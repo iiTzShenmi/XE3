@@ -172,8 +172,12 @@ def _select_option_label(embed: discord.Embed, action: dict[str, str]) -> str:
     return str(embed.title or action.get("label") or "Item")[:100]
 
 
+def _is_file_entry(entry: tuple[str, str, dict[str, str]]) -> bool:
+    return bool(entry and (entry[2] or {}).get("kind") == "uri")
+
+
 def _select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
-    if entries and all((entry[2] or {}).get("kind") == "uri" for entry in entries):
+    if entries and all(_is_file_entry(entry) for entry in entries):
         return "Choose a file"
     return "Choose an item"
 
@@ -182,7 +186,7 @@ class _CommandSelect(discord.ui.Select):
     def __init__(self, bot: commands.Bot, user_id: int, entries: list[tuple[str, str, dict[str, str]]]):
         self.entries = entries[:MAX_SELECT_OPTIONS]
         options = [
-            discord.SelectOption(label=label[:100], description=desc[:100], value=str(idx))
+            discord.SelectOption(label=label[:100], description=(None if _is_file_entry(self.entries[idx]) else desc[:100]), value=str(idx))
             for idx, (label, desc, _) in enumerate(self.entries)
         ]
         super().__init__(placeholder="Choose an item", min_values=1, max_values=1, options=options)
@@ -317,8 +321,10 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
             description='Use the selector below to open details without flooding the channel.',
             color=discord.Color.blurple(),
         )
-        for idx, (label, desc, _) in enumerate(entries[:10], start=1):
-            summary.add_field(name=f'{idx}. {label[:100]}', value=desc[:1024] or 'Open details', inline=True)
+        preview_entries = entries[:25]
+        for idx, (label, desc, action) in enumerate(preview_entries, start=1):
+            value = "Open file" if _is_file_entry((label, desc, action)) else (desc[:1024] or "Open details")
+            summary.add_field(name=f'{idx}. {label[:100]}', value=value, inline=True)
         await _send_with(target, embeds=[summary], view=CommandSelectView(bot, user_id, entries))
         sent_any = True
 
