@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import requests
 
 MAX_SELECT_OPTIONS = 25
+E3_EXECUTION_SEMAPHORE = asyncio.Semaphore(2)
 
 import discord
 from discord import app_commands
@@ -14,6 +15,7 @@ from discord.ext import commands
 
 from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
 from agent.features.e3 import handle_e3_command, run_e3_async_command
+from agent.features.e3.client import fetch_courses
 from agent.features.e3.db import get_user_id
 from agent.features.e3.reminders import build_test_reminder_payload, start_reminder_worker
 from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
@@ -117,14 +119,14 @@ def _hex_to_color(value: str | None) -> discord.Color | None:
         return None
 
 
-async def _send_text_chunks(target, text: str) -> None:
+async def _send_text_chunks(target, text: str, *, ephemeral: bool = False) -> None:
     chunks = _chunk_text(text)
     for idx, chunk in enumerate(chunks):
         if isinstance(target, discord.Interaction):
             if not target.response.is_done() and idx == 0:
-                await target.response.send_message(chunk)
+                await target.response.send_message(chunk, ephemeral=ephemeral)
             else:
-                await target.followup.send(chunk)
+                await target.followup.send(chunk, ephemeral=ephemeral)
         else:
             await target.send(chunk)
 
@@ -329,9 +331,9 @@ class E3LoginModal(discord.ui.Modal, title="E3 Login"):
         self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         command = f"login {self.account.value.strip()} {self.password.value.strip()}"
-        await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot)
+        await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot, ephemeral=True)
 
 
 def _bubble_actions(bubble: dict[str, Any]) -> list[dict[str, str]]:
@@ -416,7 +418,7 @@ def _build_preferred_view(bot: commands.Bot, user_id: int, embed: discord.Embed 
     return CommandButtonView(bot, user_id, actions[:5]) if actions else None
 
 
-async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int) -> None:
+async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int, ephemeral: bool = False) -> None:
     items = _extract_embeds_and_views(bot, payload, user_id)
     sent_any = False
     pending_embeds: list[discord.Embed] = []
@@ -425,8 +427,8 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
     def _send_with(target_obj, *, embeds=None, view=None, content=None):
         if isinstance(target_obj, discord.Interaction):
             if not target_obj.response.is_done() and not sent_any:
-                return target_obj.response.send_message(content=content, embeds=embeds, view=view)
-            return target_obj.followup.send(content=content, embeds=embeds, view=view)
+                return target_obj.response.send_message(content=content, embeds=embeds, view=view, ephemeral=ephemeral)
+            return target_obj.followup.send(content=content, embeds=embeds, view=view, ephemeral=ephemeral)
         return target_obj.send(content=content, embeds=embeds, view=view)
 
     async def flush_pending() -> None:
@@ -480,7 +482,7 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
     for embed, actions, text in items:
         if text:
             await flush_pending()
-            await _send_text_chunks(target, text)
+            await _send_text_chunks(target, text, ephemeral=ephemeral)
             sent_any = True
             continue
 
@@ -498,16 +500,17 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
     await flush_pending()
 
 
-async def _execute_e3_payload(target, command_text: str, user_id: int, *, bot: commands.Bot | None = None):
+async def _execute_e3_payload(target, command_text: str, user_id: int, *, bot: commands.Bot | None = None, ephemeral: bool = False):
     bot = bot or target.client
     text = f"e3 {command_text.strip()}" if not command_text.strip().lower().startswith("e3") else command_text.strip()
     user_key = _platform_user_key(user_id)
     command = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
-    if command.split(maxsplit=1)[0].lower() in {"login", "relogin", "refresh", "update"} or command in {"重新登入", "更新", "刷新"}:
-        payload = await asyncio.to_thread(run_e3_async_command, text, logger, user_key)
-    else:
-        payload = await asyncio.to_thread(handle_e3_command, text, logger, user_key)
-    await _send_payload(target, payload, bot=bot, user_id=user_id)
+    async with E3_EXECUTION_SEMAPHORE:
+        if command.split(maxsplit=1)[0].lower() in {"login", "relogin", "refresh", "update"} or command in {"重新登入", "更新", "刷新"}:
+            payload = await asyncio.to_thread(run_e3_async_command, text, logger, user_key)
+        else:
+            payload = await asyncio.to_thread(handle_e3_command, text, logger, user_key)
+    await _send_payload(target, payload, bot=bot, user_id=user_id, ephemeral=ephemeral)
 
 
 async def _deliver_discord_dm(bot: commands.Bot, user_key: str, payload: Any) -> bool:
@@ -552,6 +555,62 @@ def _start_discord_reminder_worker(bot: commands.Bot) -> None:
 
 def _build_reminder_test_payload(user_id: int) -> str:
     return build_test_reminder_payload(user_id)
+
+
+def _is_owner_check():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        client = interaction.client
+        if hasattr(client, "is_owner"):
+            return await client.is_owner(interaction.user)
+        return False
+
+    return app_commands.check(predicate)
+
+
+def _cached_course_choices(discord_user_id: int) -> list[tuple[str, str]]:
+    user_key = _platform_user_key(discord_user_id)
+    try:
+        courses = fetch_courses(user_key)
+    except Exception:
+        logger.exception("discord_course_autocomplete_failed user=%s", discord_user_id)
+        return []
+
+    rows: list[tuple[str, str]] = []
+    for display_name, payload in (courses or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        course_name = str(display_name or "").strip()
+        course_id = str(payload.get("_course_id") or "").strip()
+        if not course_name and not course_id:
+            continue
+        label = f"{course_id} {course_name}".strip()[:100]
+        value = course_id or course_name
+        if value:
+            rows.append((label, value[:100]))
+
+    rows.sort(key=lambda row: row[0].lower())
+    deduped: list[tuple[str, str]] = []
+    seen_values: set[str] = set()
+    for label, value in rows:
+        if value in seen_values:
+            continue
+        seen_values.add(value)
+        deduped.append((label, value))
+    return deduped[:25]
+
+
+async def _autocomplete_course_files(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    current_lower = str(current or "").strip().lower()
+    choices = []
+    for label, value in _cached_course_choices(interaction.user.id):
+        haystack = f"{label} {value}".lower()
+        if current_lower and current_lower not in haystack:
+            continue
+        choices.append(app_commands.Choice(name=label, value=value))
+    return choices[:25]
 
 
 def _build_help_text(prefix: str) -> str:
@@ -627,12 +686,6 @@ def _create_bot() -> commands.Bot:
     async def e3_help(interaction: discord.Interaction):
         await interaction.response.send_message(_build_help_text(str(bot.command_prefix)))
 
-    @e3_group.command(name="run", description="Run an arbitrary E3 command")
-    @app_commands.describe(command="Example: course, timeline, files 韓文")
-    async def e3_run(interaction: discord.Interaction, command: str):
-        await interaction.response.defer(thinking=True)
-        await _execute_e3_payload(interaction, command, interaction.user.id, bot=bot)
-
     @e3_group.command(name="login", description="Open a login form for E3")
     async def e3_login(interaction: discord.Interaction):
         await interaction.response.send_modal(E3LoginModal(bot))
@@ -640,25 +693,26 @@ def _create_bot() -> commands.Bot:
     @e3_group.command(name="relogin", description="Refresh your E3 session")
     async def e3_relogin(interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
-        await _execute_e3_payload(interaction, "relogin", interaction.user.id, bot=bot)
+        await _execute_e3_payload(interaction, "relogin", interaction.user.id, bot=bot, ephemeral=True)
 
     @e3_group.command(name="course", description="Show current courses")
     async def e3_course(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
-        await _execute_e3_payload(interaction, "course", interaction.user.id, bot=bot)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        await _execute_e3_payload(interaction, "course", interaction.user.id, bot=bot, ephemeral=True)
 
     @e3_group.command(name="timeline", description="Show E3 timeline")
     async def e3_timeline(interaction: discord.Interaction, kind: str | None = None):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         command = "timeline" if not kind else f"timeline {kind}"
-        await _execute_e3_payload(interaction, command, interaction.user.id, bot=bot)
+        await _execute_e3_payload(interaction, command, interaction.user.id, bot=bot, ephemeral=True)
 
     @e3_group.command(name="grades", description="Show grades")
     async def e3_grades(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
-        await _execute_e3_payload(interaction, "grades", interaction.user.id, bot=bot)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        await _execute_e3_payload(interaction, "grades", interaction.user.id, bot=bot, ephemeral=True)
 
-    @e3_group.command(name="files", description="Search course files")
+    @e3_group.command(name="files", description="Browse files from one of your courses")
+    @app_commands.autocomplete(keyword=_autocomplete_course_files)
     async def e3_files(interaction: discord.Interaction, keyword: str):
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, f"files {keyword}", interaction.user.id, bot=bot)
@@ -689,10 +743,28 @@ def _create_bot() -> commands.Bot:
         await _send_payload(interaction, payload, bot=bot, user_id=interaction.user.id)
 
     @bot.tree.command(name="chksys", description="Show system status")
+    @_is_owner_check()
     async def slash_chksys(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         payload = await asyncio.to_thread(build_system_report)
-        await _send_text_chunks(interaction, payload)
+        await _send_text_chunks(interaction, payload, ephemeral=True)
+
+
+    @bot.tree.error
+    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.errors.CheckFailure):
+            message = "⚠️ You do not have permission to run this command."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+        logger.exception("discord_app_command_failed", exc_info=error)
+        message = "⚠️ Something went wrong while running this command."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
 
     return bot
 

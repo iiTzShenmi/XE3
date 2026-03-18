@@ -15,7 +15,6 @@ from agent.config import (
     port,
     tunnel_watchdog_state_file,
 )
-from agent.features.e3.reminders import start_reminder_worker
 from agent.features.weather import handle_city_weather, handle_location_weather
 from agent.features.e3 import handle_e3_command
 from agent.features.e3.file_proxy import FileProxyError, FileProxySessionExpired, prepare_proxy_download
@@ -473,11 +472,7 @@ def _should_start_background_worker():
 
 
 if _should_start_background_worker():
-    start_reminder_worker(
-        lambda user_id, payload: push_to_line(user_id, payload, logger),
-        logger,
-        target_predicate=lambda user_key: not str(user_key or "").startswith("discord:"),
-    )
+    logger.info("line_reminder_worker_disabled owner=discord")
 
 
 if __name__ == "__main__":

@@ -64,8 +64,60 @@ def _course_name_for_display(text):
     return text or "-"
 
 
+def _count_event_types(rows):
+    counts = {"homework": 0, "exam": 0, "calendar": 0}
+    for row in rows:
+        event_type = str(row.get("event_type") or "").strip()
+        if event_type in counts:
+            counts[event_type] += 1
+    return counts
+
+
+def _morning_brief_lines(rows):
+    now = _taipei_now()
+    today = now.date()
+    counts = _count_event_types(rows)
+    today_rows = []
+    for row in rows:
+        try:
+            dt = datetime.fromisoformat(str(row["due_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        if dt.astimezone(timezone(timedelta(hours=8))).date() == today:
+            today_rows.append(row)
+
+    lines = ["Good morning. Here's your E3 briefing for today."]
+    summary_bits = []
+    if counts["homework"]:
+        summary_bits.append(f"{counts['homework']} assignment(s)")
+    if counts["exam"]:
+        summary_bits.append(f"{counts['exam']} exam(s)")
+    if counts["calendar"]:
+        summary_bits.append(f"{counts['calendar']} calendar item(s)")
+    if summary_bits:
+        lines.append("In the next 36 hours: " + ", \".join(summary_bits) + \".")
+    if today_rows:
+        lines.append(f"Due today: {len(today_rows)} item(s).")
+        first_row = min(today_rows, key=lambda row: str(row.get("due_at") or ""))
+        course_name = _course_name_for_display(first_row["course_name"] or first_row["course_id"] or "-")
+        lines.append(
+            f"Next up: {_format_due_label(first_row['due_at'])} {course_name} - {first_row['title']}"
+        )
+    else:
+        lines.append("Nothing is due today so far.")
+    return lines
+
+
 def _format_digest(rows, slot_text):
-    lines = [f"⏰ E3 提醒 {slot_text}", "未來 36 小時內的重點事件："]
+    lines = [f"⏰ E3 提醒 {slot_text}"]
+    if slot_text == "09:00":
+        lines.extend(_morning_brief_lines(rows))
+        lines.append("")
+    lines.append("未來 36 小時內的重點事件：")
     for idx, row in enumerate(rows, start=1):
         course_name = _course_name_for_display(row["course_name"] or row["course_id"] or "-")
         label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(row["event_type"], "📌")
