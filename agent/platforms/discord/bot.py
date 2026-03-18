@@ -14,6 +14,8 @@ from discord.ext import commands
 
 from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
 from agent.features.e3 import handle_e3_command, run_e3_async_command
+from agent.features.e3.db import get_user_id
+from agent.features.e3.reminders import build_test_reminder_payload, start_reminder_worker
 from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
 from agent.features.weather import handle_city_weather
 from agent.system_status import build_system_report
@@ -125,6 +127,54 @@ async def _send_text_chunks(target, text: str) -> None:
                 await target.followup.send(chunk)
         else:
             await target.send(chunk)
+
+
+def _is_reminder_actions(actions: list[dict[str, str]]) -> bool:
+    commands = {str(action.get("value") or "").strip().lower() for action in actions if action.get("kind") == "message"}
+    return "e3 remind on" in commands and "e3 remind off" in commands
+
+
+def _reminder_enabled_from_embed(embed: discord.Embed | None) -> bool:
+    title = getattr(embed, "title", "") or ""
+    description = getattr(embed, "description", "") or ""
+    text = f"{title}\n{description}".lower()
+    return any(token in text for token in ["已開啟", "狀態｜已開啟", "狀態：開啟", "✅ 已開啟"])
+
+
+class ReminderToggleButton(discord.ui.Button):
+    def __init__(self, bot: commands.Bot, user_id: int, enabled: bool):
+        self.bot = bot
+        self.user_id = user_id
+        self.enabled = enabled
+        command_text = "e3 remind off" if enabled else "e3 remind on"
+        label = "Turn Reminder Off" if enabled else "Turn Reminder On"
+        style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
+        super().__init__(label=label, style=style)
+        self.command_text = command_text
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This toggle belongs to another user's session.")
+            return
+        payload = await asyncio.to_thread(handle_e3_command, self.command_text, logger, _platform_user_key(self.user_id))
+        edited = False
+        try:
+            edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
+        except discord.DiscordException:
+            logger.exception("discord_reminder_toggle_edit_failed user=%s", self.user_id)
+        if not interaction.response.is_done():
+            if edited:
+                await interaction.response.defer()
+            else:
+                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+        elif not edited:
+            await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+
+
+class ReminderToggleView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, user_id: int, enabled: bool, timeout: float = 600):
+        super().__init__(timeout=timeout)
+        self.add_item(ReminderToggleButton(bot, user_id, enabled))
 
 
 class CommandButtonView(discord.ui.View):
@@ -286,16 +336,23 @@ class E3LoginModal(discord.ui.Modal, title="E3 Login"):
 
 def _bubble_actions(bubble: dict[str, Any]) -> list[dict[str, str]]:
     actions: list[dict[str, str]] = []
-    footer = bubble.get("footer") or {}
-    for item in footer.get("contents") or []:
-        if not isinstance(item, dict) or item.get("type") != "button":
-            continue
-        action = item.get("action") or {}
-        action_type = action.get("type")
-        if action_type == "message":
-            actions.append({"kind": "message", "label": str(action.get("label") or "Open"), "value": str(action.get("text") or "")})
-        elif action_type == "uri":
-            actions.append({"kind": "uri", "label": str(action.get("label") or "Open"), "value": str(action.get("uri") or "")})
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "button":
+                action = node.get("action") or {}
+                action_type = action.get("type")
+                if action_type == "message":
+                    actions.append({"kind": "message", "label": str(action.get("label") or "Open"), "value": str(action.get("text") or "")})
+                elif action_type == "uri":
+                    actions.append({"kind": "uri", "label": str(action.get("label") or "Open"), "value": str(action.get("uri") or "")})
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(bubble)
     return actions
 
 
@@ -333,6 +390,32 @@ def _extract_embeds_and_views(bot: commands.Bot, payload: Any, user_id: int) -> 
     return items
 
 
+async def _edit_message_from_payload(message: discord.Message, payload: Any, *, bot: commands.Bot, user_id: int) -> bool:
+    items = _extract_embeds_and_views(bot, payload, user_id)
+    embeds: list[discord.Embed] = []
+    actions: list[dict[str, str]] = []
+    text_chunks: list[str] = []
+    for embed, item_actions, text in items:
+        if text:
+            text_chunks.append(str(text).strip())
+            continue
+        if embed is not None:
+            embeds.append(embed)
+            actions.extend(item_actions)
+    if not embeds:
+        return False
+    view = _build_preferred_view(bot, user_id, embeds[0], actions)
+    content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
+    await message.edit(content=content, embeds=embeds[:10], view=view)
+    return True
+
+
+def _build_preferred_view(bot: commands.Bot, user_id: int, embed: discord.Embed | None, actions: list[dict[str, str]]) -> discord.ui.View | None:
+    if _is_reminder_actions(actions):
+        return ReminderToggleView(bot, user_id, _reminder_enabled_from_embed(embed))
+    return CommandButtonView(bot, user_id, actions[:5]) if actions else None
+
+
 async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int) -> None:
     items = _extract_embeds_and_views(bot, payload, user_id)
     sent_any = False
@@ -350,7 +433,8 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
         nonlocal sent_any, pending_embeds, pending_actions
         if not pending_embeds:
             return
-        view = CommandButtonView(bot, user_id, pending_actions[:5]) if pending_actions else None
+        first_embed = pending_embeds[0] if pending_embeds else None
+        view = _build_preferred_view(bot, user_id, first_embed, pending_actions)
         await _send_with(target, embeds=pending_embeds, view=view)
         sent_any = True
         pending_embeds = []
@@ -426,6 +510,50 @@ async def _execute_e3_payload(target, command_text: str, user_id: int, *, bot: c
     await _send_payload(target, payload, bot=bot, user_id=user_id)
 
 
+async def _deliver_discord_dm(bot: commands.Bot, user_key: str, payload: Any) -> bool:
+    key = str(user_key or "")
+    if not key.startswith("discord:"):
+        return False
+    try:
+        discord_user_id = int(key.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return False
+
+    user = bot.get_user(discord_user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(discord_user_id)
+        except discord.DiscordException:
+            return False
+    try:
+        await _send_payload(user, payload, bot=bot, user_id=discord_user_id)
+        return True
+    except discord.DiscordException:
+        logger.exception("discord_reminder_delivery_failed user=%s", user_key)
+        return False
+
+
+def _start_discord_reminder_worker(bot: commands.Bot) -> None:
+    def push_fn(user_key: str, payload: Any) -> bool:
+        future = asyncio.run_coroutine_threadsafe(_deliver_discord_dm(bot, user_key, payload), bot.loop)
+        try:
+            return bool(future.result(timeout=60))
+        except Exception:
+            logger.exception("discord_reminder_future_failed user=%s", user_key)
+            return False
+
+    started = start_reminder_worker(
+        push_fn,
+        logger,
+        target_predicate=lambda user_key: str(user_key or "").startswith("discord:"),
+    )
+    logger.info("discord_reminder_worker_started=%s", started)
+
+
+def _build_reminder_test_payload(user_id: int) -> str:
+    return build_test_reminder_payload(user_id)
+
+
 def _build_help_text(prefix: str) -> str:
     return (
         "XE3 Discord Bot\n"
@@ -439,6 +567,7 @@ def _build_help_text(prefix: str) -> str:
         f"{prefix}e3 timeline\n"
         f"{prefix}e3 grades\n"
         f"{prefix}e3 files <keyword>\n"
+        f"{prefix}e3 remind show|on|off|test\n"
         f"{prefix}chksys"
     )
 
@@ -461,6 +590,7 @@ def _create_bot() -> commands.Bot:
                 logger.info("discord_app_commands_synced_global count=%s", len(synced))
         except Exception:
             logger.exception("discord_app_commands_sync_failed")
+        _start_discord_reminder_worker(bot)
 
     @bot.command(name="homevault")
     async def homevault(ctx: commands.Context):
@@ -532,6 +662,23 @@ def _create_bot() -> commands.Bot:
     async def e3_files(interaction: discord.Interaction, keyword: str):
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, f"files {keyword}", interaction.user.id, bot=bot)
+
+    @e3_group.command(name="remind", description="Reminder settings")
+    @app_commands.describe(action="show, on, off, or test")
+    async def e3_remind(interaction: discord.Interaction, action: str = "show"):
+        normalized = (action or "show").strip().lower()
+        if normalized == "test":
+            await interaction.response.defer(thinking=True)
+            user_key = _platform_user_key(interaction.user.id)
+            internal_user_id = await asyncio.to_thread(get_user_id, user_key)
+            if not internal_user_id:
+                await _send_text_chunks(interaction, "Please login to E3 first before testing reminders.")
+                return
+            payload = await asyncio.to_thread(_build_reminder_test_payload, internal_user_id)
+            await _send_text_chunks(interaction, payload)
+            return
+        await interaction.response.defer(thinking=True)
+        await _execute_e3_payload(interaction, f"remind {normalized}", interaction.user.id, bot=bot)
 
     bot.tree.add_command(e3_group, guild=discord.Object(id=discord_guild_id()) if discord_guild_id() else None)
 

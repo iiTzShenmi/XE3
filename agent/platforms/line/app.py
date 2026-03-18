@@ -473,7 +473,11 @@ def _should_start_background_worker():
 
 
 if _should_start_background_worker():
-    start_reminder_worker(lambda user_id, payload: push_to_line(user_id, payload, logger), logger)
+    start_reminder_worker(
+        lambda user_id, payload: push_to_line(user_id, payload, logger),
+        logger,
+        target_predicate=lambda user_key: not str(user_key or "").startswith("discord:"),
+    )
 
 
 if __name__ == "__main__":

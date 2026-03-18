@@ -222,7 +222,7 @@ def _maybe_periodic_sync(row, now, push_fn, logger):
         )
 
 
-def process_due_reminders(push_fn, logger):
+def process_due_reminders(push_fn, logger, target_predicate=None):
     now = _taipei_now()
     current_slot = now.strftime("%H:%M")
     start_iso = now.astimezone(timezone.utc).isoformat()
@@ -231,6 +231,8 @@ def process_due_reminders(push_fn, logger):
     tolerance = max(interval_seconds * 2, 300)
 
     for row in list_reminder_targets():
+        if target_predicate and not target_predicate(str(row["line_user_id"])):
+            continue
         if row["login_status"] != "ok":
             continue
         _maybe_periodic_sync(row, now, push_fn, logger)
@@ -282,10 +284,10 @@ def process_due_reminders(push_fn, logger):
             logger.error("e3_reminder_push_failed user=%s slot=%s", row["line_user_id"], current_slot)
 
 
-def _worker_loop(push_fn: Callable[[str, Any], bool], logger, interval_seconds: int) -> None:
+def _worker_loop(push_fn: Callable[[str, Any], bool], logger, interval_seconds: int, target_predicate=None) -> None:
     while True:
         try:
-            process_due_reminders(push_fn, logger)
+            process_due_reminders(push_fn, logger, target_predicate=target_predicate)
         except Exception:
             logger.exception("e3_reminder_loop_failed")
         time.sleep(interval_seconds)
@@ -304,7 +306,7 @@ def _acquire_worker_lock() -> bool:
     return True
 
 
-def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger) -> bool:
+def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger, target_predicate=None) -> bool:
     global _STARTED
     with _LOCK:
         if _STARTED:
@@ -317,9 +319,19 @@ def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger) -> bool:
     interval_seconds = e3_reminder_poll_seconds()
     worker = threading.Thread(
         target=_worker_loop,
-        args=(push_fn, logger, interval_seconds),
+        args=(push_fn, logger, interval_seconds, target_predicate),
         daemon=True,
         name="e3-reminder-worker",
     )
     worker.start()
     return True
+
+
+def build_test_reminder_payload(user_id: int) -> str:
+    now = _taipei_now()
+    start_iso = now.astimezone(timezone.utc).isoformat()
+    end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
+    events = get_events_due_between(user_id, start_iso, end_iso, limit=5)
+    if not events:
+        return "⏰ Reminder test\nNo upcoming events in the next 36 hours."
+    return _format_digest(events, "test")
