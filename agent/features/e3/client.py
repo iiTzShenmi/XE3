@@ -1,10 +1,8 @@
-import importlib
 import html as html_lib
 import json
 import os
 import re
 import shutil
-import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -12,7 +10,12 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 
-from agent.config import e3_root as get_config_e3_root, e3_runtime_root, legacy_e3_runtime_root
+from agent.config import e3_runtime_root, legacy_e3_runtime_root
+from .scraper import config as scraper_config
+from .scraper import db_manager as scraper_db_manager
+from .scraper import utils as scraper_utils
+from .scraper.get_course import extract_course as scraper_extract_course
+from .scraper.get_course import get_user_data as scraper_get_user_data
 
 
 _E3_SYNC_LOCK = threading.Lock()
@@ -51,74 +54,31 @@ def _runtime_paths_for_user(user_key: str) -> dict[str, str]:
 
 @contextmanager
 def _patched_e3_runtime(user_key: str) -> Iterator[dict[str, str]]:
-    e3_project_root = get_config_e3_root().resolve()
-    if not e3_project_root.exists():
-        raise FileNotFoundError(f"E3 root not found: {e3_project_root}")
-
-    e3_root_str = str(e3_project_root)
-    if e3_root_str not in sys.path:
-        sys.path.insert(0, e3_root_str)
-
-    config = importlib.import_module("config")
-    utils = importlib.import_module("utils")
-    get_user_data_module = importlib.import_module("get_course.get_user_data")
-    extract_course_module = importlib.import_module("get_course.extract_course")
-
-    db_manager = None
-    if "db_manager" in sys.modules:
-        db_manager = importlib.import_module("db_manager")
-
-    parse_html_pages = None
-    if "parse_html_pages" in sys.modules:
-        parse_html_pages = importlib.import_module("parse_html_pages")
-
     new_paths = _runtime_paths_for_user(user_key)
-
-    original = {key: getattr(config, key) for key in new_paths}
-    original_utils_base_dir = utils.BASE_DIR
-    original_cookie_file = get_user_data_module.COOKIE_FILE
-    original_extract_config = {
-        "COURSES_FILE": extract_course_module.config.COURSES_FILE,
-        "E3_MY_HTML": extract_course_module.config.E3_MY_HTML,
-    }
-
-    original_db_links = None
-    if db_manager is not None:
-        original_db_links = db_manager.LINKS_DB_FILE
-
-    original_parsed_dir = None
-    if parse_html_pages is not None:
-        original_parsed_dir = parse_html_pages.OUTPUT_DIR
+    original = {key: getattr(scraper_config, key) for key in new_paths}
+    original_utils_base_dir = scraper_utils.BASE_DIR
+    original_cookie_file = scraper_get_user_data.COOKIE_FILE
+    original_db_links = scraper_db_manager.LINKS_DB_FILE
 
     try:
         for key, value in new_paths.items():
-            setattr(config, key, value)
+            setattr(scraper_config, key, value)
 
-        utils.BASE_DIR = new_paths["BASE_DIR"]
-        get_user_data_module.COOKIE_FILE = new_paths["COOKIE_FILE"]
-        extract_course_module.config.COURSES_FILE = new_paths["COURSES_FILE"]
-        extract_course_module.config.E3_MY_HTML = new_paths["E3_MY_HTML"]
-
-        if db_manager is not None:
-            db_manager.LINKS_DB_FILE = os.path.join(new_paths["BASE_DIR"], "file_links_db.json")
-
-        if parse_html_pages is not None:
-            parse_html_pages.OUTPUT_DIR = os.path.join(new_paths["BASE_DIR"], "parsed_html_data")
+        scraper_utils.BASE_DIR = new_paths["BASE_DIR"]
+        scraper_get_user_data.COOKIE_FILE = new_paths["COOKIE_FILE"]
+        scraper_extract_course.config.COURSES_FILE = new_paths["COURSES_FILE"]
+        scraper_extract_course.config.E3_MY_HTML = new_paths["E3_MY_HTML"]
+        scraper_db_manager.LINKS_DB_FILE = os.path.join(new_paths["BASE_DIR"], "file_links_db.json")
 
         yield new_paths
     finally:
         for key, value in original.items():
-            setattr(config, key, value)
-        utils.BASE_DIR = original_utils_base_dir
-        get_user_data_module.COOKIE_FILE = original_cookie_file
-        extract_course_module.config.COURSES_FILE = original_extract_config["COURSES_FILE"]
-        extract_course_module.config.E3_MY_HTML = original_extract_config["E3_MY_HTML"]
-
-        if db_manager is not None and original_db_links is not None:
-            db_manager.LINKS_DB_FILE = original_db_links
-
-        if parse_html_pages is not None and original_parsed_dir is not None:
-            parse_html_pages.OUTPUT_DIR = original_parsed_dir
+            setattr(scraper_config, key, value)
+        scraper_utils.BASE_DIR = original_utils_base_dir
+        scraper_get_user_data.COOKIE_FILE = original_cookie_file
+        scraper_extract_course.config.COURSES_FILE = original["COURSES_FILE"]
+        scraper_extract_course.config.E3_MY_HTML = original["E3_MY_HTML"]
+        scraper_db_manager.LINKS_DB_FILE = original_db_links
 
 
 def _load_json(path: os.PathLike[str] | str) -> Any:
@@ -323,7 +283,7 @@ def _build_course_lookup(courses: dict[str, dict[str, Any]]) -> dict[str, str]:
 
 
 def check_status(user_key: str | None = None) -> dict[str, Any]:
-    e3_root = get_config_e3_root().resolve()
+    e3_root = Path(__file__).resolve().parent / "scraper"
     runtime_root = get_runtime_root()
     status = {
         "e3_root": str(e3_root),
@@ -388,8 +348,7 @@ def login_and_sync(
 ) -> dict[str, Any]:
     with _E3_SYNC_LOCK:
         with _patched_e3_runtime(user_key) as paths:
-            get_user_data = importlib.import_module("get_course.get_user_data").get_user_data
-            get_user_data(account, password, update_data=update_data, update_links=update_links)
+            scraper_get_user_data.get_user_data(account, password, update_data=update_data, update_links=update_links)
             courses = _read_all_courses_data(paths["BASE_DIR"], paths["COURSES_FILE"])
             course_lookup = _build_course_lookup(courses)
             return {
