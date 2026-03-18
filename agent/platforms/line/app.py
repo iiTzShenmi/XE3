@@ -1,10 +1,20 @@
 import logging
+import json
+import os
+import shutil
+import subprocess
 import time
 
 import requests
 from flask import Flask, Response, request
 
-from agent.config import auto_reload_enabled, port
+from agent.config import (
+    auto_reload_enabled,
+    cloudflared_url_file,
+    line_notify_user_id,
+    port,
+    tunnel_watchdog_state_file,
+)
 from agent.features.e3.reminders import start_reminder_worker
 from agent.features.weather import handle_city_weather, handle_location_weather
 from agent.features.e3 import handle_e3_command
@@ -26,6 +36,159 @@ from agent.platforms.line.messaging import (
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _systemctl_state(unit_name, user=False):
+    cmd = ["systemctl"]
+    if user:
+        cmd.append("--user")
+    cmd.extend(["is-active", unit_name])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=8, check=False)
+    except Exception as exc:  # pragma: no cover
+        return f"error:{exc}"
+    state = (result.stdout or result.stderr or "").strip()
+    return state or f"exit:{result.returncode}"
+
+
+def _process_active(pattern):
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:  # pragma: no cover
+        return False
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
+def _read_watchdog_state():
+    path = tunnel_watchdog_state_file()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _tunnel_status_summary():
+    url_path = cloudflared_url_file()
+    url = ""
+    if url_path.exists():
+        try:
+            url = url_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            url = ""
+    active = _process_active("cloudflared tunnel --url")
+    if active and url:
+        return f"active ({url})"
+    if active:
+        return "active (等待公開網址)"
+    return "inactive"
+
+
+def _watchdog_status_summary():
+    active = _process_active("scripts/tunnel_watchdog.py")
+    state = _read_watchdog_state() or {}
+    healthy = state.get("healthy")
+    detail = str(state.get("detail") or "").strip()
+    if active and healthy is True:
+        return f"active (healthy)"
+    if active and healthy is False:
+        return f"active (unhealthy: {detail})" if detail else "active (unhealthy)"
+    if active:
+        return "active"
+    if healthy is True:
+        return "inactive (last seen healthy)"
+    if healthy is False:
+        return f"inactive (last seen unhealthy: {detail})" if detail else "inactive (last seen unhealthy)"
+    return "inactive"
+
+
+def _memory_summary():
+    total_kb = None
+    avail_kb = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    total_kb = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+    except OSError:
+        return "記憶體：unknown"
+
+    if not total_kb or avail_kb is None:
+        return "記憶體：unknown"
+
+    used_kb = max(0, total_kb - avail_kb)
+    used_gb = used_kb / 1024 / 1024
+    total_gb = total_kb / 1024 / 1024
+    percent = (used_kb / total_kb) * 100 if total_kb else 0
+    return f"記憶體：{used_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)"
+
+
+def _disk_summary():
+    usage = shutil.disk_usage("/")
+    used_gb = (usage.total - usage.free) / 1024 / 1024 / 1024
+    total_gb = usage.total / 1024 / 1024 / 1024
+    percent = ((usage.total - usage.free) / usage.total) * 100 if usage.total else 0
+    return f"磁碟：{used_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)"
+
+
+def _uptime_summary():
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as handle:
+            seconds = int(float(handle.read().split()[0]))
+    except OSError:
+        return "開機時間：unknown"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    if days:
+        return f"開機時間：{days}d {hours}h {minutes}m"
+    return f"開機時間：{hours}h {minutes}m"
+
+
+def _load_summary():
+    load1, load5, load15 = os.getloadavg()
+    cores = os.cpu_count() or 1
+    ratio = load1 / cores if cores else load1
+    if ratio < 0.5:
+        level = "輕"
+    elif ratio < 1.0:
+        level = "中"
+    else:
+        level = "高"
+    return f"系統負載：{load1:.2f} / {load5:.2f} / {load15:.2f}（1/5/15 分鐘，{cores} 核心，{level}）"
+
+
+def _build_chksys_report():
+    return (
+        "🛠️ 系統檢查\n"
+        f"主服務：{_systemctl_state('multi-task-agent.service')}\n"
+        f"Tunnel：{_tunnel_status_summary()}\n"
+        f"Watchdog：{_watchdog_status_summary()}\n"
+        f"{_load_summary()}\n"
+        f"{_memory_summary()}\n"
+        f"{_disk_summary()}\n"
+        f"{_uptime_summary()}"
+    )
+
+
+def _handle_chksys(reply_token, line_user_id):
+    report = _build_chksys_report()
+    target_user = line_notify_user_id() or line_user_id
+    pushed = push_to_line(target_user, report, logger)
+    ack = "🛠️ 系統狀態已傳送。" if pushed else "⚠️ 系統狀態查詢完成，但推播失敗，請檢查 LINE_NOTIFY_USER_ID。"
+    if reply_token:
+        send_line_response(reply_token, line_user_id, ack, logger)
+    elif line_user_id:
+        push_to_line(line_user_id, ack, logger)
 
 
 def _render_proxy_error_page(title, message, suggestion=""):
@@ -180,7 +343,8 @@ def _handle_homevault(reply_token, line_user_id):
         "9) e3 grades / e3 成績\n"
         "10) e3 files <課名關鍵字>\n"
         "11) e3 remind show/on/off\n"
-        "12) e3 幫助"
+        "12) e3 幫助\n"
+        "13) chksys"
     )
     if reply_token:
         send_line_response(
@@ -230,6 +394,8 @@ def callback():
                 _handle_weather_text(text, reply_token, line_user_id)
             elif text.lower().startswith("e3"):
                 _handle_e3_text(text, reply_token, line_user_id)
+            elif text.lower() == "chksys":
+                _handle_chksys(reply_token, line_user_id)
             elif text.lower() == "homevault":
                 _handle_homevault(reply_token, line_user_id)
             else:
@@ -257,7 +423,7 @@ def healthz():
 
 
 @app.route("/e3/file/<token>", methods=["GET"])
-def e3_file_proxy():
+def e3_file_proxy(token):
     try:
         download = prepare_proxy_download(token)
     except FileProxySessionExpired as exc:

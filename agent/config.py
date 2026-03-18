@@ -78,6 +78,10 @@ def line_channel_access_token():
     return os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 
 
+def line_notify_user_id():
+    return os.getenv("LINE_NOTIFY_USER_ID", "").strip()
+
+
 def public_base_url():
     state_file = cloudflared_url_file()
     if state_file.exists():
