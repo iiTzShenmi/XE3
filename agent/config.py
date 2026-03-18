@@ -189,3 +189,7 @@ def tunnel_watchdog_state_file():
 
 def reminder_worker_lock_file():
     return e3_data_root() / "reminder_worker.lock"
+
+
+def discord_attachment_max_bytes():
+    return max(1024 * 1024, _get_int("DISCORD_ATTACHMENT_MAX_BYTES", 10 * 1024 * 1024))

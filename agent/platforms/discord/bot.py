@@ -1,6 +1,10 @@
 import asyncio
+import io
 import logging
 from typing import Any
+from urllib.parse import urlparse
+
+import requests
 
 MAX_SELECT_OPTIONS = 25
 
@@ -8,8 +12,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from agent.config import discord_bot_token, discord_command_prefix, discord_guild_id
+from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
 from agent.features.e3 import handle_e3_command, run_e3_async_command
+from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
 from agent.features.weather import handle_city_weather
 from agent.system_status import build_system_report
 
@@ -182,6 +187,45 @@ def _select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str
     return "Choose an item"
 
 
+def _extract_proxy_token(url: str) -> str | None:
+    base = public_base_url()
+    parsed = urlparse(str(url or ""))
+    if base and str(url).startswith(base + "/e3/file/"):
+        return str(url).split('/e3/file/', 1)[1]
+    if parsed.path.startswith('/e3/file/'):
+        return parsed.path.split('/e3/file/', 1)[1]
+    return None
+
+
+def _download_discord_attachment(user_id: int, action: dict[str, str], fallback_name: str) -> tuple[discord.File | None, str | None]:
+    source = str(action.get('value') or '').strip()
+    if not source:
+        return None, None
+
+    try:
+        token = _extract_proxy_token(source)
+        if token:
+            payload = prepare_proxy_download(token)
+        else:
+            payload = prepare_user_download(f"discord:{user_id}", source, filename=fallback_name, max_bytes=discord_attachment_max_bytes())
+    except FileProxyError as exc:
+        return None, exc.message
+    except requests.RequestException:
+        return None, 'Unable to download the file from E3 right now.'
+
+    response = payload['response']
+    filename = payload.get('filename') or fallback_name or 'download'
+    try:
+        data = response.content
+    finally:
+        response.close()
+
+    if len(data) > discord_attachment_max_bytes():
+        return None, 'This file is too large to upload directly to Discord.'
+
+    return discord.File(io.BytesIO(data), filename=filename), None
+
+
 class _CommandSelect(discord.ui.Select):
     def __init__(self, bot: commands.Bot, user_id: int, entries: list[tuple[str, str, dict[str, str]]]):
         self.entries = entries[:MAX_SELECT_OPTIONS]
@@ -203,7 +247,13 @@ class _CommandSelect(discord.ui.Select):
             await _execute_e3_payload(interaction, action.get("value") or "", self.user_id, bot=self.bot)
             return
         if action.get("kind") == "uri":
-            embed = discord.Embed(title=(self.entries[int(self.values[0])][0] or action.get("label") or "Open file"), description=desc or "Open the selected file.", color=discord.Color.blurple())
+            selected_label = self.entries[int(self.values[0])][0] or action.get("label") or "Open file"
+            file_obj, error_text = await asyncio.to_thread(_download_discord_attachment, self.user_id, action, selected_label)
+            if file_obj is not None:
+                embed = discord.Embed(title=selected_label, description='Sent directly from E3.', color=discord.Color.blurple())
+                await interaction.followup.send(embed=embed, file=file_obj)
+                return
+            embed = discord.Embed(title=selected_label, description=error_text or desc or 'Open the selected file.', color=discord.Color.blurple())
             view = discord.ui.View()
             view.add_item(discord.ui.Button(label=(action.get("label") or "Open")[:80], url=action.get("value") or "https://discord.com"))
             await interaction.followup.send(embed=embed, view=view)

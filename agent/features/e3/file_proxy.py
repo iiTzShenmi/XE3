@@ -207,3 +207,39 @@ def prepare_proxy_download(token):
         "filename": filename,
         "content_type": content_type,
     }
+
+
+def prepare_user_download(user_id, source_url, filename="download", max_bytes=None):
+    if not _is_allowed_e3_url(source_url):
+        raise FileProxyInvalidToken("下載連結中的檔案位置不被允許。")
+
+    cookie_dict = _load_cookie_dict(user_id)
+    session = requests.Session()
+    session.cookies.update(cookie_dict)
+    response = session.get(source_url, stream=True, timeout=30, allow_redirects=True)
+    response.raise_for_status()
+
+    final_url = response.url
+    if not _is_allowed_e3_url(final_url):
+        response.close()
+        raise FileProxySessionExpired("E3 導向了非預期頁面，登入可能已過期，請先重新登入。")
+
+    limit = int(max_bytes or e3_file_proxy_max_bytes())
+    content_length = response.headers.get("Content-Length")
+    if content_length:
+        try:
+            size = int(content_length)
+        except (TypeError, ValueError):
+            size = None
+        else:
+            if size > limit:
+                response.close()
+                raise FileProxyTooLarge()
+
+    content_type = response.headers.get("Content-Type") or "application/octet-stream"
+    resolved_name = _filename_from_response(source_url, response, filename or "download")
+    return {
+        "response": response,
+        "filename": resolved_name,
+        "content_type": content_type,
+    }
