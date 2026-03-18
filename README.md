@@ -144,3 +144,38 @@ loginctl show-user eason | grep Linger
 - The file proxy only works when users can reach your public URL.
 - For small-scale testing, the Cloudflare quick tunnel is enough.
 - For a stable long-term setup, move to a fixed public domain or named tunnel.
+
+## Discord Bot
+
+Discord support is scaffolded in the repo with a separate entrypoint:
+
+```bash
+/home/eason/server/venv/bin/python /home/eason/server/discord_bot.py
+```
+
+Environment variables:
+
+```env
+DISCORD_BOT_TOKEN=your_bot_token
+DISCORD_COMMAND_PREFIX=!
+# optional, only needed if you later add guild-scoped slash command sync
+DISCORD_GUILD_ID=
+```
+
+Current Discord commands:
+
+```text
+!homevault
+!help
+!weather <city>
+!chksys
+!e3 help
+!e3 login <account> <password>
+!e3 relogin
+!e3 course
+!e3 timeline
+!e3 grades
+!e3 files <keyword>
+```
+
+The Discord bot currently reuses the existing E3 and weather core logic and sends the text fallback for responses.

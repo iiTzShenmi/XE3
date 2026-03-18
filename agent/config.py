@@ -85,6 +85,24 @@ def line_notify_user_id():
     return os.getenv("LINE_NOTIFY_USER_ID", "").strip()
 
 
+def discord_bot_token():
+    return os.getenv("DISCORD_BOT_TOKEN", "").strip()
+
+
+def discord_command_prefix():
+    return os.getenv("DISCORD_COMMAND_PREFIX", "!").strip() or "!"
+
+
+def discord_guild_id():
+    value = os.getenv("DISCORD_GUILD_ID", "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def e3_encryption_key() -> bytes:
     secret = (
         os.getenv("E3_ENCRYPTION_KEY", "").strip()
