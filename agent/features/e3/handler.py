@@ -1911,6 +1911,13 @@ def _build_file_nav_bubble(course_key, page, total_pages):
     }
 
 
+def _file_page_size(user_id):
+    user_key = str(user_id or "")
+    if user_key.startswith("discord:"):
+        return 25
+    return 8
+
+
 def _file_detail(action, tokens, logger, line_user_id):
     _, err = _require_line_user(line_user_id)
     if err:
@@ -1953,7 +1960,7 @@ def _file_detail(action, tokens, logger, line_user_id):
             return f"找不到第 {folder_index} 個資料夾，請先輸入 `e3 檔案資料夾 {course_id or course_name}`。"
         folder_name, entries = folder_groups[folder_index - 1]
 
-    page_size = 8
+    page_size = _file_page_size(line_user_id)
     total_pages = max(1, (len(entries) + page_size - 1) // page_size)
     page = min(page, total_pages)
     start = (page - 1) * page_size
