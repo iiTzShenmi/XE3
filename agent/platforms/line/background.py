@@ -9,6 +9,7 @@ from agent.features.e3 import handle_e3_command, run_e3_async_command
 BACKGROUND_COMMAND_DEDUPE_SECONDS = 8
 _BACKGROUND_COMMANDS = {}
 _BACKGROUND_LOCK = threading.Lock()
+_HEAVY_TASK_SEMAPHORE = threading.Semaphore(2)
 _EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="line-bg")
 
 
@@ -102,10 +103,11 @@ def start_e3_background_task(text: str, line_user_id: str | None, logger, push_f
 def _run_e3_background_task(text: str, line_user_id: str, logger, push_fn: Callable[[str, Any], bool]) -> None:
     try:
         logger.info("e3_background_started user=%s text=%s", line_user_id, text)
-        if is_async_e3_command(text):
-            result = run_e3_async_command(text, logger, line_user_id)
-        else:
-            result = handle_e3_command(text, logger, line_user_id)
+        with _HEAVY_TASK_SEMAPHORE:
+            if is_async_e3_command(text):
+                result = run_e3_async_command(text, logger, line_user_id)
+            else:
+                result = handle_e3_command(text, logger, line_user_id)
     except Exception as exc:
         logger.exception("e3_background_task_failed user=%s", line_user_id)
         result = f"E3 背景作業失敗：{exc}"
