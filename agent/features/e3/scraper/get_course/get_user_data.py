@@ -34,6 +34,7 @@ def login_and_get_cookies(account, password):
         chrome_options.add_argument("--start-maximized")
     _clear_cookie_file()
     driver = webdriver.Chrome(options=chrome_options)
+    driver.set_page_load_timeout(config.SELENIUM_PAGE_LOAD_TIMEOUT)
 
     try:
         print("[*] Opening E3 login page...")
@@ -101,6 +102,13 @@ def build_authenticated_session(cookies=None):
     })
     if cookies:
         session.cookies.update(cookies)
+    original_request = session.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", config.REQUEST_TIMEOUT)
+        return original_request(method, url, **kwargs)
+
+    session.request = request_with_timeout
     return session
 
 
@@ -123,13 +131,13 @@ def fetch_e3_my(account, password):
 
     print("[*] Fetching dashboard page...")
     try:
-        resp = session.get(url, allow_redirects=True)
+        resp = session.get(url, allow_redirects=True, timeout=15.0)
     except requests.TooManyRedirects:
         print("[!] Too many redirects detected, refreshing cookies...")
         _clear_cookie_file()
         cookies = login_and_get_cookies(account, password)
         session = build_authenticated_session(cookies)
-        resp = session.get(url, allow_redirects=True)
+        resp = session.get(url, allow_redirects=True, timeout=15.0)
 
     # Detect redirect loops / login page
     if resp.history and len(resp.history) > 5:
@@ -137,14 +145,14 @@ def fetch_e3_my(account, password):
         _clear_cookie_file()
         cookies = login_and_get_cookies(account, password)
         session = build_authenticated_session(cookies)
-        resp = session.get(url, allow_redirects=True)
+        resp = session.get(url, allow_redirects=True, timeout=15.0)
 
     if _needs_relogin(resp):
         print("[!] Cookies invalid, re-login...")
         _clear_cookie_file()
         cookies = login_and_get_cookies(account, password)
         session = build_authenticated_session(cookies)
-        resp = session.get(url, allow_redirects=True)
+        resp = session.get(url, allow_redirects=True, timeout=15.0)
 
     if resp.ok:
         print("[+] Success, got dashboard content!")

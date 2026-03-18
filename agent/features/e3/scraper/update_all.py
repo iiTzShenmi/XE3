@@ -15,6 +15,13 @@ def build_session(cookies=None):
     session.headers.update({"User-Agent": config.USER_AGENT})
     if cookies and isinstance(cookies, dict):
         session.cookies.update(cookies)
+    original_request = session.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", config.REQUEST_TIMEOUT)
+        return original_request(method, url, **kwargs)
+
+    session.request = request_with_timeout
     return session
 
 def load_cookies():

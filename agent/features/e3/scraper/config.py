@@ -29,6 +29,10 @@ FLASK_DEBUG = False  # Set to True for development
 # Selenium configuration
 SELENIUM_HEADLESS = True
 SELENIUM_TIMEOUT = 20
+SELENIUM_PAGE_LOAD_TIMEOUT = 30
+
+# Requests configuration
+REQUEST_TIMEOUT = 15.0
 
 # Semester filter (can be configured)
 SEMESTER_FILTER = "114下"  # Set to None to fetch all semesters
