@@ -1,4 +1,4 @@
-# HomeVault
+# XE3 / HomeVault
 
 A LINE bot focused on E3 course access, timelines, reminders, and lightweight utility features.
 
@@ -160,6 +160,8 @@ DISCORD_BOT_TOKEN=your_bot_token
 DISCORD_COMMAND_PREFIX=!
 # optional, only needed if you later add guild-scoped slash command sync
 DISCORD_GUILD_ID=
+# optional, for !chksys / system report naming
+APP_SERVICE_NAME=discord-bot.service
 ```
 
 Current Discord commands:
@@ -179,3 +181,27 @@ Current Discord commands:
 ```
 
 The Discord bot currently reuses the existing E3 and weather core logic and sends the text fallback for responses.
+
+### Discord Service
+
+Systemd template:
+
+```text
+deploy/systemd/discord-bot.service
+```
+
+Install and start:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp /home/eason/server/deploy/systemd/discord-bot.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now discord-bot.service
+```
+
+Useful checks:
+
+```bash
+systemctl --user status discord-bot.service
+journalctl --user -u discord-bot.service -f
+```

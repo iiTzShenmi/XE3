@@ -103,6 +103,10 @@ def discord_guild_id():
         return None
 
 
+def app_service_name():
+    return os.getenv("APP_SERVICE_NAME", "multi-task-agent.service").strip() or "multi-task-agent.service"
+
+
 def e3_encryption_key() -> bytes:
     secret = (
         os.getenv("E3_ENCRYPTION_KEY", "").strip()

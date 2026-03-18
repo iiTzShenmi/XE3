@@ -3,7 +3,7 @@ import os
 import shutil
 import subprocess
 
-from agent.config import cloudflared_url_file, tunnel_watchdog_state_file
+from agent.config import app_service_name, cloudflared_url_file, tunnel_watchdog_state_file
 
 
 def _systemctl_state(unit_name, user=False):
@@ -138,7 +138,7 @@ def _load_summary():
 def build_system_report():
     return (
         "System Check\n"
-        f"Main service: {_systemctl_state('multi-task-agent.service')}\n"
+        f"Main service: {_systemctl_state(app_service_name())}\n"
         f"Tunnel: {_tunnel_status_summary()}\n"
         f"Watchdog: {_watchdog_status_summary()}\n"
         f"{_load_summary()}\n"
