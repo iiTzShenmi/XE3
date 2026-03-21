@@ -40,14 +40,19 @@ def push_line_message(text):
     recipient = line_recipient()
     if not token or not recipient:
         return False
-    response = requests.post(
-        "https://api.line.me/v2/bot/message/push",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"to": recipient, "messages": [{"type": "text", "text": text}]},
-        timeout=10,
-    )
-    response.raise_for_status()
-    return True
+    try:
+        response = requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"to": recipient, "messages": [{"type": "text", "text": text}]},
+            timeout=10,
+        )
+        if response.status_code == 429:
+            return False
+        response.raise_for_status()
+        return True
+    except requests.RequestException:
+        return False
 
 
 def check_health():

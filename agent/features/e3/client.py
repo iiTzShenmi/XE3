@@ -137,6 +137,10 @@ def _read_all_courses_data(base_dir: str, courses_file_path: str | None = None) 
         if outline_data:
             course_data["course_outline"] = outline_data
 
+        timetable_data = _load_json(course_folder / "timetable.json")
+        if timetable_data:
+            course_data["timetable"] = timetable_data
+
         homework_page_data = _load_json(course_folder / "homework_page.json")
         if homework_page_data:
             course_data["homework_page"] = homework_page_data

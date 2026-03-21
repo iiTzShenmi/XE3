@@ -16,7 +16,7 @@ from discord.ext import commands
 from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
 from agent.features.e3 import handle_e3_command, run_e3_async_command
 from agent.features.e3.client import fetch_courses
-from agent.features.e3.db import get_user_id
+from agent.features.e3.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
 from agent.features.e3.reminders import build_test_reminder_payload, start_reminder_worker
 from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
 from agent.features.weather import handle_city_weather
@@ -28,6 +28,47 @@ logger = logging.getLogger(__name__)
 
 def _platform_user_key(user_id: int) -> str:
     return f"discord:{user_id}"
+
+
+def _remember_delivery_target(discord_user_id: int, channel_id: int | None, guild_id: int | None = None) -> None:
+    if not channel_id or not guild_id:
+        return
+    init_db()
+    upsert_discord_delivery_target(
+        _platform_user_key(discord_user_id),
+        str(channel_id),
+        str(guild_id) if guild_id else None,
+    )
+
+
+async def _remember_interaction_target(interaction: discord.Interaction) -> None:
+    await asyncio.to_thread(
+        _remember_delivery_target,
+        interaction.user.id,
+        interaction.channel_id,
+        interaction.guild_id,
+    )
+
+
+async def _remember_context_target(ctx: commands.Context) -> None:
+    channel = getattr(ctx, "channel", None)
+    guild = getattr(ctx, "guild", None)
+    channel_id = getattr(channel, "id", None)
+    guild_id = getattr(guild, "id", None)
+    await asyncio.to_thread(_remember_delivery_target, ctx.author.id, channel_id, guild_id)
+
+
+def _reminder_channel_payload(payload: Any, discord_user_id: int) -> Any:
+    mention = f"<@{discord_user_id}> Reminder for you:"
+    if isinstance(payload, str):
+        return f"{mention}\n{payload}"
+    if isinstance(payload, dict):
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            wrapped = dict(payload)
+            wrapped["messages"] = [{"type": "text", "text": mention}] + list(messages)
+            return wrapped
+    return f"{mention}\n{payload}"
 
 
 def _response_text(payload: Any) -> str:
@@ -173,10 +214,30 @@ class ReminderToggleButton(discord.ui.Button):
             await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
 
 
+class ReminderTestButton(discord.ui.Button):
+    def __init__(self, bot: commands.Bot, user_id: int):
+        self.bot = bot
+        self.user_id = user_id
+        super().__init__(label="Test Reminder", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This test button belongs to another user's session.")
+            return
+        internal_user_id = get_user_id(_platform_user_key(self.user_id))
+        if not internal_user_id:
+            await interaction.response.send_message("Please login to E3 first before testing reminders.")
+            return
+        await interaction.response.defer()
+        payload = await asyncio.to_thread(_build_reminder_test_payload, internal_user_id)
+        await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+
+
 class ReminderToggleView(discord.ui.View):
     def __init__(self, bot: commands.Bot, user_id: int, enabled: bool, timeout: float = 600):
         super().__init__(timeout=timeout)
         self.add_item(ReminderToggleButton(bot, user_id, enabled))
+        self.add_item(ReminderTestButton(bot, user_id))
 
 
 class CommandButtonView(discord.ui.View):
@@ -204,8 +265,19 @@ class _MessageCommandButton(discord.ui.Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This button belongs to another user's session.")
             return
-        await interaction.response.defer(thinking=True)
-        await _execute_e3_payload(interaction, self.command_text, self.user_id)
+        payload = await asyncio.to_thread(handle_e3_command, f"e3 {self.command_text.strip()}" if not self.command_text.strip().lower().startswith("e3") else self.command_text.strip(), logger, _platform_user_key(self.user_id))
+        edited = False
+        try:
+            edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
+        except discord.DiscordException:
+            logger.exception("discord_message_button_edit_failed user=%s command=%s", self.user_id, self.command_text)
+        if not interaction.response.is_done():
+            if edited:
+                await interaction.response.defer()
+            else:
+                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+        elif not edited:
+            await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
 
 
 def _primary_action(actions: list[dict[str, str]]) -> dict[str, str] | None:
@@ -236,6 +308,11 @@ def _is_file_entry(entry: tuple[str, str, dict[str, str]]) -> bool:
 def _select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
     if entries and all(_is_file_entry(entry) for entry in entries):
         return "Choose a file"
+    if entries and all(
+        (entry[2] or {}).get("kind") == "message" and str((entry[2] or {}).get("value") or "").strip().startswith("e3 詳情 ")
+        for entry in entries
+    ):
+        return "Choose homework details"
     return "Choose an item"
 
 
@@ -293,11 +370,23 @@ class _CommandSelect(discord.ui.Select):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This selector belongs to another user's session.")
             return
-        await interaction.response.defer(thinking=True)
         _, desc, action = self.entries[int(self.values[0])]
         if action.get("kind") == "message":
-            await _execute_e3_payload(interaction, action.get("value") or "", self.user_id, bot=self.bot)
+            payload = await asyncio.to_thread(handle_e3_command, action.get("value") or "", logger, _platform_user_key(self.user_id))
+            edited = False
+            try:
+                edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
+            except discord.DiscordException:
+                logger.exception("discord_selector_edit_failed user=%s command=%s", self.user_id, action.get("value") or "")
+            if not interaction.response.is_done():
+                if edited:
+                    await interaction.response.defer()
+                else:
+                    await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+            elif not edited:
+                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
             return
+        await interaction.response.defer(thinking=True)
         if action.get("kind") == "uri":
             selected_label = self.entries[int(self.values[0])][0] or action.get("label") or "Open file"
             file_obj, error_text = await asyncio.to_thread(_download_discord_attachment, self.user_id, action, selected_label)
@@ -331,6 +420,7 @@ class E3LoginModal(discord.ui.Modal, title="E3 Login"):
         self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True, ephemeral=True)
         command = f"login {self.account.value.strip()} {self.password.value.strip()}"
         await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot, ephemeral=True)
@@ -408,7 +498,10 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
         return False
     view = _build_preferred_view(bot, user_id, embeds[0], actions)
     content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
-    await message.edit(content=content, embeds=embeds[:10], view=view)
+    kwargs = {"content": content, "embeds": embeds[:10]}
+    if view is not None:
+        kwargs["view"] = view
+    await message.edit(**kwargs)
     return True
 
 
@@ -425,11 +518,14 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
     pending_actions: list[dict[str, str]] = []
 
     def _send_with(target_obj, *, embeds=None, view=None, content=None):
+        kwargs = {"content": content, "embeds": embeds}
+        if view is not None:
+            kwargs["view"] = view
         if isinstance(target_obj, discord.Interaction):
             if not target_obj.response.is_done() and not sent_any:
-                return target_obj.response.send_message(content=content, embeds=embeds, view=view, ephemeral=ephemeral)
-            return target_obj.followup.send(content=content, embeds=embeds, view=view, ephemeral=ephemeral)
-        return target_obj.send(content=content, embeds=embeds, view=view)
+                return target_obj.response.send_message(ephemeral=ephemeral, **kwargs)
+            return target_obj.followup.send(ephemeral=ephemeral, **kwargs)
+        return target_obj.send(**kwargs)
 
     async def flush_pending() -> None:
         nonlocal sent_any, pending_embeds, pending_actions
@@ -474,7 +570,13 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
             continue
         selector_candidates.append((embed, actions))
 
-    if only_cards and len(selector_candidates) > 2 and all(_primary_action(actions) for _, actions in selector_candidates):
+    all_detail_cards = selector_candidates and all(
+        (_primary_action(actions) or {}).get("kind") == "message"
+        and str((_primary_action(actions) or {}).get("value") or "").strip().startswith("e3 詳情 ")
+        for _, actions in selector_candidates
+    )
+
+    if only_cards and ((len(selector_candidates) > 2 and all(_primary_action(actions) for _, actions in selector_candidates)) or (all_detail_cards and len(selector_candidates) > 1)):
         for start in range(0, len(selector_candidates), MAX_SELECT_OPTIONS):
             await send_select_chunk(selector_candidates[start:start + MAX_SELECT_OPTIONS])
         return
@@ -533,6 +635,27 @@ async def _deliver_discord_dm(bot: commands.Bot, user_key: str, payload: Any) ->
         return True
     except discord.DiscordException:
         logger.exception("discord_reminder_delivery_failed user=%s", user_key)
+    target_row = get_discord_delivery_target(user_key)
+    channel_id = str(target_row["channel_id"] or "").strip() if target_row else ""
+    if not channel_id:
+        return False
+    try:
+        numeric_channel_id = int(channel_id)
+    except ValueError:
+        return False
+
+    channel = bot.get_channel(numeric_channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(numeric_channel_id)
+        except discord.DiscordException:
+            logger.exception("discord_reminder_channel_fetch_failed user=%s channel=%s", user_key, channel_id)
+            return False
+    try:
+        await _send_payload(channel, _reminder_channel_payload(payload, discord_user_id), bot=bot, user_id=discord_user_id)
+        return True
+    except discord.DiscordException:
+        logger.exception("discord_reminder_channel_delivery_failed user=%s channel=%s", user_key, channel_id)
         return False
 
 
@@ -661,6 +784,7 @@ def _create_bot() -> commands.Bot:
 
     @bot.command(name="weather")
     async def weather(ctx: commands.Context, *, city: str = ""):
+        await _remember_context_target(ctx)
         city = city.strip()
         if not city:
             await _send_text_chunks(ctx, f"Usage: {bot.command_prefix}weather <city>")
@@ -671,12 +795,14 @@ def _create_bot() -> commands.Bot:
 
     @bot.command(name="chksys")
     async def chksys(ctx: commands.Context):
+        await _remember_context_target(ctx)
         async with ctx.typing():
             payload = await asyncio.to_thread(build_system_report)
         await _send_text_chunks(ctx, payload)
 
     @bot.command(name="e3")
     async def e3(ctx: commands.Context, *, command: str = "help"):
+        await _remember_context_target(ctx)
         async with ctx.typing():
             await _execute_e3_payload(ctx, command.strip() or "help", ctx.author.id, bot=bot)
 
@@ -684,42 +810,55 @@ def _create_bot() -> commands.Bot:
 
     @e3_group.command(name="help", description="Show E3 help")
     async def e3_help(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
         await interaction.response.send_message(_build_help_text(str(bot.command_prefix)))
 
     @e3_group.command(name="login", description="Open a login form for E3")
     async def e3_login(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
         await interaction.response.send_modal(E3LoginModal(bot))
 
     @e3_group.command(name="relogin", description="Refresh your E3 session")
     async def e3_relogin(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, "relogin", interaction.user.id, bot=bot, ephemeral=True)
 
     @e3_group.command(name="course", description="Show current courses")
     async def e3_course(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True, ephemeral=True)
         await _execute_e3_payload(interaction, "course", interaction.user.id, bot=bot, ephemeral=True)
 
-    @e3_group.command(name="timeline", description="Show E3 timeline")
-    async def e3_timeline(interaction: discord.Interaction, kind: str | None = None):
+    @e3_group.command(name="timeline", description="Show upcoming homework and exams")
+    @app_commands.describe(kind="Optional filter: homework or exam")
+    @app_commands.choices(kind=[
+        app_commands.Choice(name="homework", value="homework"),
+        app_commands.Choice(name="exam", value="exam"),
+    ])
+    async def e3_timeline(interaction: discord.Interaction, kind: app_commands.Choice[str] | None = None):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True, ephemeral=True)
-        command = "timeline" if not kind else f"timeline {kind}"
+        command = "timeline academic" if not kind else f"timeline {kind.value}"
         await _execute_e3_payload(interaction, command, interaction.user.id, bot=bot, ephemeral=True)
 
     @e3_group.command(name="grades", description="Show grades")
     async def e3_grades(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True, ephemeral=True)
         await _execute_e3_payload(interaction, "grades", interaction.user.id, bot=bot, ephemeral=True)
 
     @e3_group.command(name="files", description="Browse files from one of your courses")
     @app_commands.autocomplete(keyword=_autocomplete_course_files)
     async def e3_files(interaction: discord.Interaction, keyword: str):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, f"files {keyword}", interaction.user.id, bot=bot)
 
     @e3_group.command(name="remind", description="Reminder settings")
     @app_commands.describe(action="show, on, off, or test")
     async def e3_remind(interaction: discord.Interaction, action: str = "show"):
+        await _remember_interaction_target(interaction)
         normalized = (action or "show").strip().lower()
         if normalized == "test":
             await interaction.response.defer(thinking=True)
@@ -738,6 +877,7 @@ def _create_bot() -> commands.Bot:
 
     @bot.tree.command(name="weather", description="Get weather by city")
     async def slash_weather(interaction: discord.Interaction, city: str):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True)
         payload = await asyncio.to_thread(handle_city_weather, city, logger)
         await _send_payload(interaction, payload, bot=bot, user_id=interaction.user.id)
@@ -745,6 +885,7 @@ def _create_bot() -> commands.Bot:
     @bot.tree.command(name="chksys", description="Show system status")
     @_is_owner_check()
     async def slash_chksys(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True, ephemeral=True)
         payload = await asyncio.to_thread(build_system_report)
         await _send_text_chunks(interaction, payload, ephemeral=True)

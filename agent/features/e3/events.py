@@ -76,6 +76,18 @@ def _make_event_uid(*parts):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _assignment_is_completed(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("is_completed") is True:
+        return True
+    category = str(item.get("category") or "").strip().lower()
+    if category == "submitted":
+        return True
+    submitted_files = item.get("submitted_files") or []
+    return bool(submitted_files)
+
+
 def extract_events_from_fetch_all(data, calendar_events=None):
     if not isinstance(data, dict):
         data = {}
@@ -96,14 +108,14 @@ def extract_events_from_fetch_all(data, calendar_events=None):
                     if not isinstance(item, dict):
                         continue
                     category = str(item.get("category") or "").strip().lower()
-                    submitted_files = item.get("submitted_files") or []
                     if category and category not in {"in_progress", "upcoming"}:
                         continue
-                    if submitted_files:
+                    if _assignment_is_completed(item):
                         continue
                     title = str(item.get("title") or item.get("name") or "未命名作業").strip()
                     due_raw = (
                         item.get("due")
+                        or item.get("due_time")
                         or item.get("due_date")
                         or item.get("deadline")
                         or item.get("截止")

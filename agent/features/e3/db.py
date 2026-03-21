@@ -152,6 +152,17 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discord_delivery_targets (
+              user_id INTEGER PRIMARY KEY,
+              channel_id TEXT,
+              guild_id TEXT,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
 
 
 def upsert_user(line_user_id: str) -> int:
@@ -173,6 +184,37 @@ def get_user_id(line_user_id: str) -> int | None:
     with get_conn() as conn:
         row = conn.execute("SELECT id FROM users WHERE line_user_id=?", (line_user_id,)).fetchone()
         return row["id"] if row else None
+
+
+def upsert_discord_delivery_target(line_user_id: str, channel_id: str | None, guild_id: str | None = None) -> None:
+    user_id = upsert_user(line_user_id)
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO discord_delivery_targets (user_id, channel_id, guild_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              channel_id=excluded.channel_id,
+              guild_id=excluded.guild_id,
+              updated_at=excluded.updated_at
+            """,
+            (user_id, str(channel_id or "").strip() or None, str(guild_id or "").strip() or None, now),
+        )
+
+
+def get_discord_delivery_target(line_user_id: str):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT discord_delivery_targets.channel_id, discord_delivery_targets.guild_id, discord_delivery_targets.updated_at
+            FROM users
+            JOIN discord_delivery_targets ON discord_delivery_targets.user_id = users.id
+            WHERE users.line_user_id=?
+            LIMIT 1
+            """,
+            (line_user_id,),
+        ).fetchone()
 
 
 def upsert_e3_account(

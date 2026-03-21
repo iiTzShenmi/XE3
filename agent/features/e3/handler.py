@@ -41,6 +41,8 @@ EVENT_TYPE_ALIASES = {
     "calendar": "calendar",
     "考試": "exam",
     "exam": "exam",
+    "academic": "academic",
+    "學業": "academic",
 }
 
 
@@ -257,7 +259,7 @@ def _list_courses(logger, line_user_id):
         text_lines.append(f"   作業 {summary['homework_count']}｜成績 {summary['grade_count']}｜檔案 {summary['file_count']}")
         bubbles.append(_build_course_bubble(summary))
 
-    messages = [_build_cache_status_flex(cache_status, "課程快取")]
+    messages = [item for item in [_build_cache_status_flex(cache_status, "課程快取")] if item]
     if bubbles:
         messages.append(
             {
@@ -373,7 +375,7 @@ def _list_grades(logger, line_user_id):
             lines.append(f"   ...另有 {remaining} 筆")
         bubbles.append(_build_grade_bubble(course_group))
 
-    messages = [_build_cache_status_flex(cache_status, "成績快取")]
+    messages = [item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]
     if bubbles:
         messages.append(
             {
@@ -500,6 +502,18 @@ def _assignment_items(payload):
     return []
 
 
+def _is_assignment_completed(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("is_completed") is True:
+        return True
+    category = str(item.get("category") or "").strip().lower()
+    if category == "submitted":
+        return True
+    submitted_files = item.get("submitted_files") or []
+    return bool(submitted_files)
+
+
 def _current_semester_courses(courses, semester_tag=None):
     semester_tag = semester_tag or _current_semester_tag()
     filtered = []
@@ -527,10 +541,9 @@ def _filter_active_homework_rows(rows, courses):
                 if not isinstance(item, dict):
                     continue
                 category = str(item.get("category") or "").strip().lower()
-                submitted_files = item.get("submitted_files") or []
                 if category not in {"in_progress", "upcoming"}:
                     continue
-                if submitted_files:
+                if _is_assignment_completed(item):
                     continue
                 title = re.sub(r"\s+", " ", str(item.get("title") or "").strip())
                 if course_id and title:
@@ -603,7 +616,7 @@ def _list_files(tokens, logger, line_user_id):
     if not bubbles:
         return f"「{keyword}」目前沒有可用檔案連結。"
 
-    messages = [_build_cache_status_flex(cache_status, "檔案快取")]
+    messages = [item for item in [_build_cache_status_flex(cache_status, "檔案快取")] if item]
     messages.append(
         {
             "type": "flex",
@@ -661,12 +674,19 @@ def _count_active_assignments(payload):
         if not isinstance(item, dict):
             continue
         category = str(item.get("category") or "").strip().lower()
-        submitted_files = item.get("submitted_files") or []
         if category and category not in {"in_progress", "upcoming"}:
             continue
-        if submitted_files:
+        if _is_assignment_completed(item):
             continue
         count += 1
+    return count
+
+
+def _count_completed_assignments(payload):
+    count = 0
+    for item in _assignment_items(payload):
+        if _is_assignment_completed(item):
+            count += 1
     return count
 
 
@@ -953,22 +973,45 @@ def _shorten_title(title, max_len=32):
     return text[: max_len - 1].rstrip() + "…"
 
 
-def _format_due_at_for_display(value):
+def _normalize_due_at(value):
     if not value:
-        return "N/A"
-
+        return None
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
-        return str(value)
+        return None
 
     taipei_tz = timezone(timedelta(hours=8))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=taipei_tz)
     else:
         dt = dt.astimezone(taipei_tz)
+    return dt
+
+
+def _is_discord_user_key(user_key):
+    return str(user_key or "").startswith("discord:")
+
+
+def _discord_relative_due_tag(value, user_key=None):
+    if not _is_discord_user_key(user_key):
+        return ""
+    dt = _normalize_due_at(value)
+    if dt is None:
+        return ""
+    return f" <t:{int(dt.timestamp())}:R>"
+
+
+def _format_due_at_for_display(value, user_key=None):
+    if not value:
+        return "N/A"
+
+    dt = _normalize_due_at(value)
+    if dt is None:
+        return str(value)
+
     weekdays = ["一", "二", "三", "四", "五", "六", "日"]
-    return dt.strftime("%m/%d") + f" ({weekdays[dt.weekday()]}) " + dt.strftime("%H:%M")
+    return dt.strftime("%m/%d") + f" ({weekdays[dt.weekday()]}) " + dt.strftime("%H:%M") + _discord_relative_due_tag(value, user_key)
 
 
 def _format_event_type_label(event_type):
@@ -1004,6 +1047,23 @@ def _timeline_heading(event_type):
     return f"{section_emoji} 【{_format_event_type_label(event_type)}】"
 
 
+def _parse_due_at_sort_key(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return datetime.max.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.max.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone(timedelta(hours=8))).astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _timeline_rows_sorted(rows):
+    return sorted(rows, key=lambda row: (_parse_due_at_sort_key(row["due_at"]), str(row["title"] or "")))
+
+
 def _line_response(text, messages=None):
     payload = {"text": text}
     if messages:
@@ -1028,10 +1088,7 @@ def _build_cache_status_flex(cache_status, title):
         body_text = "Use Force Update to fetch the latest data from E3."
         accent = "#B45309"
     elif cache_status.get("is_fresh"):
-        age_minutes = int(cache_status.get("age_minutes") or 0)
-        header_text = f"Fresh cache · {age_minutes} min old"
-        body_text = "This response is served from local data for faster performance."
-        accent = "#15803D"
+        return None
     else:
         age_minutes = int(cache_status.get("age_minutes") or 0)
         ttl_minutes = int(cache_status.get("ttl_minutes") or 15)
@@ -1088,7 +1145,8 @@ def _store_last_event_index(line_user_id, ordered_groups):
     if not line_user_id:
         return
     mapping = {}
-    for _, items in ordered_groups:
+    for group in ordered_groups:
+        items = group[-1]
         for idx, row in items:
             event_uid = row["event_uid"] if isinstance(row, dict) else row["event_uid"]
             if event_uid:
@@ -1234,7 +1292,7 @@ def _build_reminder_settings_flex(enabled, schedule, alt_text):
     }
 
 
-def _build_timeline_flex(rows, alt_text, hero_title, event_type=None):
+def _build_timeline_flex(rows, alt_text, hero_title, event_type=None, line_user_id=None):
     bubbles = []
     accent = {
         "exam": "#B22222",
@@ -1242,9 +1300,24 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None):
         "calendar": "#2563EB",
     }.get(event_type, "#4B5563")
     for idx, row in rows[:10]:
-        due_at = _format_due_at_for_display(row["due_at"])
+        due_at = _format_due_at_for_display(row["due_at"], line_user_id)
         course_name = _course_name_for_display(row["course_name"] or row["course_id"] or "-")
         title = _shorten_title(row["title"], max_len=44)
+        footer_contents = [
+            {
+                "type": "button",
+                "style": "primary",
+                "height": "sm",
+                "color": accent,
+                "action": {
+                    "type": "message",
+                    "label": "查看詳情",
+                    "text": f"e3 詳情 {idx}",
+                },
+            }
+        ]
+        footer_contents.extend(_timeline_homework_file_buttons(row, line_user_id))
+
         bubbles.append(
             {
                 "type": "bubble",
@@ -1302,19 +1375,7 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None):
                     "type": "box",
                     "layout": "vertical",
                     "spacing": "sm",
-                    "contents": [
-                        {
-                            "type": "button",
-                            "style": "primary",
-                            "height": "sm",
-                            "color": accent,
-                            "action": {
-                                "type": "message",
-                                "label": "查看詳情",
-                                "text": f"e3 詳情 {idx}",
-                            },
-                        }
-                    ],
+                    "contents": footer_contents,
                 },
             }
         )
@@ -1332,7 +1393,67 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None):
     }
 
 
-def _build_detail_flex(row, index, alt_text):
+def _detail_file_buttons(payload, line_user_id):
+    if not line_user_id:
+        return []
+
+    file_entries = []
+    for item in payload.get("attachments") or []:
+        if isinstance(item, dict):
+            file_entries.append(("附件", item))
+    for item in payload.get("submitted_files") or []:
+        if isinstance(item, dict):
+            file_entries.append(("已繳", item))
+
+    buttons = []
+    for idx, (label_prefix, item) in enumerate(file_entries[:3], start=1):
+        source_url = str(item.get("url") or "").strip()
+        title = str(item.get("name") or "").strip() or f"{label_prefix}{idx}"
+        if not source_url:
+            continue
+        buttons.append(
+            {
+                "type": "button",
+                "style": "link",
+                "height": "sm",
+                "action": {
+                    "type": "uri",
+                    "label": f"{label_prefix}{idx}",
+                    "uri": build_proxy_url(line_user_id, source_url, filename=title),
+                },
+            }
+        )
+    return buttons
+
+
+def _row_value(row, key, default=None):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _timeline_homework_file_buttons(row, line_user_id):
+    if not line_user_id or str(_row_value(row, "event_type", "") or "") != "homework":
+        return []
+
+    payload = {}
+    payload_json = _row_value(row, "payload_json", "") or ""
+    if payload_json:
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            payload = {}
+
+    return _detail_file_buttons(payload, line_user_id)[:2]
+
+
+def _build_detail_flex(row, index, alt_text, line_user_id=None):
     payload = {}
     payload_json = row["payload_json"] or ""
     if payload_json:
@@ -1367,6 +1488,7 @@ def _build_detail_flex(row, index, alt_text):
                 },
             }
         )
+    action_buttons.extend(_detail_file_buttons(payload, line_user_id))
 
     return {
         "type": "flex",
@@ -1398,7 +1520,7 @@ def _build_detail_flex(row, index, alt_text):
                     {"type": "text", "text": _course_name_for_display(row["course_name"] or row["course_id"] or "-"), "weight": "bold", "wrap": True},
                     {"type": "text", "text": row["title"], "wrap": True, "size": "sm"},
                     {"type": "separator", "margin": "md"},
-                    {"type": "text", "text": f"截止：{_format_due_at_full(row['due_at'])}", "size": "sm", "wrap": True},
+                    {"type": "text", "text": f"截止：{_format_due_at_full(row['due_at'], line_user_id)}", "size": "sm", "wrap": True},
                     {"type": "text", "text": f"顯示日期：{payload.get('date_label') or '-'}", "size": "sm", "wrap": True},
                 ],
             },
@@ -1431,12 +1553,11 @@ def _collect_course_homework_items(payload):
         if not isinstance(item, dict):
             continue
         category = str(item.get("category") or "").strip().lower()
-        submitted_files = item.get("submitted_files") or []
         if category and category not in {"in_progress", "upcoming"}:
             continue
-        if submitted_files:
+        if _is_assignment_completed(item):
             continue
-        due_raw = item.get("due") or item.get("due_date") or item.get("deadline") or item.get("截止")
+        due_raw = item.get("due") or item.get("due_time") or item.get("due_date") or item.get("deadline") or item.get("截止")
         items.append(
             {
                 "title": str(item.get("title") or item.get("name") or "未命名作業").strip(),
@@ -1451,7 +1572,12 @@ def _build_course_detail_flex(detail, alt_text):
         {"type": "text", "text": detail["course_name"], "weight": "bold", "wrap": True, "size": "lg"},
         {"type": "text", "text": detail["course_id"] or "未提供課號", "size": "sm", "color": "#475569"},
         {"type": "separator", "margin": "md"},
-        {"type": "text", "text": f"作業：{detail['homework_count']}　行事曆：{detail['calendar_count']}　檔案：{detail['file_count']}", "size": "sm", "wrap": True},
+        {
+            "type": "text",
+            "text": f"未完成作業：{detail['homework_count']}　已完成作業：{detail['completed_homework_count']}　行事曆：{detail['calendar_count']}　檔案：{detail['file_count']}",
+            "size": "sm",
+            "wrap": True,
+        },
     ]
     if detail["homework_lines"]:
         body_contents.append({"type": "text", "text": "作業", "weight": "bold", "size": "sm", "margin": "md"})
@@ -1519,21 +1645,14 @@ def _build_course_detail_flex(detail, alt_text):
     }
 
 
-def _format_due_at_full(value):
+def _format_due_at_full(value, user_key=None):
     if not value:
         return "N/A"
 
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+    dt = _normalize_due_at(value)
+    if dt is None:
         return str(value)
-
-    taipei_tz = timezone(timedelta(hours=8))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=taipei_tz)
-    else:
-        dt = dt.astimezone(taipei_tz)
-    return dt.strftime("%Y/%m/%d %H:%M")
+    return dt.strftime("%Y/%m/%d %H:%M") + _discord_relative_due_tag(value, user_key)
 
 
 def _extract_detail_index(action, tokens):
@@ -1546,7 +1665,7 @@ def _extract_detail_index(action, tokens):
     return None
 
 
-def _format_event_detail(row, index):
+def _format_event_detail(row, index, user_key=None):
     payload = {}
     payload_json = row["payload_json"] or ""
     if payload_json:
@@ -1559,7 +1678,7 @@ def _format_event_detail(row, index):
     lines.append(f"類型：{_format_event_type_label(row['event_type'])}")
     lines.append(f"課程：{_course_name_for_display(row['course_name'] or row['course_id'] or '-')}")
     lines.append(f"標題：{row['title']}")
-    lines.append(f"截止：{_format_due_at_full(row['due_at'])}")
+    lines.append(f"截止：{_format_due_at_full(row['due_at'], user_key)}")
 
     date_label = payload.get("date_label")
     if date_label:
@@ -1572,6 +1691,13 @@ def _format_event_detail(row, index):
     event_id = payload.get("event_id")
     if event_id:
         lines.append(f"事件 ID：{event_id}")
+
+    attachments = payload.get("attachments") or []
+    submitted_files = payload.get("submitted_files") or []
+    if attachments:
+        lines.append(f"附件：{len(attachments)} 個")
+    if submitted_files:
+        lines.append(f"已繳檔案：{len(submitted_files)} 個")
 
     return "\n".join(lines)
 
@@ -1597,57 +1723,120 @@ def _format_timeline(rows, header):
 
 
 def _build_timeline_display_groups(rows):
-    grouped_rows = {"exam": [], "homework": [], "calendar": []}
-    for row in rows:
-        grouped_rows.setdefault(row["event_type"], []).append(row)
+    ordered_rows = _timeline_rows_sorted(rows)
+    if not ordered_rows:
+        return []
 
-    section_order = ["exam", "homework", "calendar"]
     ordered = []
     display_index = 1
-    for event_type in section_order:
-        items = grouped_rows.get(event_type) or []
-        section_items = []
-        for row in items:
-            section_items.append((display_index, row))
+    if len({str(row["event_type"]) for row in ordered_rows}) == 1:
+        event_type = str(ordered_rows[0]["event_type"])
+        ordered.append((event_type, [(idx, row) for idx, row in enumerate(ordered_rows, start=1)]))
+        return ordered
+
+    mixed_items = []
+    for row in ordered_rows:
+        mixed_items.append((display_index, row))
+        display_index += 1
+    ordered.append(("mixed", mixed_items))
+    return ordered
+
+
+def _build_timeline_urgency_groups(rows):
+    ordered_rows = _timeline_rows_sorted(rows)
+    if not ordered_rows:
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    buckets = [
+        ("urgent", "🚨 Due within 48h", []),
+        ("week", "📅 This Week", []),
+        ("later", "📌 Later", []),
+    ]
+
+    for row in ordered_rows:
+        due_dt = _parse_due_at_sort_key(row["due_at"])
+        delta = due_dt - now_utc
+        if delta <= timedelta(hours=48):
+            buckets[0][2].append(row)
+        elif delta <= timedelta(days=7):
+            buckets[1][2].append(row)
+        else:
+            buckets[2][2].append(row)
+
+    ordered = []
+    display_index = 1
+    for bucket_key, bucket_label, bucket_rows in buckets:
+        if not bucket_rows:
+            continue
+        indexed_rows = []
+        for row in bucket_rows:
+            indexed_rows.append((display_index, row))
             display_index += 1
-        ordered.append((event_type, section_items))
+        ordered.append((bucket_key, bucket_label, indexed_rows))
     return ordered
 
 
 def _filter_rows_by_event_type(rows, event_type):
     if not event_type:
         return rows
+    if event_type == "academic":
+        return [row for row in rows if row["event_type"] in {"homework", "exam"}]
     return [row for row in rows if row["event_type"] == event_type]
 
 
-def _build_timeline_messages(rows, header, event_type=None):
+def _build_timeline_messages(rows, header, event_type=None, line_user_id=None):
     filtered_rows = _filter_rows_by_event_type(rows, event_type)
     if not filtered_rows:
         return None, [], []
 
-    ordered_groups = _build_timeline_display_groups(filtered_rows)
+    filtered_rows = _timeline_rows_sorted(filtered_rows)
+    use_triage = event_type is None
+    ordered_groups = _build_timeline_urgency_groups(filtered_rows) if use_triage else _build_timeline_display_groups(filtered_rows)
     text_sections = []
     messages = []
-    for group_event_type, items in ordered_groups:
+    for group in ordered_groups:
+        if use_triage:
+            group_event_type, heading, items = group
+        else:
+            group_event_type, items = group
+            heading = "🗓️ 時間軸" if group_event_type == "mixed" else _timeline_heading(group_event_type)
         if not items:
             continue
-        if not text_sections:
+        if use_triage:
+            section_lines = [header] if not text_sections else []
+        elif group_event_type == "mixed":
+            section_lines = [header] if not text_sections else []
+        elif not text_sections:
             section_lines = [header, _timeline_heading(group_event_type)]
         else:
             section_lines = [_timeline_heading(group_event_type)]
+        if use_triage:
+            section_lines.append(heading)
         for idx, row in items:
-            due_at = _format_due_at_for_display(row["due_at"])
+            due_at = _format_due_at_for_display(row["due_at"], line_user_id)
             course_name = _shorten_course_name(row["course_name"] or row["course_id"] or "-")
             title = _shorten_title(row["title"])
-            icon = "👉" if group_event_type == "homework" else "📍"
+            icon = "👉" if row["event_type"] == "homework" else "📍"
+            type_label = _format_event_type_label(row["event_type"])
             section_lines.append(f"{idx}. {due_at} ｜{course_name}")
-            section_lines.append(f"   {icon} {title}")
+            if use_triage or group_event_type == "mixed":
+                section_lines.append(f"   {icon} [{type_label}] {title}")
+            else:
+                section_lines.append(f"   {icon} {title}")
             section_lines.append("")
         if section_lines[-1] == "":
             section_lines.pop()
         section_text = "\n".join(section_lines)
         text_sections.append(section_text)
-        flex = _build_timeline_flex(items, section_text, _timeline_heading(group_event_type), event_type=group_event_type)
+        hero_title = heading
+        flex = _build_timeline_flex(
+            items,
+            section_text,
+            hero_title,
+            event_type=None if use_triage or group_event_type == "mixed" else group_event_type,
+            line_user_id=line_user_id,
+        )
         if flex:
             messages.append(flex)
 
@@ -1681,8 +1870,8 @@ def _event_detail(action, tokens, line_user_id):
     if row is None:
         return f"找不到第 {index} 筆事件，請先輸入 `e3 近期` 或 `e3 timeline` 確認編號。"
 
-    text = _format_event_detail(row, index)
-    flex = _build_detail_flex(row, index, text)
+    text = _format_event_detail(row, index, line_user_id)
+    flex = _build_detail_flex(row, index, text, line_user_id=line_user_id)
     return _line_response(text, messages=[flex] if flex else None)
 
 
@@ -1725,6 +1914,7 @@ def _course_detail(action, tokens, logger, line_user_id):
         "course_id": course_id,
         "course_name": course_name,
         "homework_count": _count_active_assignments(payload),
+        "completed_homework_count": _count_completed_assignments(payload),
         "calendar_count": len(calendar_items),
         "file_count": _count_file_items(links),
         "homework_lines": [
@@ -1741,7 +1931,7 @@ def _course_detail(action, tokens, logger, line_user_id):
     text_lines = [
         f"📘 課程詳情 #{index}",
         f"課程：{course_id} {course_name}".strip(),
-        f"作業：{detail['homework_count']}｜行事曆：{detail['calendar_count']}｜檔案：{detail['file_count']}",
+        f"未完成作業：{detail['homework_count']}｜已完成作業：{detail['completed_homework_count']}｜行事曆：{detail['calendar_count']}｜檔案：{detail['file_count']}",
         "作業：" + ("；".join(detail["homework_lines"]) if detail["homework_lines"] else "-"),
         "行事曆：" + ("；".join(detail["calendar_lines"]) if detail["calendar_lines"] else "-"),
         "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
@@ -2192,11 +2382,16 @@ def _upcoming(tokens, line_user_id):
     rows = _filter_active_homework_rows(rows, courses)
     if event_type == "homework" and not rows:
         return "目前沒有未繳且尚未過期的作業。"
-    text, messages, ordered_groups = _build_timeline_messages(rows, "⏰ 近期提醒（前 10 筆）：", event_type=event_type)
+    text, messages, ordered_groups = _build_timeline_messages(
+        rows,
+        "⏰ 近期提醒（前 10 筆）：",
+        event_type=event_type,
+        line_user_id=line_user_id,
+    )
     if not text:
         return "目前沒有符合條件的近期事件。"
     text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
-    messages = [_build_cache_status_flex(cache_status, "近期事件快取")] + (messages or [])
+    messages = [item for item in [_build_cache_status_flex(cache_status, "近期事件快取")] if item] + (messages or [])
     _store_last_event_index(line_user_id, ordered_groups)
     return _line_response(text, messages=messages or None)
 
@@ -2233,10 +2428,15 @@ def _timeline(tokens, line_user_id, logger):
     except Exception:
         courses = {}
     rows = _filter_active_homework_rows(rows, courses)
-    text, messages, ordered_groups = _build_timeline_messages(rows, "🗓️ E3 時間軸（前 20 筆）：", event_type=event_type)
+    text, messages, ordered_groups = _build_timeline_messages(
+        rows,
+        "🗓️ E3 時間軸（前 20 筆）：",
+        event_type=event_type,
+        line_user_id=line_user_id,
+    )
     if not text:
         return "目前沒有符合條件的時間軸事件。"
     text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
-    messages = [_build_cache_status_flex(cache_status, "時間軸快取")] + (messages or [])
+    messages = [item for item in [_build_cache_status_flex(cache_status, "時間軸快取")] if item] + (messages or [])
     _store_last_event_index(line_user_id, ordered_groups)
     return _line_response(text, messages=messages or None)

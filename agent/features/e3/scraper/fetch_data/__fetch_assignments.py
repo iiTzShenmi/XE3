@@ -6,6 +6,42 @@ from ..utils import save_json, load_json, ensure_course_folder, safe_name
 from .. import config
 from .. import db_manager
 
+
+def _submission_status_completed(detail_soup):
+    positive_markers = [
+        "submitted for grading",
+        "submission status submitted for grading",
+        "submission has been made",
+        "已繳交",
+        "已提交",
+        "已送出",
+    ]
+    negative_markers = [
+        "not submitted",
+        "no attempt",
+        "no submissions have been made yet",
+        "未繳交",
+        "未提交",
+        "尚未提交",
+    ]
+
+    for row in detail_soup.select("tr"):
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        label = cells[0].get_text(" ", strip=True).lower()
+        value = cells[1].get_text(" ", strip=True).lower()
+        if not label:
+            continue
+        if "submission status" in label or "提交狀態" in label or "繳交狀態" in label:
+            if any(marker in value for marker in positive_markers) and not any(marker in value for marker in negative_markers):
+                return True
+
+    page_text = detail_soup.get_text(" ", strip=True).lower()
+    if any(marker in page_text for marker in positive_markers) and not any(marker in page_text for marker in negative_markers):
+        return True
+    return False
+
 def _find_nearest_submit_time(node):
     """Try to find the fileuploadsubmissiontime related to node by searching siblings/nearby nodes."""
     # 1) try immediate next siblings (small window)
@@ -110,6 +146,7 @@ def fetch_assignments(course_id, course_name, session, cookies):
             content = ""
             attachments = []       # instructor-uploaded files (web)
             submitted_files = []   # student's submitted files
+            submission_detected = category == "submitted"
             assignment_folder = os.path.join(homework_folder, safe_name(title))
             os.makedirs(assignment_folder, exist_ok=True)
             submitted_folder = os.path.join(assignment_folder, "submitted")
@@ -122,6 +159,7 @@ def fetch_assignments(course_id, course_name, session, cookies):
                     detail_resp = session.get(detail_url, cookies=cookies)
                     detail_resp.raise_for_status()
                     detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
+                    submission_detected = submission_detected or _submission_status_completed(detail_soup)
 
                     # === DESCRIPTION: remove file/submission nodes so they don't leak into content ===
                     # Clone (or operate on copy) — we'll remove nodes from soup copy to extract a clean description.
@@ -169,6 +207,7 @@ def fetch_assignments(course_id, course_name, session, cookies):
                         if "assignsubmission_file" in furl or "submission_files" in furl:
                             # Find nearest submission time
                             s_time = _find_nearest_submit_time(sub_div) or None
+                            submission_detected = True
 
                             # Check previous record to decide if we need to download
                             need_download = True
@@ -206,7 +245,8 @@ def fetch_assignments(course_id, course_name, session, cookies):
                 "category": category,
                 "content": content,
                 "attachments": attachments,
-                "submitted_files": submitted_files
+                "submitted_files": submitted_files,
+                "is_completed": bool(submission_detected or submitted_files),
             })
 
     #remove same assignment using priority

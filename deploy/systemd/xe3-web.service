@@ -1,0 +1,16 @@
+[Unit]
+Description=XE3 Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/server
+Environment=PYTHONPATH=%h/server
+EnvironmentFile=%h/server/.env
+ExecStart=%h/server/venv/bin/python %h/server/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
