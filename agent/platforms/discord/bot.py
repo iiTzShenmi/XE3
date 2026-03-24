@@ -318,6 +318,10 @@ def _repeated_message_label(entries: list[tuple[str, str, dict[str, str]]]) -> s
     return None
 
 
+def _all_file_entries(entries: list[tuple[str, str, dict[str, str]]]) -> bool:
+    return bool(entries) and all(_is_file_entry(entry) for entry in entries)
+
+
 def _select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
     if entries and all(_is_file_entry(entry) for entry in entries):
         return "Choose a file"
@@ -531,10 +535,15 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
             selector_entries.append((_select_option_label(embed, action), _embed_option_description(embed), action))
 
     repeated_label_cards = bool(selector_entries and _repeated_message_label(selector_entries))
+    file_selector_cards = bool(selector_entries and _all_file_entries(selector_entries) and len(selector_entries) > 1)
     should_use_selector = (
         selector_entries
         and len(selector_entries) <= MAX_SELECT_OPTIONS
-        and ((len(selector_candidates) > 2 and all(_primary_action(item_actions) for _, item_actions in selector_candidates)) or (repeated_label_cards and len(selector_candidates) > 1))
+        and (
+            file_selector_cards
+            or (len(selector_candidates) > 2 and all(_primary_action(item_actions) for _, item_actions in selector_candidates))
+            or (repeated_label_cards and len(selector_candidates) > 1)
+        )
     )
 
     content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
@@ -626,6 +635,7 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
         selector_candidates.append((embed, actions))
 
     repeated_label_cards = False
+    file_selector_cards = False
     if selector_candidates:
         selector_entries = []
         for embed, actions in selector_candidates:
@@ -635,8 +645,13 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
                 break
             selector_entries.append((_select_option_label(embed, action), _embed_option_description(embed), action))
         repeated_label_cards = bool(selector_entries and _repeated_message_label(selector_entries))
+        file_selector_cards = bool(selector_entries and _all_file_entries(selector_entries) and len(selector_entries) > 1)
 
-    if selector_candidates and ((len(selector_candidates) > 2 and all(_primary_action(actions) for _, actions in selector_candidates)) or (repeated_label_cards and len(selector_candidates) > 1)):
+    if selector_candidates and (
+        file_selector_cards
+        or (len(selector_candidates) > 2 and all(_primary_action(actions) for _, actions in selector_candidates))
+        or (repeated_label_cards and len(selector_candidates) > 1)
+    ):
         for start in range(0, len(selector_candidates), MAX_SELECT_OPTIONS):
             await send_select_chunk(selector_candidates[start:start + MAX_SELECT_OPTIONS])
         return
