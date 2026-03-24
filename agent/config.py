@@ -150,7 +150,7 @@ def port():
 
 
 def e3_sync_interval_minutes():
-    return max(15, _get_int("E3_SYNC_INTERVAL_MINUTES", 30))
+    return max(15, _get_int("E3_SYNC_INTERVAL_MINUTES", 60))
 
 
 def e3_cache_ttl_minutes():
@@ -167,6 +167,10 @@ def e3_file_proxy_ttl_seconds():
 
 def e3_file_proxy_max_bytes():
     return max(1024 * 1024, _get_int("E3_FILE_PROXY_MAX_BYTES", 25 * 1024 * 1024))
+
+
+def e3_file_proxy_max_uses():
+    return max(1, _get_int("E3_FILE_PROXY_MAX_USES", 3))
 
 
 def tunnel_data_root():

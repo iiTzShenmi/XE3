@@ -19,6 +19,16 @@ def _systemctl_state(unit_name, user=False):
     return state or f"exit:{result.returncode}"
 
 
+def _preferred_app_services():
+    configured = app_service_name()
+    services = []
+    for candidate in [configured, "discord-bot.service", "xe3-web.service"]:
+        name = str(candidate or "").strip()
+        if name and name not in services:
+            services.append(name)
+    return services
+
+
 def _process_active(pattern):
     try:
         result = subprocess.run(
@@ -136,9 +146,21 @@ def _load_summary():
 
 
 def build_system_report():
+    service_lines = []
+    for service_name in _preferred_app_services():
+        state = _systemctl_state(service_name, user=True)
+        if service_name == "multi-task-agent.service" and state == "inactive":
+            continue
+        label = {
+            "discord-bot.service": "Discord bot",
+            "xe3-web.service": "Web service",
+        }.get(service_name, "Main service")
+        service_lines.append(f"{label}: {state}")
+
     return (
         "System Check\n"
-        f"Main service: {_systemctl_state(app_service_name())}\n"
+        + "\n".join(service_lines)
+        + "\n"
         f"Tunnel: {_tunnel_status_summary()}\n"
         f"Watchdog: {_watchdog_status_summary()}\n"
         f"{_load_summary()}\n"

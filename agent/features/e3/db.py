@@ -534,6 +534,22 @@ def list_reminder_targets():
         ).fetchall()
 
 
+def list_sync_targets():
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT
+              users.id AS user_id,
+              users.line_user_id AS line_user_id,
+              e3_accounts.login_status AS login_status
+            FROM users
+            JOIN e3_accounts ON e3_accounts.user_id = users.id
+            WHERE e3_accounts.encrypted_password IS NOT NULL
+            ORDER BY users.id ASC
+            """
+        ).fetchall()
+
+
 def notification_sent(user_id: int, notification_type: str, details: str | None = None) -> bool:
     with get_conn() as conn:
         row = conn.execute(

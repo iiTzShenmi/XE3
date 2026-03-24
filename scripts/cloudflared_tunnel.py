@@ -25,6 +25,8 @@ def main():
         "tunnel",
         "--url",
         f"http://127.0.0.1:{port()}",
+        "--protocol",
+        "http2",
         "--no-autoupdate",
     ]
     process = subprocess.Popen(

@@ -74,6 +74,83 @@ def _find_nearest_submit_time(node):
     return None
 
 
+def _collect_assignment_links(detail_soup, base_url):
+    attachment_candidates = []
+    submitted_candidates = []
+    seen = set()
+
+    for link in detail_soup.select("a[href]"):
+        href = str(link.get("href") or "").strip()
+        if not href:
+            continue
+        abs_url = urljoin(base_url, href)
+        if "/pluginfile.php/" not in abs_url:
+            continue
+        fname = safe_name(link.get_text(strip=True))
+        if not fname:
+            continue
+        key = (fname, abs_url)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        classes = " ".join(link.get("class") or [])
+        context_text = ""
+        parent = link.parent
+        if parent is not None:
+            context_text = parent.get_text(" ", strip=True).lower()
+
+        lowered_href = href.lower()
+        is_intro_attachment = "/introattachment/" in lowered_href
+        is_submitted = (
+            not is_intro_attachment and (
+                "assignsubmission_file" in lowered_href
+                or "submission_files" in lowered_href
+                or "submitted" in classes.lower()
+                or "submitted" in context_text
+                or "已繳" in context_text
+            )
+        )
+
+        record = {"name": fname, "url": abs_url}
+        if is_submitted:
+            submitted_candidates.append(record)
+        else:
+            attachment_candidates.append(record)
+
+    return attachment_candidates, submitted_candidates
+
+
+def _find_assignment_description_root(detail_soup):
+    selectors = [
+        "div.activity-description",
+        "div.assignintro",
+        "div.intro",
+        "#intro",
+        "div.description",
+        "div.generalbox",
+        "div.content",
+    ]
+    for selector in selectors:
+        node = detail_soup.select_one(selector)
+        if node is not None:
+            return node
+    return None
+
+
+def _extract_assignment_description(detail_soup, base_url):
+    desc_node = _find_assignment_description_root(detail_soup)
+    if desc_node is None:
+        return "", [], []
+
+    attachments, submitted = _collect_assignment_links(desc_node, base_url)
+    for bad in desc_node.select("div.fileuploadsubmission, div.fileuploadsubmissiontime"):
+        bad.decompose()
+
+    content = desc_node.get_text("\n", strip=True)
+    return content, attachments, submitted
+
+
 def fetch_assignments(course_id, course_name, session, cookies):
     course_name = safe_name(course_name)
     course_folder = ensure_course_folder(course_id, course_name)
@@ -161,77 +238,55 @@ def fetch_assignments(course_id, course_name, session, cookies):
                     detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
                     submission_detected = submission_detected or _submission_status_completed(detail_soup)
 
-                    # === DESCRIPTION: remove file/submission nodes so they don't leak into content ===
-                    # Clone (or operate on copy) — we'll remove nodes from soup copy to extract a clean description.
-                    desc_node = detail_soup.select_one("div.assignintro, div.intro, div.generalbox")
-                    if desc_node:
-                        # Remove any file blocks or submission time nodes inside description before extracting text
-                        for bad in desc_node.select("div.fileuploadsubmission, div.fileuploadsubmissiontime"):
-                            bad.decompose()
-                        content = desc_node.get_text("\n", strip=True)
-                    else:
-                        # fallback: some pages put content under .description or #intro
-                        fallback = detail_soup.select_one("#intro, div.description, div.content")
-                        if fallback:
-                            for bad in fallback.select("div.fileuploadsubmission, div.fileuploadsubmissiontime"):
-                                bad.decompose()
-                            content = fallback.get_text("\n", strip=True)
+                    # Prefer files and description under the visible assignment intro block.
+                    content, scoped_attachments, _ = _extract_assignment_description(detail_soup, detail_resp.url)
+                    raw_attachments, raw_submitted = _collect_assignment_links(detail_soup, detail_resp.url)
 
-                    # === INSTRUCTOR ATTACHMENTS (usually in description area or attachments block) ===
-                    # Look for fileuploadsubmission anchors that are NOT assignsubmission_file
-                    for f in detail_soup.select("div.fileuploadsubmission a"):
-                        furl = f.get("href")
-                        fname = safe_name(f.get_text(strip=True))
-                        if not furl:
+                    seen_attachment_urls = set()
+                    for attachment in scoped_attachments + raw_attachments:
+                        url = str(attachment.get("url") or "").strip()
+                        name = str(attachment.get("name") or "").strip()
+                        if not url or not name or url in seen_attachment_urls:
                             continue
-                        abs_url = urljoin(detail_resp.url, furl)
-                        if "assignsubmission_file" in furl or "submission_files" in furl:
-                            # student-submitted file — handled below; skip here
-                            continue
-                        # Otherwise treat as web/instructor file
-                        attachments.append({"name": fname, "url": abs_url, "type": "web"})
-                        # Save link to database instead of downloading
+                        seen_attachment_urls.add(url)
+                        attachments.append({"name": attachment["name"], "url": attachment["url"], "type": "web"})
                         from .. import db_manager
-                        db_manager.add_assignment_file_link(course_id, title, fname, abs_url, "web")
+                        db_manager.add_assignment_file_link(course_id, title, attachment["name"], attachment["url"], "web")
 
                     # === STUDENT SUBMISSIONS: locate fileuploadsubmission blocks that are "submitted" files ===
                     # For each fileuploadsubmission element, decide whether it's a student's file by its href.
+                    submission_times = {}
                     for sub_div in detail_soup.select("div.fileuploadsubmission"):
                         a = sub_div.select_one("a")
                         if not a or not a.get("href"):
                             continue
-                        furl = a["href"]
-                        abs_url = urljoin(detail_resp.url, furl)
-                        fname = safe_name(a.get_text(strip=True))
+                        abs_url = urljoin(detail_resp.url, a["href"])
+                        submission_times[abs_url] = _find_nearest_submit_time(sub_div) or None
 
-                        if "assignsubmission_file" in furl or "submission_files" in furl:
-                            # Find nearest submission time
-                            s_time = _find_nearest_submit_time(sub_div) or None
-                            submission_detected = True
+                    for sub in raw_submitted:
+                        fname = sub["name"]
+                        abs_url = sub["url"]
+                        s_time = submission_times.get(abs_url)
+                        submission_detected = True
 
-                            # Check previous record to decide if we need to download
-                            need_download = True
-                            prev_subs = prev_entry.get("submitted_files", []) if prev_entry else []
-                            prev_match = next((ps for ps in prev_subs if ps.get("name") == fname), None)
-                            prev_time = prev_match.get("submit_time") if prev_match else None
-                            if prev_time and s_time and prev_time == s_time and os.path.exists(os.path.join(submitted_folder, fname)):
-                                need_download = False
+                        prev_subs = prev_entry.get("submitted_files", []) if prev_entry else []
+                        prev_match = next((ps for ps in prev_subs if ps.get("name") == fname), None)
+                        prev_time = prev_match.get("submit_time") if prev_match else None
+                        _ = prev_time and s_time and prev_time == s_time and os.path.exists(os.path.join(submitted_folder, fname))
 
-                            submitted_files.append({
-                                "name": fname,
-                                "url": abs_url,
-                                "type": "submitted",
-                                "submit_time": s_time
-                            })
-                            
-                            # Save link to database instead of downloading
-                            from .. import db_manager
-                            db_manager.add_assignment_file_link(course_id, title, fname, abs_url, "submitted")
-                            
-                            # Only download if file already exists locally (for backward compatibility)
-                            local_path = os.path.join(submitted_folder, fname)
-                            if os.path.exists(local_path):
-                                db_manager.mark_file_downloaded(course_id, "assignment_submitted", local_path, title) 
+                        submitted_files.append({
+                            "name": fname,
+                            "url": abs_url,
+                            "type": "submitted",
+                            "submit_time": s_time
+                        })
+
+                        from .. import db_manager
+                        db_manager.add_assignment_file_link(course_id, title, fname, abs_url, "submitted")
+
+                        local_path = os.path.join(submitted_folder, fname)
+                        if os.path.exists(local_path):
+                            db_manager.mark_file_downloaded(course_id, "assignment_submitted", local_path, title)
 
                 except Exception as e:
                     print(f"[!] Failed to fetch detail page {detail_url}: {e}")

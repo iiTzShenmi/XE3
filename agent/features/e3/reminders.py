@@ -11,6 +11,7 @@ from .db import (
     get_e3_account_by_user_id,
     get_events_due_between,
     list_reminder_targets,
+    list_sync_targets,
     log_notification,
     mark_missing_events_inactive,
     notification_sent,
@@ -31,6 +32,19 @@ _WORKER_LOCK_HANDLE: Optional[Any] = None
 
 def _taipei_now():
     return datetime.now(timezone(timedelta(hours=8)))
+
+
+def _row_value(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        value = row.get(key, default)
+    else:
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+    return default if value is None else value
 
 
 def _load_schedule(row):
@@ -67,7 +81,7 @@ def _course_name_for_display(text):
 def _count_event_types(rows):
     counts = {"homework": 0, "exam": 0, "calendar": 0}
     for row in rows:
-        event_type = str(row.get("event_type") or "").strip()
+        event_type = str(_row_value(row, "event_type", "") or "").strip()
         if event_type in counts:
             counts[event_type] += 1
     return counts
@@ -80,7 +94,7 @@ def _morning_brief_lines(rows):
     today_rows = []
     for row in rows:
         try:
-            dt = datetime.fromisoformat(str(row["due_at"]).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(_row_value(row, "due_at", "")).replace("Z", "+00:00"))
         except ValueError:
             continue
         if dt.tzinfo is None:
@@ -99,13 +113,13 @@ def _morning_brief_lines(rows):
     if counts["calendar"]:
         summary_bits.append(f"{counts['calendar']} calendar item(s)")
     if summary_bits:
-        lines.append("In the next 36 hours: " + ", \".join(summary_bits) + \".")
+        lines.append("In the next 36 hours: " + ", ".join(summary_bits) + ".")
     if today_rows:
         lines.append(f"Due today: {len(today_rows)} item(s).")
-        first_row = min(today_rows, key=lambda row: str(row.get("due_at") or ""))
-        course_name = _course_name_for_display(first_row["course_name"] or first_row["course_id"] or "-")
+        first_row = min(today_rows, key=lambda row: str(_row_value(row, "due_at", "") or ""))
+        course_name = _course_name_for_display(_row_value(first_row, "course_name") or _row_value(first_row, "course_id") or "-")
         lines.append(
-            f"Next up: {_format_due_label(first_row['due_at'])} {course_name} - {first_row['title']}"
+            f"Next up: {_format_due_label(_row_value(first_row, 'due_at'))} {course_name} - {_row_value(first_row, 'title', '-')}"
         )
     else:
         lines.append("Nothing is due today so far.")
@@ -119,10 +133,10 @@ def _format_digest(rows, slot_text):
         lines.append("")
     lines.append("未來 36 小時內的重點事件：")
     for idx, row in enumerate(rows, start=1):
-        course_name = _course_name_for_display(row["course_name"] or row["course_id"] or "-")
-        label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(row["event_type"], "📌")
-        lines.append(f"{idx}. {_format_due_label(row['due_at'])} {label} {course_name}")
-        lines.append(f"   {row['title']}")
+        course_name = _course_name_for_display(_row_value(row, "course_name") or _row_value(row, "course_id") or "-")
+        label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(_row_value(row, "event_type"), "📌")
+        lines.append(f"{idx}. {_format_due_label(_row_value(row, 'due_at'))} {label} {course_name}")
+        lines.append(f"   {_row_value(row, 'title', '-')}")
     return "\n".join(lines)
 
 
@@ -133,12 +147,12 @@ def _build_digest_payload(rows, slot_text):
 
 
 def _format_countdown_payload(row, hours_left):
-    course_name = _course_name_for_display(row["course_name"] or row["course_id"] or "-")
-    label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(row["event_type"], "📌")
+    course_name = _course_name_for_display(_row_value(row, "course_name") or _row_value(row, "course_id") or "-")
+    label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(_row_value(row, "event_type"), "📌")
     return (
         f"⏰ E3 倒數提醒（{hours_left} 小時）\n"
-        f"{_format_due_label(row['due_at'])} {label} {course_name}\n"
-        f"{row['title']}"
+        f"{_format_due_label(_row_value(row, 'due_at'))} {label} {course_name}\n"
+        f"{_row_value(row, 'title', '-')}"
     )
 
 
@@ -274,6 +288,15 @@ def _maybe_periodic_sync(row, now, push_fn, logger):
         )
 
 
+def _process_periodic_syncs(now, push_fn, logger, target_predicate=None):
+    for row in list_sync_targets():
+        if target_predicate and not target_predicate(str(row["line_user_id"])):
+            continue
+        if row["login_status"] != "ok":
+            continue
+        _maybe_periodic_sync(row, now, push_fn, logger)
+
+
 def process_due_reminders(push_fn, logger, target_predicate=None):
     now = _taipei_now()
     current_slot = now.strftime("%H:%M")
@@ -282,12 +305,13 @@ def process_due_reminders(push_fn, logger, target_predicate=None):
     interval_seconds = e3_reminder_poll_seconds()
     tolerance = max(interval_seconds * 2, 300)
 
+    _process_periodic_syncs(now, push_fn, logger, target_predicate=target_predicate)
+
     for row in list_reminder_targets():
         if target_predicate and not target_predicate(str(row["line_user_id"])):
             continue
         if row["login_status"] != "ok":
             continue
-        _maybe_periodic_sync(row, now, push_fn, logger)
 
         for hours_left in COUNTDOWN_HOURS:
             window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)

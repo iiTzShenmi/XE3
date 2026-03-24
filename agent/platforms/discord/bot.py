@@ -305,14 +305,29 @@ def _is_file_entry(entry: tuple[str, str, dict[str, str]]) -> bool:
     return bool(entry and (entry[2] or {}).get("kind") == "uri")
 
 
+def _repeated_message_label(entries: list[tuple[str, str, dict[str, str]]]) -> str | None:
+    if not entries:
+        return None
+    actions = [entry[2] or {} for entry in entries]
+    if not all(str(action.get("kind") or "") == "message" for action in actions):
+        return None
+    labels = {str(action.get("label") or "").strip() for action in actions}
+    labels.discard("")
+    if len(labels) == 1:
+        return next(iter(labels))
+    return None
+
+
 def _select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
     if entries and all(_is_file_entry(entry) for entry in entries):
         return "Choose a file"
-    if entries and all(
-        (entry[2] or {}).get("kind") == "message" and str((entry[2] or {}).get("value") or "").strip().startswith("e3 詳情 ")
-        for entry in entries
-    ):
+    repeated_label = _repeated_message_label(entries)
+    if repeated_label and "詳情" in repeated_label:
         return "Choose homework details"
+    if repeated_label == "查看檔案":
+        return "Choose materials"
+    if repeated_label:
+        return f"Choose {repeated_label}"
     return "Choose an item"
 
 
@@ -376,6 +391,8 @@ class _CommandSelect(discord.ui.Select):
             edited = False
             try:
                 edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
+            except discord.NotFound:
+                logger.info("discord_selector_message_missing user=%s command=%s", self.user_id, action.get("value") or "")
             except discord.DiscordException:
                 logger.exception("discord_selector_edit_failed user=%s command=%s", self.user_id, action.get("value") or "")
             if not interaction.response.is_done():
@@ -484,20 +501,56 @@ def _extract_embeds_and_views(bot: commands.Bot, payload: Any, user_id: int) -> 
 
 async def _edit_message_from_payload(message: discord.Message, payload: Any, *, bot: commands.Bot, user_id: int) -> bool:
     items = _extract_embeds_and_views(bot, payload, user_id)
+    text_chunks: list[str] = []
+    selector_candidates: list[tuple[discord.Embed, list[dict[str, str]]]] = []
     embeds: list[discord.Embed] = []
     actions: list[dict[str, str]] = []
-    text_chunks: list[str] = []
+
     for embed, item_actions, text in items:
         if text:
-            text_chunks.append(str(text).strip())
+            cleaned = str(text).strip()
+            if cleaned:
+                text_chunks.append(cleaned)
             continue
-        if embed is not None:
-            embeds.append(embed)
-            actions.extend(item_actions)
+        if embed is None:
+            continue
+        embeds.append(embed)
+        actions.extend(item_actions)
+        selector_candidates.append((embed, item_actions))
+
     if not embeds:
         return False
-    view = _build_preferred_view(bot, user_id, embeds[0], actions)
+
+    selector_entries: list[tuple[str, str, dict[str, str]]] = []
+    if selector_candidates:
+        for embed, item_actions in selector_candidates:
+            action = _primary_action(item_actions)
+            if not action:
+                selector_entries = []
+                break
+            selector_entries.append((_select_option_label(embed, action), _embed_option_description(embed), action))
+
+    repeated_label_cards = bool(selector_entries and _repeated_message_label(selector_entries))
+    should_use_selector = (
+        selector_entries
+        and len(selector_entries) <= MAX_SELECT_OPTIONS
+        and ((len(selector_candidates) > 2 and all(_primary_action(item_actions) for _, item_actions in selector_candidates)) or (repeated_label_cards and len(selector_candidates) > 1))
+    )
+
     content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
+    if should_use_selector:
+        summary = discord.Embed(
+            title=_select_summary_title(selector_entries),
+            description='Use the selector below to open details without flooding the channel.',
+            color=discord.Color.blurple(),
+        )
+        for idx, (label, desc, action) in enumerate(selector_entries[:MAX_SELECT_OPTIONS], start=1):
+            value = "Open file" if _is_file_entry((label, desc, action)) else (desc[:1024] or "Open details")
+            summary.add_field(name=f'{idx}. {label[:100]}', value=value, inline=True)
+        await message.edit(content=content, embeds=[summary], view=CommandSelectView(bot, user_id, selector_entries))
+        return True
+
+    view = _build_preferred_view(bot, user_id, embeds[0], actions)
     kwargs = {"content": content, "embeds": embeds[:10]}
     if view is not None:
         kwargs["view"] = view
@@ -516,6 +569,7 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
     sent_any = False
     pending_embeds: list[discord.Embed] = []
     pending_actions: list[dict[str, str]] = []
+    text_chunks_all: list[str] = []
 
     def _send_with(target_obj, *, embeds=None, view=None, content=None):
         kwargs = {"content": content, "embeds": embeds}
@@ -561,22 +615,28 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
         sent_any = True
 
     selector_candidates: list[tuple[discord.Embed, list[dict[str, str]]]] = []
-    only_cards = True
     for embed, actions, text in items:
         if text:
-            only_cards = False
-            break
+            cleaned = str(text).strip()
+            if cleaned:
+                text_chunks_all.append(cleaned)
+            continue
         if embed is None:
             continue
         selector_candidates.append((embed, actions))
 
-    all_detail_cards = selector_candidates and all(
-        (_primary_action(actions) or {}).get("kind") == "message"
-        and str((_primary_action(actions) or {}).get("value") or "").strip().startswith("e3 詳情 ")
-        for _, actions in selector_candidates
-    )
+    repeated_label_cards = False
+    if selector_candidates:
+        selector_entries = []
+        for embed, actions in selector_candidates:
+            action = _primary_action(actions)
+            if not action:
+                selector_entries = []
+                break
+            selector_entries.append((_select_option_label(embed, action), _embed_option_description(embed), action))
+        repeated_label_cards = bool(selector_entries and _repeated_message_label(selector_entries))
 
-    if only_cards and ((len(selector_candidates) > 2 and all(_primary_action(actions) for _, actions in selector_candidates)) or (all_detail_cards and len(selector_candidates) > 1)):
+    if selector_candidates and ((len(selector_candidates) > 2 and all(_primary_action(actions) for _, actions in selector_candidates)) or (repeated_label_cards and len(selector_candidates) > 1)):
         for start in range(0, len(selector_candidates), MAX_SELECT_OPTIONS):
             await send_select_chunk(selector_candidates[start:start + MAX_SELECT_OPTIONS])
         return
@@ -805,6 +865,13 @@ def _create_bot() -> commands.Bot:
         await _remember_context_target(ctx)
         async with ctx.typing():
             await _execute_e3_payload(ctx, command.strip() or "help", ctx.author.id, bot=bot)
+
+    @bot.event
+    async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.CommandNotFound):
+            return
+        logger.exception("discord_prefix_command_failed", exc_info=error)
+        await _send_text_chunks(ctx, "⚠️ Something went wrong while running that command.")
 
     e3_group = app_commands.Group(name="e3", description="XE3 course assistant")
 

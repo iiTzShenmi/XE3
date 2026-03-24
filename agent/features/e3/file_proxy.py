@@ -13,6 +13,7 @@ import requests
 
 from agent.config import (
     e3_file_proxy_max_bytes,
+    e3_file_proxy_max_uses,
     e3_file_proxy_ttl_seconds,
     file_proxy_secret,
     public_base_url,
@@ -70,7 +71,8 @@ def _cleanup_nonces(now=None):
     now = now or _now()
     expired = []
     with _NONCE_LOCK:
-        for nonce, exp in _USED_NONCES.items():
+        for nonce, state in _USED_NONCES.items():
+            exp = int((state or {}).get("exp") or 0)
             if exp <= now:
                 expired.append(nonce)
         for nonce in expired:
@@ -134,9 +136,14 @@ def _load_proxy_token(token):
 def _mark_nonce_used(nonce, exp):
     _cleanup_nonces()
     with _NONCE_LOCK:
-        if nonce in _USED_NONCES:
-            return False
-        _USED_NONCES[nonce] = exp
+        state = _USED_NONCES.get(nonce)
+        if state:
+            count = int(state.get("count") or 0)
+            if count >= e3_file_proxy_max_uses():
+                return False
+            state["count"] = count + 1
+            return True
+        _USED_NONCES[nonce] = {"exp": exp, "count": 1}
         return True
 
 

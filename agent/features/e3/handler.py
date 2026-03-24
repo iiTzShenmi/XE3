@@ -97,6 +97,12 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
     if action.startswith("課程詳情") or (verb == "course" and len(tokens) >= 3 and tokens[1].lower() in {"detail", "details"}):
         return _course_detail(action, tokens, logger, line_user_id)
 
+    if action.startswith("課程作業") or (verb in {"course", "courses"} and len(tokens) >= 3 and tokens[1].lower() in {"homework", "assignments"}):
+        return _course_homework(action, tokens, logger, line_user_id)
+
+    if action.startswith("作業詳情") or (verb in {"homework", "assignment", "assignments"} and len(tokens) >= 2 and tokens[1].lower() in {"detail", "details"}):
+        return _course_homework_detail(action, tokens, logger, line_user_id)
+
     if action_head == "課程" or verb in {"course", "courses"}:
         return _list_courses(logger, line_user_id)
 
@@ -668,6 +674,39 @@ def _extract_course_index(action, tokens):
     return None
 
 
+def _extract_course_target(action, tokens, command_head_zh, command_noun_en):
+    raw_target = ""
+    if tokens and tokens[0] == command_head_zh:
+        raw_target = " ".join(tokens[1:]).strip()
+    elif len(tokens) >= 3 and tokens[0].lower() in {"course", "courses"} and tokens[1].lower() == command_noun_en:
+        raw_target = " ".join(tokens[2:]).strip()
+    else:
+        match = re.match(rf"^{re.escape(command_head_zh)}\s*(.+)$", action.strip())
+        if match:
+            raw_target = match.group(1).strip()
+    return raw_target
+
+
+def _extract_indexed_target(action, tokens, command_head_zh):
+    raw_target = ""
+    if tokens and tokens[0] == command_head_zh:
+        raw_target = " ".join(tokens[1:]).strip()
+    else:
+        match = re.match(rf"^{re.escape(command_head_zh)}\s*(.+)$", action.strip())
+        if match:
+            raw_target = match.group(1).strip()
+
+    if not raw_target:
+        return "", None
+
+    index = None
+    index_match = re.search(r"(?:\s+|^)(?:i|item|#)(\d+)$", raw_target, flags=re.IGNORECASE)
+    if index_match:
+        index = max(1, int(index_match.group(1)))
+        raw_target = raw_target[: index_match.start()].strip()
+    return raw_target, index
+
+
 def _count_active_assignments(payload):
     count = 0
     for item in _assignment_items(payload):
@@ -819,8 +858,18 @@ def _build_course_bubble(summary):
                     "height": "sm",
                     "action": {
                         "type": "message",
-                        "label": "查看資料夾",
+                        "label": "查看教材",
                         "text": f"e3 檔案資料夾 {summary['course_id'] or summary['course_name']}",
+                    },
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "查看作業",
+                        "text": f"e3 課程作業 {summary['course_id'] or summary['course_name']}",
                     },
                 },
             ],
@@ -1567,6 +1616,38 @@ def _collect_course_homework_items(payload):
     return items[:3]
 
 
+def _collect_course_homework_entries(payload):
+    items = []
+    for item in _assignment_items(payload):
+        if not isinstance(item, dict):
+            continue
+        due_raw = item.get("due") or item.get("due_time") or item.get("due_date") or item.get("deadline") or item.get("截止")
+        completed = _is_assignment_completed(item)
+        attachments = [entry for entry in (item.get("attachments") or []) if isinstance(entry, dict)]
+        submitted_files = [entry for entry in (item.get("submitted_files") or []) if isinstance(entry, dict)]
+        category = str(item.get("category") or "").strip().lower()
+        if not completed and category and category not in {"in_progress", "upcoming"}:
+            continue
+        if completed and not (attachments or submitted_files):
+            continue
+        items.append(
+            {
+                "title": str(item.get("title") or item.get("name") or "未命名作業").strip(),
+                "due_at": due_raw,
+                "completed": completed,
+                "_raw": item,
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            1 if item.get("completed") else 0,
+            _parse_due_at_sort_key(item.get("due_at")),
+            item.get("title") or "",
+        )
+    )
+    return items
+
+
 def _build_course_detail_flex(detail, alt_text):
     body_contents = [
         {"type": "text", "text": detail["course_name"], "weight": "bold", "wrap": True, "size": "lg"},
@@ -1624,8 +1705,18 @@ def _build_course_detail_flex(detail, alt_text):
                         "height": "sm",
                         "action": {
                             "type": "message",
-                            "label": "查看資料夾",
+                            "label": "查看教材",
                             "text": f"e3 檔案資料夾 {detail['course_id'] or detail['course_name']}",
+                        },
+                    },
+                    {
+                        "type": "button",
+                        "style": "secondary",
+                        "height": "sm",
+                        "action": {
+                            "type": "message",
+                            "label": "查看作業",
+                            "text": f"e3 課程作業 {detail['course_id'] or detail['course_name']}",
                         },
                     },
                     {
@@ -1641,6 +1732,76 @@ def _build_course_detail_flex(detail, alt_text):
                     }
                 ],
             },
+        },
+    }
+
+
+def _build_course_homework_flex(course_name, course_id, items, alt_text, line_user_id=None):
+    bubbles = []
+    for idx, item in enumerate(items[:10], start=1):
+        title = str(item.get("title") or "未命名作業").strip()
+        due_at = _format_due_at_for_display(item.get("due_at"), line_user_id)
+        payload = item.get("_raw") or {}
+        status_text = "已完成" if item.get("completed") else "未完成"
+        attachment_count = len(payload.get("attachments") or [])
+        submitted_count = len(payload.get("submitted_files") or [])
+        footer_contents = [
+            {
+                "type": "button",
+                "style": "primary",
+                "height": "sm",
+                "color": "#D97706",
+                "action": {
+                    "type": "message",
+                    "label": "查看詳情",
+                    "text": f"e3 作業詳情 {course_id or course_name} i{idx}",
+                },
+            }
+        ]
+        bubbles.append(
+            {
+                "type": "bubble",
+                "size": "kilo",
+                "header": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#D97706",
+                    "paddingAll": "12px",
+                    "contents": [
+                        {"type": "text", "text": "作業", "color": "#FFFBEB", "size": "xs"},
+                        {"type": "text", "text": title, "color": "#FFFFFF", "weight": "bold", "wrap": True},
+                    ],
+                },
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "contents": [
+                        {"type": "text", "text": course_name, "wrap": True, "size": "sm"},
+                        {"type": "text", "text": status_text, "size": "sm", "color": "#475569", "wrap": True},
+                        {"type": "text", "text": due_at, "size": "sm", "color": "#475569", "wrap": True},
+                        {"type": "text", "text": f"附件 {attachment_count}｜已繳 {submitted_count}", "size": "xs", "color": "#6B7280", "wrap": True},
+                        {"type": "text", "text": f"編號 #{idx}", "size": "xs", "color": "#6B7280"},
+                    ],
+                },
+                "footer": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "contents": footer_contents,
+                },
+            }
+        )
+
+    if not bubbles:
+        return None
+
+    return {
+        "type": "flex",
+        "altText": alt_text,
+        "contents": {
+            "type": "carousel",
+            "contents": bubbles,
         },
     }
 
@@ -1939,6 +2100,135 @@ def _course_detail(action, tokens, logger, line_user_id):
     text = "\n".join(text_lines)
     flex = _build_course_detail_flex(detail, text)
     return _line_response(text, messages=[flex] if flex else None)
+
+
+def _course_homework(action, tokens, logger, line_user_id):
+    _, err = _require_line_user(line_user_id)
+    if err:
+        return err
+
+    target = _extract_course_target(action, tokens, "課程作業", "homework")
+    if not target:
+        return "用法：e3 課程作業 <課號或課名>"
+
+    try:
+        courses = fetch_courses(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_course_homework_failed error=%s", exc)
+        return "課程作業讀取失敗，請先 `e3 relogin`。"
+
+    semester_tag = _current_semester_tag()
+    matched_course = None
+    for display_name, payload in _current_semester_courses(courses, semester_tag=semester_tag):
+        course_id = str((payload or {}).get("_course_id") or "").strip()
+        course_name = _course_name_for_display(display_name)
+        searchable = f"{course_id} {course_name}"
+        if _matches_course_keyword(searchable, target):
+            matched_course = (course_id, course_name, payload)
+            break
+
+    if not matched_course:
+        return f"找不到「{target}」的課程作業。"
+
+    course_id, course_name, payload = matched_course
+    items = _collect_course_homework_entries(payload)
+
+    if not items:
+        return f"{course_name} 目前沒有可查看的作業。"
+
+    lines = [f"📝 {course_name} 作業列表（{len(items)} 筆）"]
+    for idx, item in enumerate(items[:10], start=1):
+        status_text = "已完成" if item.get("completed") else "未完成"
+        lines.append(f"{idx}. [{status_text}] {item['title']}｜{_format_due_at_for_display(item['due_at'], line_user_id)}")
+    if len(items) > 10:
+        lines.append(f"還有 {len(items) - 10} 筆作業。")
+    text = "\n".join(lines)
+    flex = _build_course_homework_flex(course_name, course_id, items, text, line_user_id=line_user_id)
+    return _line_response(text, messages=[flex] if flex else None)
+
+
+def _course_homework_detail(action, tokens, logger, line_user_id):
+    _, err = _require_line_user(line_user_id)
+    if err:
+        return err
+
+    target, index = _extract_indexed_target(action, tokens, "作業詳情")
+    if not target or not index:
+        return "用法：e3 作業詳情 <課號或課名> i1"
+
+    try:
+        courses = fetch_courses(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_course_homework_detail_failed error=%s", exc)
+        return "作業詳情讀取失敗，請先 `e3 relogin`。"
+
+    semester_tag = _current_semester_tag()
+    matched_course = None
+    for display_name, payload in _current_semester_courses(courses, semester_tag=semester_tag):
+        course_id = str((payload or {}).get("_course_id") or "").strip()
+        course_name = _course_name_for_display(display_name)
+        searchable = f"{course_id} {course_name}"
+        if _matches_course_keyword(searchable, target):
+            matched_course = (course_id, course_name, payload)
+            break
+
+    if not matched_course:
+        return f"找不到「{target}」的課程作業。"
+
+    course_id, course_name, payload = matched_course
+    items = _collect_course_homework_entries(payload)
+    if index > len(items):
+        return f"找不到第 {index} 個作業，請先輸入 `e3 課程作業 {course_id or course_name}`。"
+
+    selected = items[index - 1]
+    raw = selected.get("_raw") or {}
+    detail_url = str(raw.get("detail_url") or raw.get("url") or "").strip()
+    attachments = [item for item in (raw.get("attachments") or []) if isinstance(item, dict)]
+    submitted_files = [item for item in (raw.get("submitted_files") or []) if isinstance(item, dict)]
+
+    lines = [f"📝 {course_name} / 作業詳情 #{index}"]
+    lines.append(f"標題：{selected['title']}")
+    lines.append(f"狀態：{'已完成' if selected.get('completed') else '未完成'}")
+    lines.append(f"截止：{_format_due_at_full(selected.get('due_at'), line_user_id)}")
+    if attachments:
+        lines.append(f"附件：{len(attachments)} 個")
+        for item in attachments[:3]:
+            lines.append(f"  - {str(item.get('name') or '附件').strip()}")
+    if submitted_files:
+        lines.append(f"已繳檔案：{len(submitted_files)} 個")
+        for item in submitted_files[:3]:
+            lines.append(f"  - {str(item.get('name') or '已繳檔案').strip()}")
+    if detail_url:
+        lines.append(f"連結：{detail_url}")
+
+    file_entries = []
+    for kind, items_list, accent in (
+        ("作業附件", attachments, "#D97706"),
+        ("已繳檔案", submitted_files, "#475569"),
+    ):
+        for item in items_list:
+            source_url = str(item.get("url") or "").strip()
+            title = str(item.get("name") or "").strip() or kind
+            if not source_url:
+                continue
+            file_entries.append(
+                {
+                    "kind": kind,
+                    "course_name": selected["title"],
+                    "title": title,
+                    "url": build_proxy_url(line_user_id, source_url, filename=title),
+                    "accent": accent,
+                }
+            )
+
+    messages = []
+    if file_entries:
+        alt_text = f"📝 {selected['title']} 檔案列表"
+        flex = _build_file_download_flex(file_entries, alt_text, selected["title"])
+        if flex:
+            messages.append(flex)
+
+    return _line_response("\n".join(lines), messages=messages or None)
 
 
 def _build_file_download_flex(entries, alt_text, course_name):
