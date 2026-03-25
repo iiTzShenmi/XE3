@@ -1331,7 +1331,7 @@ def _schedule_choice_from_value(value: str) -> list[str] | None:
 
 def _timeline_heading(event_type):
     section_emoji = {
-        "exam": "🧪",
+        "exam": "⚠️",
         "homework": "📝",
         "calendar": "🗓️",
     }.get(event_type, "📌")
@@ -1408,7 +1408,7 @@ def _format_reminder_summary(enabled, schedule, timezone_name="Asia/Taipei"):
         f"🟢 狀態：{'開啟' if enabled else '關閉'}\n"
         f"🌏 時區：{timezone_name}\n"
         f"🕘 時段：{schedule_text}\n"
-        "🧪 可先按 Test Reminder 看實際訊息內容。"
+        "▶️ 可先按 Test Reminder 看實際訊息內容。"
     )
 
 
@@ -1838,6 +1838,22 @@ def _collect_course_calendar_events(snapshot, course_id):
         items.append(event)
     items.sort(key=lambda item: item.get("due_at") or "")
     return items[:3]
+
+
+def _normalize_title_token(text):
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+
+def _assignment_completion_map(payload):
+    mapping = {}
+    for item in _assignment_items(payload):
+        if not isinstance(item, dict):
+            continue
+        title = _normalize_title_token(item.get("title") or item.get("name"))
+        if not title:
+            continue
+        mapping[title] = _is_assignment_completed(item)
+    return mapping
 
 
 def _clean_outline_text(value):
@@ -2640,6 +2656,7 @@ def _build_course_detail_payload(display_name, payload, timeline_snapshot, file_
     links = (file_snapshot.get("file_links") or {}).get(course_id) or {}
     homework_items = _collect_course_homework_items(payload)
     calendar_items = _collect_course_calendar_events(timeline_snapshot, course_id)
+    completion_map = _assignment_completion_map(payload)
     all_file_entries = _collect_file_entries(course_id, course_name, links)
     file_lines = [f"{entry['kind']}｜{entry['title']}" for entry in all_file_entries[:3]]
     remaining_files = len(all_file_entries) - len(file_lines)
@@ -2659,7 +2676,13 @@ def _build_course_detail_payload(display_name, payload, timeline_snapshot, file_
             for item in homework_items
         ] or ["🎉 目前沒有未完成作業"],
         "calendar_lines": [
-            f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
+            (
+                ("✅ ~~已完成｜" if completion_map.get(_normalize_title_token(item.get("title"))) else "⚠️ 未完成｜")
+                + f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
+                + ("~~" if completion_map.get(_normalize_title_token(item.get("title"))) else "")
+            )
+            if completion_map.get(_normalize_title_token(item.get("title"))) is not None
+            else f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
             for item in calendar_items
         ] or ["🎉 目前沒有近期行事曆"],
         "file_lines": file_lines or ["目前沒有可用檔案"],
