@@ -20,6 +20,7 @@
 | 2026-03-25 | `9c5d405` | 擴充 E3 scraper coverage |
 | 2026-03-25 | `eb5f707` | 整理 E3 event / reminder / response formatting |
 | 2026-03-25 | `f2a1470` | 細修 Discord interaction 與檔案短連結 |
+| 2026-03-25 | `d691dd9` | 統一 Discord 回應方式、重整課程摘要與提醒 embed |
 
 ## Milestones
 
@@ -54,6 +55,14 @@
 - timeline / upcoming / 課程詳情 / 成績總覽格式整理
 - 部分課綱考試事件改成可進入 timeline / reminder
 - grade 通知不再誤 dump 整份 `grades.json`
+
+### 7. Discord 回應一致化與摘要重整
+- `/e3 course` 維持 dropdown，但改成先顯示「課程摘要」，再用 `課程詳情` 展開補充資訊
+- `課程摘要` 收斂成短版、易讀格式：考試提醒 / 作業 / 行事曆 / 檔案
+- `/e3 timeline` 改成只顯示 30 天內事件，避免列表過長
+- 提醒與成績更新通知改成 Discord embed 風格
+- scheduled reminder 在「沒有事件」時也會送簡潔版提醒
+- 一般 `/e3 ...` slash command 改成公開回應，互動元件優先原地更新訊息
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
