@@ -93,6 +93,43 @@ def _urlsafe_b64decode(text):
     return base64.urlsafe_b64decode((text + padding).encode("ascii")).decode("utf-8")
 
 
+def _token_store_dir():
+    path = get_runtime_root() / "_file_proxy_tokens"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _token_store_path(token_id):
+    return _token_store_dir() / f"{token_id}.json"
+
+
+def _store_proxy_payload(token_id, payload_json):
+    _cleanup_token_store()
+    _token_store_path(token_id).write_text(payload_json, encoding="utf-8")
+
+
+def _load_stored_proxy_payload(token_id):
+    path = _token_store_path(token_id)
+    if not path.exists():
+        raise FileProxyInvalidToken()
+    payload_json = path.read_text(encoding="utf-8")
+    return payload_json
+
+
+def _cleanup_token_store(now=None):
+    now = now or _now()
+    store_dir = _token_store_dir()
+    for path in store_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            exp = int(payload.get("exp") or 0)
+        except Exception:
+            path.unlink(missing_ok=True)
+            continue
+        if exp <= now:
+            path.unlink(missing_ok=True)
+
+
 def _is_allowed_e3_url(url):
     parts = urlsplit(str(url or "").strip())
     return parts.scheme in {"http", "https"} and parts.netloc in _ALLOWED_HOSTS and parts.path.startswith("/pluginfile.php/")
@@ -112,7 +149,8 @@ def build_proxy_url(line_user_id, source_url, filename=""):
         "name": filename,
     }
     payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    token = _urlsafe_b64encode(payload_json)
+    token = secrets.token_urlsafe(12)
+    _store_proxy_payload(token, payload_json)
     signature = _sign_payload(payload_json)
     return f"{base_url}/e3/file/{token}.{signature}"
 
@@ -121,7 +159,10 @@ def _load_proxy_token(token):
     if "." not in token:
         raise FileProxyInvalidToken()
     payload_part, signature = token.rsplit(".", 1)
-    payload_json = _urlsafe_b64decode(payload_part)
+    try:
+        payload_json = _load_stored_proxy_payload(payload_part)
+    except FileProxyInvalidToken:
+        payload_json = _urlsafe_b64decode(payload_part)
     expected = _sign_payload(payload_json)
     if not hmac.compare_digest(signature, expected):
         raise FileProxyInvalidToken()
