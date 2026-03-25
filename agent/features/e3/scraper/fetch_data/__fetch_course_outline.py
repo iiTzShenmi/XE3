@@ -3,6 +3,7 @@ Fetch course outline page data
 """
 import os
 import re
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -75,6 +76,65 @@ def _collect_outline_sections(main_content):
             exam_candidates.extend(_extract_exam_candidates(f"{title} {body_text}", f"section:{title or 'untitled'}"))
     return sections, exam_candidates
 
+
+def _extract_activity_meta(item, page_url):
+    link_elem = item.find("a", class_=lambda x: x and "aalink" in x.lower()) or item.find("a", href=True)
+    if not link_elem:
+        return None
+
+    name_elem = link_elem.find("span", class_="instancename") or link_elem
+    for accesshide in name_elem.find_all("span", class_="accesshide"):
+        accesshide.decompose()
+    name = _clean_text(name_elem.get_text(" ", strip=True))
+    if not name:
+        return None
+
+    link = urljoin(page_url, link_elem.get("href", ""))
+    parsed = urlparse(link)
+    query = parse_qs(parsed.query)
+    path = parsed.path or ""
+    module_type = ""
+    if "/mod/" in path:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 2:
+            module_type = parts[1]
+
+    icon_elem = item.find("img", class_=lambda x: x and "activityicon" in x.lower())
+    icon_alt = _clean_text(icon_elem.get("alt")) if icon_elem else ""
+    module_id = item.get("id", "").replace("module-", "") if item.get("id", "").startswith("module-") else ""
+    instance_id = (query.get("id") or [""])[0]
+    availability_text = _clean_text(" ".join(node.get_text(" ", strip=True) for node in item.select(".availabilityinfo, .description .dimmed_text, .showavailability")))
+    description = _clean_text(" ".join(node.get_text(" ", strip=True) for node in item.select(".description, .contentafterlink, .activity-information")))
+    visible = "dimmed" not in " ".join(item.get("class", []))
+
+    payload = {
+        "name": name,
+        "type": icon_alt,
+        "module_type": module_type,
+        "link": link,
+        "module_id": module_id,
+        "instance_id": instance_id,
+        "icon_alt": icon_alt,
+        "description": description,
+        "availability": availability_text,
+        "visible": visible,
+    }
+
+    if "mod/folder/view.php" in link and instance_id:
+        payload["folder_id"] = instance_id
+    if "mod/forum/view.php" in link and instance_id:
+        payload["forum_id"] = instance_id
+    if "mod/assign/view.php" in link and instance_id:
+        payload["assign_id"] = instance_id
+    if "mod/quiz/view.php" in link and instance_id:
+        payload["quiz_id"] = instance_id
+    if "mod/page/view.php" in link and instance_id:
+        payload["page_id"] = instance_id
+    if "mod/url/view.php" in link and instance_id:
+        payload["url_id"] = instance_id
+
+    return payload
+
 def fetch_course_outline(course_id, course_name, session, cookies):
     """Fetch course outline page data for a specific course."""
     course_name = safe_name(course_name)
@@ -98,71 +158,55 @@ def fetch_course_outline(course_id, course_name, session, cookies):
     
     activities = []
     exam_candidates = []
-    
-    # Find all activity items
-    activity_items = main_content.find_all("li", class_=lambda x: x and "activity" in x.lower())
-    
-    for item in activity_items:
-        # Find the link element
-        link_elem = item.find("a", class_=lambda x: x and "aalink" in x.lower())
-        if link_elem:
-            name_elem = link_elem.find("span", class_="instancename")
-            if name_elem:
-                # Remove accesshide spans
-                for accesshide in name_elem.find_all("span", class_="accesshide"):
-                    accesshide.decompose()
-                name = name_elem.get_text(strip=True)
-                link = link_elem.get("href", "")
-                
-                # Extract activity type from icon
-                activity_type = ""
-                icon_elem = item.find("img", class_="activityicon")
-                if icon_elem:
-                    activity_type = icon_elem.get("alt", "")
-                
-                # Extract module ID if available
-                module_id = item.get("id", "").replace("module-", "") if item.get("id", "").startswith("module-") else ""
-                
-                activity_data = {
-                    "name": name,
-                    "type": activity_type,
-                    "link": link,
-                    "module_id": module_id
-                }
-                exam_candidates.extend(_extract_exam_candidates(name, f"activity:{module_id or name}"))
-                
-                # If it's a folder link, extract folder ID
-                if "mod/folder/view.php" in link:
-                    folder_id_match = re.search(r'id=(\d+)', link)
-                    if folder_id_match:
-                        activity_data["folder_id"] = folder_id_match.group(1)
-                        activity_data["file_links"] = []  # Would be populated by fetching folder page
-                
-                activities.append(activity_data)
+    sections = []
+
+    section_nodes = main_content.select("li[id^='section-'], .course-section, .section.main")
+    if not section_nodes:
+        section_nodes = [main_content]
+
+    for sec_idx, section in enumerate(section_nodes, start=1):
+        section_title = _clean_text(" ".join(node.get_text(" ", strip=True) for node in section.select(".sectionname, h3.sectionname, h4.sectionname, .section-title"))) or f"Section {sec_idx}"
+        section_id = section.get("id", "")
+        section_summary = _clean_text(" ".join(node.get_text(" ", strip=True) for node in section.select(".summary, .content .summarytext")))[:1200]
+
+        section_payload = {
+            "section_id": section_id,
+            "section_title": section_title,
+            "summary": section_summary,
+            "activities": [],
+        }
+        exam_candidates.extend(_extract_exam_candidates(f"{section_title} {section_summary}", f"course_section:{section_id or section_title}"))
+
+        for item in section.find_all("li", class_=lambda x: x and "activity" in " ".join(x).lower()):
+            activity_data = _extract_activity_meta(item, resp.url)
+            if not activity_data:
+                continue
+            activity_data["section_id"] = section_id
+            activity_data["section_title"] = section_title
+            exam_candidates.extend(_extract_exam_candidates(f"{activity_data.get('name', '')} {activity_data.get('description', '')}", f"activity:{activity_data.get('module_id') or activity_data.get('instance_id') or activity_data.get('name')}"))
+            section_payload["activities"].append(activity_data)
+            activities.append(activity_data)
+
+        if section_payload["activities"] or section_summary:
+            sections.append(section_payload)
 
     outline_sections, section_exam_candidates = _collect_outline_sections(main_content)
     exam_candidates.extend(section_exam_candidates)
     page_text = _clean_text(main_content.get_text(" ", strip=True))[:4000]
     
+    payload = {
+        "course_id": course_id,
+        "course_name": course_name,
+        "source_url": url,
+        "activities": activities,
+        "total_activities": len(activities),
+        "sections": sections,
+        "outline_sections": outline_sections,
+        "exam_candidates": exam_candidates,
+        "page_text": page_text,
+    }
+    save_json(outline_file, payload)
     if activities:
-        save_json(outline_file, {
-            "course_id": course_id,
-            "course_name": course_name,
-            "activities": activities,
-            "total_activities": len(activities),
-            "outline_sections": outline_sections,
-            "exam_candidates": exam_candidates,
-            "page_text": page_text,
-        })
         print(f"[+] Saved {len(activities)} activities for {course_name}")
     else:
-        save_json(outline_file, {
-            "course_id": course_id,
-            "course_name": course_name,
-            "activities": [],
-            "total_activities": 0,
-            "outline_sections": outline_sections,
-            "exam_candidates": exam_candidates,
-            "page_text": page_text,
-        })
         print(f"[-] No activities found for {course_name}")

@@ -1,5 +1,6 @@
 import os
-import requests
+from urllib.parse import urljoin
+
 from bs4 import BeautifulSoup
 from ..utils import save_json, load_json, ensure_course_folder, safe_name
 from .. import config
@@ -40,15 +41,28 @@ def fetch_news(course_id, course_name, session, cookies):
 
         # ---- Fetch full content ----
         full_content = ""
+        author_text = ""
         comments = []
+        attachments = []
         try:
             detail_resp = session.get(link, cookies=cookies)
+            detail_resp.raise_for_status()
             detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
 
             # main content (often inside div.news-content or similar)
             content_div = detail_soup.select_one("div.news-content") or detail_soup.select_one("div.content")
             if content_div:
                 full_content = content_div.get_text("\n", strip=True)
+
+            author_node = detail_soup.select_one(".author, .user, .username, .byline")
+            if author_node:
+                author_text = author_node.get_text(" ", strip=True)
+
+            for link_tag in detail_soup.select("a[href*='pluginfile.php'], .attachments a[href]"):
+                href = urljoin(detail_resp.url, link_tag.get("href", ""))
+                name = link_tag.get_text(" ", strip=True)
+                if href and name and not any(item.get("url") == href for item in attachments):
+                    attachments.append({"name": name, "url": href})
 
             # comments (if available)
             for com in detail_soup.select("div.comment"):
@@ -67,7 +81,9 @@ def fetch_news(course_id, course_name, session, cookies):
             "title": title,
             "date": date,
             "url": link,
+            "author": author_text,
             "content": full_content,
+            "attachments": attachments,
             "comments": comments
         })
         updated = True

@@ -125,6 +125,10 @@ def _read_all_courses_data(base_dir: str, courses_file_path: str | None = None) 
         if news_data:
             course_data["news"] = news_data
 
+        forums_data = _load_json(course_folder / "forums.json")
+        if forums_data:
+            course_data["forums"] = forums_data
+
         assignments_data = _load_json(course_folder / "homework" / "assignments.json")
         if assignments_data:
             course_data["assignments"] = assignments_data

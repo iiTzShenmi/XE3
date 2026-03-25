@@ -2,6 +2,7 @@ import json
 import requests
 from .utils import save_json, safe_name, load_json
 from .fetch_data.__fetch_news import fetch_news
+from .fetch_data.__fetch_forums import fetch_forums
 from .fetch_data.__fetch_handouts import fetch_handouts
 from .fetch_data.__fetch_assignments import fetch_assignments 
 from .fetch_data.__fetch_grades import fetch_grades
@@ -61,6 +62,11 @@ def __update_course_data(session=None, cookies=None):
             fetch_news(cid, cname, session, cookies)
         except Exception as e:
             print(f"[!] fetch_news failed for {cid}: {e}")
+
+        try:
+            fetch_forums(cid, cname, session, cookies)
+        except Exception as e:
+            print(f"[!] fetch_forums failed for {cid}: {e}")
             
         try:
             fetch_assignments(cid, cname, session, cookies)
