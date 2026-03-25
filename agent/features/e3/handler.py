@@ -1,3 +1,4 @@
+import html
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -115,6 +116,9 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
 
     if action_head == "狀態" or verb == "status":
         return _check_e3_status(line_user_id)
+
+    if action.startswith("課程摘要") or (verb == "course" and len(tokens) >= 3 and tokens[1].lower() in {"summary", "overview"}):
+        return _course_summary(action, tokens, logger, line_user_id)
 
     if action.startswith("課程詳情") or (verb == "course" and len(tokens) >= 3 and tokens[1].lower() in {"detail", "details"}):
         return _course_detail(action, tokens, logger, line_user_id)
@@ -986,8 +990,8 @@ def _build_course_bubble(summary):
                     "color": "#0F766E",
                     "action": {
                         "type": "message",
-                        "label": "查看詳情",
-                        "text": f"e3 課程詳情 {summary['index']}",
+                        "label": "查看課程",
+                        "text": f"e3 課程摘要 {summary['index']}",
                     },
                 },
                 {
@@ -1349,6 +1353,16 @@ def _parse_due_at_sort_key(value):
 
 def _timeline_rows_sorted(rows):
     return sorted(rows, key=lambda row: (_parse_due_at_sort_key(row["due_at"]), str(row["title"] or "")))
+
+
+def _filter_rows_within_days(rows, days: int):
+    cutoff = datetime.now(timezone.utc) + timedelta(days=days)
+    filtered = []
+    for row in rows:
+        due_dt = _parse_due_at_sort_key(row["due_at"])
+        if due_dt <= cutoff:
+            filtered.append(row)
+    return filtered
 
 
 def _line_response(text, messages=None):
@@ -1830,6 +1844,29 @@ def _clean_outline_text(value):
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
+def _short_exam_topic(topic: str) -> str:
+    clean = html.unescape(_clean_outline_text(topic))
+    if not clean:
+        return ""
+    direct = re.search(r"((?:Exam|Midterm|Final Exam|Quiz)\s*[\w\-()\/.: ]*)", clean, flags=re.IGNORECASE)
+    if direct:
+        return _clean_outline_text(direct.group(1))
+    zh_direct = re.search(r"((?:期中考|期末考|小考|測驗)[^｜,，;；]*)", clean)
+    if zh_direct:
+        return _clean_outline_text(zh_direct.group(1))
+    return _shorten_title(clean, 36)
+
+
+def _short_exam_date(class_date: str) -> str:
+    clean = html.unescape(_clean_outline_text(class_date))
+    if not clean:
+        return ""
+    matches = re.findall(r"(\d{4}-\d{2}-\d{2}(?:\([^)]+\))?)", clean)
+    if matches:
+        return matches[-1]
+    return clean
+
+
 def _course_outline_summary(payload):
     if not isinstance(payload, dict):
         return {}
@@ -1862,7 +1899,10 @@ def _course_outline_summary(payload):
             continue
         if not any(keyword in topic.lower() for keyword in ("exam", "midterm", "final", "quiz", "期中", "期末", "考試", "測驗")):
             continue
-        exam_lines.append(f"{class_date}｜{topic}")
+        short_date = _short_exam_date(class_date)
+        short_topic = _short_exam_topic(topic)
+        if short_date and short_topic:
+            exam_lines.append(f"{short_date}｜{short_topic}")
 
     return {
         "teacher": _clean_outline_text(base.get("tea_name") or base.get("Instructors") or base.get("teacher_id")),
@@ -1982,30 +2022,15 @@ def _build_course_detail_flex(detail, alt_text):
         },
     ]
     if detail.get("course_info_lines"):
+        body_contents.append({"type": "separator", "margin": "md"})
         body_contents.append({"type": "text", "text": "課綱重點", "weight": "bold", "size": "sm", "margin": "md"})
         for line in detail["course_info_lines"]:
             body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
     if detail.get("grade_summary_lines"):
+        body_contents.append({"type": "separator", "margin": "md"})
         body_contents.append({"type": "text", "text": "成績摘要", "weight": "bold", "size": "sm", "margin": "md"})
         for line in detail["grade_summary_lines"]:
             body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
-    if detail.get("exam_lines"):
-        body_contents.append({"type": "text", "text": "課綱考試提醒", "weight": "bold", "size": "sm", "margin": "md"})
-        for line in detail["exam_lines"]:
-            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
-    if detail["homework_lines"]:
-        body_contents.append({"type": "text", "text": "作業", "weight": "bold", "size": "sm", "margin": "md"})
-        for line in detail["homework_lines"]:
-            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
-    if detail["calendar_lines"]:
-        body_contents.append({"type": "text", "text": "行事曆", "weight": "bold", "size": "sm", "margin": "md"})
-        for line in detail["calendar_lines"]:
-            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
-    if detail["file_lines"]:
-        body_contents.append({"type": "text", "text": "檔案", "weight": "bold", "size": "sm", "margin": "md"})
-        for line in detail["file_lines"]:
-            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
-
     return {
         "type": "flex",
         "altText": alt_text,
@@ -2032,6 +2057,17 @@ def _build_course_detail_flex(detail, alt_text):
                 "layout": "vertical",
                 "spacing": "sm",
                 "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "height": "sm",
+                        "color": "#0F766E",
+                        "action": {
+                            "type": "message",
+                            "label": "重點摘要",
+                            "text": f"e3 課程摘要 {detail['index']}",
+                        },
+                    },
                     {
                         "type": "button",
                         "style": "secondary",
@@ -2063,6 +2099,137 @@ def _build_course_detail_flex(detail, alt_text):
                             "text": "e3 course",
                         },
                     }
+                ],
+            },
+        },
+    }
+
+
+def _build_course_summary_flex(detail, alt_text, index):
+    body_contents = [
+        {"type": "text", "text": detail["course_name"], "weight": "bold", "wrap": True, "size": "lg"},
+        {"type": "separator", "margin": "md"},
+        {
+            "type": "text",
+            "text": f"▶️ 未完成作業：{detail['homework_count']}",
+            "size": "sm",
+            "wrap": True,
+        },
+        {"type": "text", "text": f"▶️ 行事曆：{detail['calendar_count']}", "size": "sm", "wrap": True},
+        {"type": "text", "text": f"▶️ 檔案：{detail['file_count']}", "size": "sm", "wrap": True},
+    ]
+    if detail.get("exam_lines"):
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "🔴 考試提醒", "weight": "bold", "size": "sm", "margin": "md"},
+                *[
+                    {"type": "text", "text": line, "size": "sm", "wrap": True}
+                    for line in detail["exam_lines"]
+                ],
+            ]
+        )
+    if detail["homework_lines"]:
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "🟠 作業", "weight": "bold", "size": "sm", "margin": "md"},
+                *[
+                    {"type": "text", "text": line, "size": "sm", "wrap": True}
+                    for line in detail["homework_lines"]
+                ],
+            ]
+        )
+    if detail["calendar_lines"]:
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "🟢 行事曆", "weight": "bold", "size": "sm", "margin": "md"},
+                *[
+                    {"type": "text", "text": line, "size": "sm", "wrap": True}
+                    for line in detail["calendar_lines"]
+                ],
+            ]
+        )
+    if detail["file_lines"]:
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "📎 檔案", "weight": "bold", "size": "sm", "margin": "md"},
+                *[
+                    {"type": "text", "text": line, "size": "sm", "wrap": True}
+                    for line in detail["file_lines"]
+                ],
+            ]
+        )
+
+    return {
+        "type": "flex",
+        "altText": alt_text,
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#0F766E",
+                "paddingAll": "12px",
+                "contents": [
+                    {"type": "text", "text": "課程摘要", "color": "#FFFFFF", "weight": "bold", "size": "md"},
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": body_contents,
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "height": "sm",
+                        "color": "#0F766E",
+                        "action": {
+                            "type": "message",
+                            "label": "課程詳情",
+                            "text": f"e3 課程詳情 {index}",
+                        },
+                    },
+                    {
+                        "type": "button",
+                        "style": "secondary",
+                        "height": "sm",
+                        "action": {
+                            "type": "message",
+                            "label": "查看教材",
+                            "text": f"e3 檔案資料夾 {detail['course_id'] or detail['course_name']}",
+                        },
+                    },
+                    {
+                        "type": "button",
+                        "style": "secondary",
+                        "height": "sm",
+                        "action": {
+                            "type": "message",
+                            "label": "查看作業",
+                            "text": f"e3 課程作業 {detail['course_id'] or detail['course_name']}",
+                        },
+                    },
+                    {
+                        "type": "button",
+                        "style": "secondary",
+                        "height": "sm",
+                        "action": {
+                            "type": "message",
+                            "label": "回到課程列表",
+                            "text": "e3 course",
+                        },
+                    },
                 ],
             },
         },
@@ -2431,6 +2598,43 @@ def _course_detail(action, tokens, logger, line_user_id):
         )
 
     display_name, payload = current_courses[index - 1]
+    detail = _build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id)
+    detail["index"] = index
+
+    if _is_discord_user_key(line_user_id):
+        text_lines = [
+            f"📘 **課程詳情 #{index}**",
+            _discord_separator(line_user_id),
+            f"📚 **{detail['course_id']} {detail['course_name']}**".strip(),
+            f"📝 作業 `{detail['homework_count']}` 未完成 · ✅ `{detail['completed_homework_count']}` 已完成",
+            f"📅 行事曆 `{detail['calendar_count']}` · 📎 教材 `{detail['file_count']}`",
+            "",
+            f"🧾 **課綱重點**",
+            *[f"• {line}" for line in detail["course_info_lines"]],
+            "",
+            _discord_separator(line_user_id),
+            "",
+            f"📊 **成績摘要**",
+            *[f"• {line}" for line in detail["grade_summary_lines"]],
+        ]
+    else:
+        text_lines = [
+            f"📘 課程詳情 #{index}",
+            f"課程：{course_id} {course_name}".strip(),
+            f"未完成作業：{detail['homework_count']}｜已完成作業：{detail['completed_homework_count']}｜行事曆：{detail['calendar_count']}｜檔案：{detail['file_count']}",
+            "課綱重點：" + ("；".join(detail["course_info_lines"]) if detail["course_info_lines"] else "-"),
+            "成績摘要：" + ("；".join(detail["grade_summary_lines"]) if detail["grade_summary_lines"] else "-"),
+            "課綱考試提醒：" + ("；".join(detail["exam_lines"]) if detail["exam_lines"] else "-"),
+            "作業：" + ("；".join(detail["homework_lines"]) if detail["homework_lines"] else "-"),
+            "行事曆：" + ("；".join(detail["calendar_lines"]) if detail["calendar_lines"] else "-"),
+            "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
+        ]
+    text = "\n".join(text_lines)
+    flex = _build_course_detail_flex(detail, text)
+    return _line_response(text, messages=[flex] if flex else None)
+
+
+def _build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id):
     course_id = str((payload or {}).get("_course_id") or "").strip()
     course_name = _course_name_for_display(display_name)
     links = (file_snapshot.get("file_links") or {}).get(course_id) or {}
@@ -2440,9 +2644,10 @@ def _course_detail(action, tokens, logger, line_user_id):
     file_lines = [f"{entry['kind']}｜{entry['title']}" for entry in all_file_entries[:3]]
     remaining_files = len(all_file_entries) - len(file_lines)
     if remaining_files > 0:
-        file_lines.append(f"還有 {remaining_files} 個檔案，點「查看資料夾」查看。")
+        file_lines.append(f"還有 {remaining_files} 個檔案，點「查看教材」查看。")
 
     detail = {
+        "index": 0,
         "course_id": course_id,
         "course_name": course_name,
         "homework_count": _count_active_assignments(payload),
@@ -2452,11 +2657,11 @@ def _course_detail(action, tokens, logger, line_user_id):
         "homework_lines": [
             f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
             for item in homework_items
-        ] or ["目前沒有未完成作業"],
+        ] or ["🎉 目前沒有未完成作業"],
         "calendar_lines": [
             f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
             for item in calendar_items
-        ] or ["目前沒有近期行事曆"],
+        ] or ["🎉 目前沒有近期行事曆"],
         "file_lines": file_lines or ["目前沒有可用檔案"],
     }
     outline_info = _course_outline_summary(payload)
@@ -2479,48 +2684,78 @@ def _course_detail(action, tokens, logger, line_user_id):
     detail["grade_summary_lines"] = [line for line in detail["grade_summary_lines"] if not line.endswith("｜0 / 0") or grade_info["latest_lines"]]
     if grade_info["total_items"] == 0 and not grade_info["latest_lines"]:
         detail["grade_summary_lines"] = ["📊 目前還沒有可用的成績摘要"]
-    detail["exam_lines"] = [f"🧪 {line}" for line in outline_info["exam_lines"]] or ["目前尚未從課綱辨識到明確考試日期"]
+    detail["exam_lines"] = [f"⚠️ {line}" for line in outline_info["exam_lines"]] or ["🎉 目前沒有辨識到近期考試提醒"]
+    return detail
+
+
+def _course_summary(action, tokens, logger, line_user_id):
+    _, err = _require_line_user(line_user_id)
+    if err:
+        return err
+
+    index = _extract_course_index(action, tokens)
+    if index is None or index <= 0:
+        return f"請使用 {_discord_command_hint('e3 課程摘要 <編號>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 課程摘要 <編號>"
+
+    try:
+        courses = fetch_courses(make_user_key(line_user_id))
+        timeline_snapshot = fetch_timeline_snapshot(make_user_key(line_user_id))
+        file_snapshot = fetch_file_links(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_course_summary_failed error=%s", exc)
+        return (
+            f"⚠️ XE3 暫時無法打開這門課。\n先試試 {_discord_command_hint('e3 relogin', line_user_id)}。"
+            if _is_discord_user_key(line_user_id)
+            else "課程摘要讀取失敗，請先 `e3 relogin`。"
+        )
+
+    semester_tag = _current_semester_tag()
+    current_courses = _current_semester_courses(courses, semester_tag=semester_tag)
+    if index > len(current_courses):
+        return (
+            f"⚠️ 我找不到課程 `#{index}`。\n先用 {_discord_command_hint('e3 course', line_user_id)} 確認目前編號。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到第 {index} 門課程，請先輸入 `e3 course` 確認編號。"
+        )
+
+    display_name, payload = current_courses[index - 1]
+    detail = _build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id)
+    detail["index"] = index
 
     if _is_discord_user_key(line_user_id):
         text_lines = [
-            f"📘 **課程詳情 #{index}**",
+            "📘 **課程摘要**",
             _discord_separator(line_user_id),
-            f"📚 **{course_id} {course_name}**".strip(),
-            f"📝 作業 `{detail['homework_count']}` 未完成 · ✅ `{detail['completed_homework_count']}` 已完成",
-            f"📅 行事曆 `{detail['calendar_count']}` · 📎 教材 `{detail['file_count']}`",
+            f"📚 **{detail['course_name']}**",
             "",
-            f"🧾 **課綱重點**",
-            *[f"• {line}" for line in detail["course_info_lines"]],
+            f"▶️ 未完成作業：`{detail['homework_count']}`",
+            f"▶️ 行事曆：`{detail['calendar_count']}`",
+            f"▶️ 檔案：`{detail['file_count']}`",
             "",
-            f"📊 **成績摘要**",
-            *[f"• {line}" for line in detail["grade_summary_lines"]],
-            "",
-            f"🧪 **課綱考試提醒**",
+            "🔴 **考試提醒**",
             *[f"• {line}" for line in detail["exam_lines"]],
             "",
-            f"📝 **作業**",
+            "🟠 **作業**",
             *[f"• {line}" for line in detail["homework_lines"]],
             "",
-            f"📅 **近期行事曆**",
+            "🟢 **行事曆**",
             *[f"• {line}" for line in detail["calendar_lines"]],
             "",
-            f"📎 **教材 / 檔案**",
+            "📎 **教材 / 檔案**",
             *[f"• {line}" for line in detail["file_lines"]],
         ]
     else:
         text_lines = [
-            f"📘 課程詳情 #{index}",
-            f"課程：{course_id} {course_name}".strip(),
+            f"📘 課程摘要 #{index}",
+            f"課程：{detail['course_id']} {detail['course_name']}".strip(),
             f"未完成作業：{detail['homework_count']}｜已完成作業：{detail['completed_homework_count']}｜行事曆：{detail['calendar_count']}｜檔案：{detail['file_count']}",
-            "課綱重點：" + ("；".join(detail["course_info_lines"]) if detail["course_info_lines"] else "-"),
-            "成績摘要：" + ("；".join(detail["grade_summary_lines"]) if detail["grade_summary_lines"] else "-"),
             "課綱考試提醒：" + ("；".join(detail["exam_lines"]) if detail["exam_lines"] else "-"),
             "作業：" + ("；".join(detail["homework_lines"]) if detail["homework_lines"] else "-"),
             "行事曆：" + ("；".join(detail["calendar_lines"]) if detail["calendar_lines"] else "-"),
             "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
         ]
     text = "\n".join(text_lines)
-    flex = _build_course_detail_flex(detail, text)
+    flex = _build_course_summary_flex(detail, text, index)
     return _line_response(text, messages=[flex] if flex else None)
 
 
@@ -3198,9 +3433,10 @@ def _timeline(tokens, line_user_id, logger):
     except Exception:
         courses = {}
     rows = _filter_active_homework_rows(rows, courses)
+    rows = _filter_rows_within_days(rows, 30)
     text, messages, ordered_groups = _build_timeline_messages(
         rows,
-        "🗓️ **學業時間軸**" if _is_discord_user_key(line_user_id) else "🗓️ E3 時間軸（前 20 筆）：",
+        "🗓️ **學業時間軸（30 天內）**" if _is_discord_user_key(line_user_id) else "🗓️ E3 時間軸（30 天內）：",
         event_type=event_type,
         line_user_id=line_user_id,
     )

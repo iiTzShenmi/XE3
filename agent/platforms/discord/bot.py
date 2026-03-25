@@ -94,14 +94,25 @@ def _special_text_embed(text: str) -> discord.Embed | None:
     raw = str(text or "").strip()
     if not raw:
         return None
-    if raw.startswith("⏰ E3 提醒") or raw.startswith("⏰ E3 倒數提醒") or raw.startswith("⏰ 提醒測試"):
+    normalized = raw.replace("**", "").strip()
+    if normalized.startswith("⏰ E3 提醒") or normalized.startswith("⏰ E3 倒數提醒") or normalized.startswith("⏰ 提醒測試"):
         lines = [line.rstrip() for line in raw.splitlines()]
-        title = lines[0].strip() if lines else "⏰ XE3 提醒"
+        title = (lines[0].replace("**", "").strip() if lines else "⏰ XE3 提醒")
         body = "\n".join(line for line in lines[1:] if line is not None).strip()
         embed = discord.Embed(
             title=title,
             description=body or "目前沒有提醒內容。",
             color=discord.Color.orange(),
+        )
+        return embed
+    if normalized.startswith("📊 成績更新"):
+        lines = [line.rstrip() for line in raw.splitlines()]
+        title = (lines[0].replace("**", "").strip() if lines else "📊 成績更新")
+        body = "\n".join(line.replace("**", "") for line in lines[1:] if line is not None).strip()
+        embed = discord.Embed(
+            title=title,
+            description=body or "有新的成績內容。",
+            color=discord.Color.green(),
         )
         return embed
     return None
@@ -409,6 +420,10 @@ def _embed_option_description(embed: discord.Embed, action: dict[str, str] | Non
             return "｜".join(parts)[:100]
     footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
     if footer_text:
+        if footer_text == "作業附件":
+            return "老師附件"
+        if footer_text == "已繳檔案":
+            return "你的提交"
         return footer_text[:100]
     text = str(embed.description or "").replace("\n", " ").strip()
     return text[:100] if text else "點選後查看詳細內容"
@@ -423,8 +438,14 @@ def _select_option_label(embed: discord.Embed, action: dict[str, str]) -> str:
         if desc_lines:
             return desc_lines[0][:100]
     if action.get("kind") == "uri":
+        footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
+        prefix = ""
+        if footer_text == "作業附件":
+            prefix = "📎 老師附件｜"
+        elif footer_text == "已繳檔案":
+            prefix = "📤 你的提交｜"
         if desc_lines:
-            return desc_lines[0][:100]
+            return f"{prefix}{desc_lines[0][:97]}".strip()[:100]
     return str(embed.title or action.get("label") or "項目")[:100]
 
 
@@ -505,7 +526,7 @@ class _CommandSelect(discord.ui.Select):
     def __init__(self, bot: commands.Bot, user_id: int, entries: list[tuple[str, str, dict[str, str]]]):
         self.entries = entries[:MAX_SELECT_OPTIONS]
         options = [
-            discord.SelectOption(label=label[:100], description=(None if _is_file_entry(self.entries[idx]) else desc[:100]), value=str(idx))
+            discord.SelectOption(label=label[:100], description=(desc[:100] if desc else None), value=str(idx))
             for idx, (label, desc, _) in enumerate(self.entries)
         ]
         super().__init__(placeholder="選擇一個項目", min_values=1, max_values=1, options=options)
@@ -569,9 +590,9 @@ class E3LoginModal(discord.ui.Modal, title="E3 登入"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await _remember_interaction_target(interaction)
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True)
         command = f"login {self.account.value.strip()} {self.password.value.strip()}"
-        await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot, ephemeral=True)
+        await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot)
 
 
 def _bubble_actions(bubble: dict[str, Any]) -> list[dict[str, str]]:
@@ -700,7 +721,7 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
             color=discord.Color.blurple(),
         )
         for idx, (label, desc, action) in enumerate(selector_entries[:MAX_SELECT_OPTIONS], start=1):
-            value = "點選後開啟檔案" if _is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
+            value = (desc[:1024] or "點選後開啟檔案") if _is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
             summary.add_field(name=f'{_display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
         await message.edit(content=content, embeds=[summary], view=CommandSelectView(bot, user_id, selector_entries))
         return True
@@ -764,7 +785,7 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
         )
         preview_entries = entries[:25]
         for idx, (label, desc, action) in enumerate(preview_entries, start=1):
-            value = "點選後開啟檔案" if _is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
+            value = (desc[:1024] or "點選後開啟檔案") if _is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
             summary.add_field(name=f'{_display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
         await _send_with(target, embeds=[summary], view=CommandSelectView(bot, user_id, entries))
         sent_any = True
@@ -1051,13 +1072,13 @@ def _create_bot() -> commands.Bot:
     async def e3_relogin(interaction: discord.Interaction):
         await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True)
-        await _execute_e3_payload(interaction, "relogin", interaction.user.id, bot=bot, ephemeral=True)
+        await _execute_e3_payload(interaction, "relogin", interaction.user.id, bot=bot)
 
     @e3_group.command(name="course", description="顯示目前課程")
     async def e3_course(interaction: discord.Interaction):
         await _remember_interaction_target(interaction)
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        await _execute_e3_payload(interaction, "course", interaction.user.id, bot=bot, ephemeral=True)
+        await interaction.response.defer(thinking=True)
+        await _execute_e3_payload(interaction, "course", interaction.user.id, bot=bot)
 
     @e3_group.command(name="timeline", description="顯示近期作業與考試")
     @app_commands.describe(kind="可選：只看作業或只看考試")
@@ -1067,15 +1088,15 @@ def _create_bot() -> commands.Bot:
     ])
     async def e3_timeline(interaction: discord.Interaction, kind: app_commands.Choice[str] | None = None):
         await _remember_interaction_target(interaction)
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True)
         command = "timeline academic" if not kind else f"timeline {kind.value}"
-        await _execute_e3_payload(interaction, command, interaction.user.id, bot=bot, ephemeral=True)
+        await _execute_e3_payload(interaction, command, interaction.user.id, bot=bot)
 
     @e3_group.command(name="grades", description="顯示成績")
     async def e3_grades(interaction: discord.Interaction):
         await _remember_interaction_target(interaction)
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        await _execute_e3_payload(interaction, "grades", interaction.user.id, bot=bot, ephemeral=True)
+        await interaction.response.defer(thinking=True)
+        await _execute_e3_payload(interaction, "grades", interaction.user.id, bot=bot)
 
     @e3_group.command(name="files", description="瀏覽某一門課的檔案")
     @app_commands.autocomplete(keyword=_autocomplete_course_files)

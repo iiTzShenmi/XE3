@@ -215,6 +215,24 @@ def _build_digest_payload(rows, slot_text, user_key: str | None = None):
     return _format_digest(rows, slot_text, user_key=user_key)
 
 
+def _build_empty_digest_payload(slot_text, user_key: str | None = None):
+    if _is_discord_target(user_key):
+        lines = [f"⏰ **E3 提醒 {slot_text}**"]
+        if slot_text == "09:00":
+            weather_line = _briefing_weather_line()
+            lines.append("Good morning. XE3 先幫你看過了，接下來 36 小時內沒有新的截止事件。")
+            if weather_line:
+                lines.append(weather_line)
+            lines.append("")
+            lines.append("🎉 **今天暫時沒有作業或考試壓線，先安心過你的早上。**")
+        else:
+            lines.append("🎉 **今晚暫時沒有新的作業或考試壓線，可以安心休息。**")
+        return "\n".join(lines)
+    if slot_text == "09:00":
+        return "⏰ E3 提醒 09:00\n未來 36 小時內沒有新的截止事件，今天先安心。"
+    return "⏰ E3 提醒 21:00\n未來 36 小時內沒有新的截止事件，今晚可以安心休息。"
+
+
 def _format_countdown_payload(row, hours_left, user_key: str | None = None):
     course_name = _course_name_for_display(_row_value(row, "course_name") or _row_value(row, "course_id") or "-")
     label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(_row_value(row, "event_type"), "📌")
@@ -442,7 +460,16 @@ def process_due_reminders(push_fn, logger, target_predicate=None):
 
         events = get_events_due_between(row["user_id"], start_iso, end_iso, limit=8)
         if not events:
-            log_notification(row["user_id"], "scheduled_digest", "empty", details=dedupe_key)
+            payload = _build_empty_digest_payload(current_slot, row["line_user_id"])
+            ok = push_fn(row["line_user_id"], payload)
+            log_notification(
+                row["user_id"],
+                "scheduled_digest",
+                "sent" if ok else "failed",
+                details=f"{dedupe_key}|empty",
+            )
+            if not ok:
+                logger.error("e3_reminder_push_failed user=%s slot=%s empty_digest=1", row["line_user_id"], current_slot)
             continue
 
         payload = _build_digest_payload(events, current_slot, row["line_user_id"])
@@ -506,8 +533,11 @@ def build_test_reminder_payloads(user_id: int) -> list[str]:
     end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
     events = get_events_due_between(user_id, start_iso, end_iso, limit=5)
     if not events:
-        empty = "⏰ 提醒測試\n未來 36 小時內沒有近期事件。"
-        return [empty]
+        user_key = "discord:test"
+        return [
+            _build_empty_digest_payload("09:00", user_key=user_key),
+            _build_empty_digest_payload("21:00", user_key=user_key),
+        ]
     # This helper is currently only used by Discord test flows, so render the Discord-style timestamps.
     user_key = "discord:test"
     return [
