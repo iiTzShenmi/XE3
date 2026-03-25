@@ -22,6 +22,7 @@
 | 2026-03-25 | `f2a1470` | 細修 Discord interaction 與檔案短連結 |
 | 2026-03-25 | `d691dd9` | 統一 Discord 回應方式、重整課程摘要與提醒 embed |
 | 2026-03-25 | `dda738d` | 細修 Discord selector summary 與課程摘要可讀性 |
+| 2026-03-25 | `ce0d2d3` | 清理本地快取並拆分 Discord / E3 顯示模組 |
 
 ## Milestones
 
@@ -70,6 +71,12 @@
 - homework 檔案 selector 改成分區顯示：老師附件 / 你的提交
 - 其他常用 selector 也改成同一種 grouped summary 風格
 - 課程摘要加上更乾淨的段落、空行與完成狀態標記
+
+### 9. 維護性整理
+- 清掉本地 `__pycache__`，讓工作目錄更乾淨
+- 把 Discord selector / embed summary helper 抽成 `agent/platforms/discord/rendering.py`
+- 把課程摘要 / 課程詳情的 Flex card builder 抽成 `agent/features/e3/course_cards.py`
+- 讓 `bot.py` / `handler.py` 更專注在流程，而不是同時塞滿顯示細節
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
