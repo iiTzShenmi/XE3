@@ -1,4 +1,5 @@
 import re
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -6,6 +7,8 @@ import fcntl
 from typing import Any, Callable, Optional
 
 from agent.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
+from agent.features.weather.city_data import CITY_COORDINATES
+from agent.features.weather.weather_api import get_weather
 from .client import login_and_sync, make_user_key
 from .db import (
     get_e3_account_by_user_id,
@@ -25,6 +28,8 @@ from .secrets import decrypt_secret
 DEFAULT_LOOKAHEAD_HOURS = 36
 DEFAULT_SCHEDULE = ["09:00", "21:00"]
 COUNTDOWN_HOURS = [12, 2]
+DEFAULT_BRIEFING_LOCATION = "新竹市東區"
+DEFAULT_BRIEFING_COORD_KEY = "新竹市"
 _STARTED = False
 _LOCK = threading.Lock()
 _WORKER_LOCK_HANDLE: Optional[Any] = None
@@ -48,7 +53,21 @@ def _row_value(row: Any, key: str, default: Any = None) -> Any:
 
 
 def _load_schedule(row):
-    return list(DEFAULT_SCHEDULE)
+    raw = _row_value(row, "schedule_json")
+    if not raw:
+        return list(DEFAULT_SCHEDULE)
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return list(DEFAULT_SCHEDULE)
+    if not isinstance(parsed, list):
+        return list(DEFAULT_SCHEDULE)
+    normalized = []
+    for value in parsed:
+        slot = str(value or "").strip()
+        if slot and slot not in normalized:
+            normalized.append(slot)
+    return normalized or list(DEFAULT_SCHEDULE)
 
 
 def _format_due_label(value):
@@ -63,6 +82,26 @@ def _format_due_label(value):
         dt = dt.astimezone(taipei_tz)
     weekdays = ["一", "二", "三", "四", "五", "六", "日"]
     return dt.strftime("%m/%d") + f" ({weekdays[dt.weekday()]}) " + dt.strftime("%H:%M")
+
+
+def _is_discord_target(user_key: str | None) -> bool:
+    return str(user_key or "").startswith("discord:")
+
+
+def _discord_due_label(value, user_key: str | None) -> str:
+    if not _is_discord_target(user_key):
+        return _format_due_label(value)
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    taipei_tz = timezone(timedelta(hours=8))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=taipei_tz)
+    else:
+        dt = dt.astimezone(taipei_tz)
+    ts = int(dt.timestamp())
+    return f"<t:{ts}:F> · <t:{ts}:R>"
 
 
 def _course_name_for_display(text):
@@ -105,6 +144,9 @@ def _morning_brief_lines(rows):
             today_rows.append(row)
 
     lines = ["Good morning. Here's your E3 briefing for today."]
+    weather_line = _briefing_weather_line()
+    if weather_line:
+        lines.append(weather_line)
     summary_bits = []
     if counts["homework"]:
         summary_bits.append(f"{counts['homework']} assignment(s)")
@@ -126,32 +168,67 @@ def _morning_brief_lines(rows):
     return lines
 
 
-def _format_digest(rows, slot_text):
-    lines = [f"⏰ E3 提醒 {slot_text}"]
+def _briefing_weather_line() -> str | None:
+    coordinates = CITY_COORDINATES.get(DEFAULT_BRIEFING_COORD_KEY)
+    if not coordinates:
+        return None
+    lat, lon = coordinates
+    try:
+        weather = get_weather(lat, lon)
+    except Exception:
+        return None
+    return (
+        f"🌤️ {DEFAULT_BRIEFING_LOCATION}｜"
+        f"{weather['temperature']}°C"
+        f"｜體感 {weather['apparent_temperature']}°C"
+        f"｜降雨 {weather['precipitation_probability']}%"
+    )
+
+
+def _format_digest(rows, slot_text, user_key: str | None = None):
+    lines = [f"⏰ **E3 提醒 {slot_text}**" if _is_discord_target(user_key) else f"⏰ E3 提醒 {slot_text}"]
     if slot_text == "09:00":
         lines.extend(_morning_brief_lines(rows))
         lines.append("")
-    lines.append("未來 36 小時內的重點事件：")
+    lines.append("──────────" if _is_discord_target(user_key) else "")
+    lines.append("🚨 **接下來 36 小時內的重點事件**" if _is_discord_target(user_key) else "未來 36 小時內的重點事件：")
     for idx, row in enumerate(rows, start=1):
         course_name = _course_name_for_display(_row_value(row, "course_name") or _row_value(row, "course_id") or "-")
         label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(_row_value(row, "event_type"), "📌")
-        lines.append(f"{idx}. {_format_due_label(_row_value(row, 'due_at'))} {label} {course_name}")
-        lines.append(f"   {_row_value(row, 'title', '-')}")
+        due_label = _discord_due_label(_row_value(row, "due_at"), user_key)
+        if _is_discord_target(user_key):
+            lines.append(f"{label} **{course_name}**")
+            lines.append(f"• {_row_value(row, 'title', '-')}")
+            lines.append(f"• Due {due_label}")
+        else:
+            lines.append(f"{idx}. {due_label} {label} {course_name}")
+            lines.append(f"   {_row_value(row, 'title', '-')}")
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
-def _build_digest_payload(rows, slot_text):
+def _build_digest_payload(rows, slot_text, user_key: str | None = None):
     if not rows:
         return None
-    return _format_digest(rows, slot_text)
+    return _format_digest(rows, slot_text, user_key=user_key)
 
 
-def _format_countdown_payload(row, hours_left):
+def _format_countdown_payload(row, hours_left, user_key: str | None = None):
     course_name = _course_name_for_display(_row_value(row, "course_name") or _row_value(row, "course_id") or "-")
     label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(_row_value(row, "event_type"), "📌")
+    due_label = _discord_due_label(_row_value(row, "due_at"), user_key)
+    if _is_discord_target(user_key):
+        return (
+            f"⚠️ **Deadline creeping up: {hours_left}h left**\n"
+            f"{label} **{course_name}**\n"
+            f"• {_row_value(row, 'title', '-')}\n"
+            f"• Due {due_label}"
+        )
     return (
         f"⏰ E3 倒數提醒（{hours_left} 小時）\n"
-        f"{_format_due_label(_row_value(row, 'due_at'))} {label} {course_name}\n"
+        f"{due_label} {label} {course_name}\n"
         f"{_row_value(row, 'title', '-')}"
     )
 
@@ -168,6 +245,25 @@ def _extract_grade_items(courses):
             continue
         course_id = str(payload.get("_course_id") or "").strip()
         course_name = _course_name_for_display(display_name)
+        if isinstance(grades.get("grade_items"), list):
+            for row in grades.get("grade_items") or []:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("is_category") or row.get("is_calculated"):
+                    continue
+                score_text = str(row.get("score") or "").strip()
+                item_name = re.sub(r"\s+", " ", str(row.get("item_name") or "").replace("\u000b", " ")).strip()
+                if not score_text or score_text == "-" or not item_name:
+                    continue
+                items.append(
+                    {
+                        "course_id": course_id,
+                        "course_name": course_name,
+                        "item_name": item_name,
+                        "score": score_text,
+                    }
+                )
+            continue
         for item_name, score in grades.items():
             score_text = str(score or "").strip()
             if not score_text or score_text == "-":
@@ -209,13 +305,14 @@ def _sync_grade_items(user_id, courses, get_existing_rows, upsert_grade_item):
 def _format_grade_payload(change):
     course_name = _course_name_for_display(change["course_name"])
     if change.get("old_score"):
-        score_line = f"{change['old_score']} -> {change['score']}"
+        score_line = f"{change['old_score']} → {change['score']}"
     else:
         score_line = change["score"]
     return (
-        "🎉 新成績已公布\n"
-        f"{course_name}\n"
-        f"{change['item_name']}：{score_line}"
+        "📊 **成績更新**\n"
+        f"**{course_name}**\n"
+        f"• {change['item_name']}\n"
+        f"• 分數：**{score_line}**"
     )
 
 
@@ -326,7 +423,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None):
                 countdown_key = f"{event_row['event_uid']}|{hours_left}h"
                 if notification_sent(row["user_id"], "countdown_alert", countdown_key):
                     continue
-                ok = push_fn(row["line_user_id"], _format_countdown_payload(event_row, hours_left))
+                ok = push_fn(row["line_user_id"], _format_countdown_payload(event_row, hours_left, row["line_user_id"]))
                 log_notification(
                     row["user_id"],
                     "countdown_alert",
@@ -348,7 +445,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None):
             log_notification(row["user_id"], "scheduled_digest", "empty", details=dedupe_key)
             continue
 
-        payload = _build_digest_payload(events, current_slot)
+        payload = _build_digest_payload(events, current_slot, row["line_user_id"])
         ok = push_fn(row["line_user_id"], payload)
         log_notification(
             row["user_id"],
@@ -403,11 +500,17 @@ def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger, target_pr
     return True
 
 
-def build_test_reminder_payload(user_id: int) -> str:
+def build_test_reminder_payloads(user_id: int) -> list[str]:
     now = _taipei_now()
     start_iso = now.astimezone(timezone.utc).isoformat()
     end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
     events = get_events_due_between(user_id, start_iso, end_iso, limit=5)
     if not events:
-        return "⏰ Reminder test\nNo upcoming events in the next 36 hours."
-    return _format_digest(events, "test")
+        empty = "⏰ 提醒測試\n未來 36 小時內沒有近期事件。"
+        return [empty]
+    # This helper is currently only used by Discord test flows, so render the Discord-style timestamps.
+    user_key = "discord:test"
+    return [
+        _format_digest(events, "09:00", user_key=user_key),
+        _format_digest(events, "21:00", user_key=user_key),
+    ]

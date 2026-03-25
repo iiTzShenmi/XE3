@@ -155,16 +155,19 @@ def build_system_report():
             "discord-bot.service": "Discord bot",
             "xe3-web.service": "Web service",
         }.get(service_name, "Main service")
-        service_lines.append(f"{label}: {state}")
+        service_lines.append(f"• {label}: {state}")
 
     return (
-        "System Check\n"
+        "🛠️ **系統檢查**\n"
+        "──────────\n"
+        "📦 **Services**\n"
         + "\n".join(service_lines)
-        + "\n"
-        f"Tunnel: {_tunnel_status_summary()}\n"
-        f"Watchdog: {_watchdog_status_summary()}\n"
-        f"{_load_summary()}\n"
-        f"{_memory_summary()}\n"
-        f"{_disk_summary()}\n"
-        f"{_uptime_summary()}"
+        + "\n──────────\n"
+        f"🌐 **Tunnel:** {_tunnel_status_summary()}\n"
+        f"👀 **Watchdog:** {_watchdog_status_summary()}\n"
+        "──────────\n"
+        f"🧮 **{_load_summary()}**\n"
+        f"🧠 **{_memory_summary()}**\n"
+        f"💾 **{_disk_summary()}**\n"
+        f"⏱️ **{_uptime_summary()}**"
     )

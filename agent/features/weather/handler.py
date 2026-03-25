@@ -66,11 +66,13 @@ def format_weather(city, weather, source=None):
     if source:
         location_info += f" ({source})"
 
-    return f"""{location_info}
-
-🌡 現在溫度：{weather['temperature']}°C
-🥵 體感溫度：{weather['apparent_temperature']}°C
-🌧 降雨機率：{weather['precipitation_probability']}%
-
-📈 今日最高溫：{weather['max_temp']}°C
-📉 今日最低溫：{weather['min_temp']}°C"""
+    return (
+        f"🌤️ **{location_info}**\n"
+        "──────────\n"
+        f"🌡️ **現在溫度：** {weather['temperature']}°C\n"
+        f"🥵 **體感溫度：** {weather['apparent_temperature']}°C\n"
+        f"🌧️ **降雨機率：** {weather['precipitation_probability']}%\n"
+        "\n"
+        f"📈 **今日最高：** {weather['max_temp']}°C\n"
+        f"📉 **今日最低：** {weather['min_temp']}°C"
+    )

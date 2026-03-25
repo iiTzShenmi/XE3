@@ -21,6 +21,7 @@ from .db import (
     mark_missing_events_inactive,
     upsert_grade_item,
     update_reminder_enabled,
+    update_reminder_schedule,
     update_login_state,
     upsert_e3_account,
     upsert_event,
@@ -75,6 +76,27 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
     action_head = tokens[0] if tokens else ""
 
     if not action or action.lower() in {"help", "幫助", "功能"}:
+        if _is_discord_user_key(line_user_id):
+            return (
+                "🤖 **XE3 E3 Help**\n"
+                "──────────\n"
+                "📚 **Core commands**\n"
+                f"• {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 relogin', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 logout', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 course', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 grades', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 files <課名關鍵字>', line_user_id)}\n"
+                "──────────\n"
+                "🗓️ **Timeline**\n"
+                f"• {_discord_command_hint('e3 upcoming [homework/exam]', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 timeline [homework/exam]', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 詳情 <編號>', line_user_id)}\n"
+                "──────────\n"
+                "⏰ **Reminder**\n"
+                f"• {_discord_command_hint('e3 remind show', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 remind schedule both|morning|evening', line_user_id)}"
+            )
         return (
             "📘 E3 指令：\n"
             "1) e3 login <帳號> <密碼>\n"
@@ -87,7 +109,7 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
             "8) e3 狀態\n"
             "9) e3 grades / e3 成績\n"
             "10) e3 files <課名關鍵字>\n"
-            "11) e3 remind show/on/off\n"
+            "11) e3 remind show/on/off/schedule both|morning|evening\n"
             "說明：課程指令會顯示目前學期（例如 114上 / 114下）"
         )
 
@@ -173,20 +195,25 @@ def _queue_async(action, line_user_id):
     if action.startswith("login"):
         tokens = action.split()
         if len(tokens) < 3:
-            return "用法：e3 login <帳號> <密碼>"
-        return "⏳ E3 登入已開始，正在驗證帳號並讀取首頁內容。完成後會再推播結果給你。"
+            return f"請使用 {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 login <帳號> <密碼>"
+        return "⏳ XE3 is signing you in and pulling your E3 home data now." if _is_discord_user_key(line_user_id) else "⏳ E3 登入已開始，正在驗證帳號並讀取首頁內容。完成後會再推播結果給你。"
 
     row = get_e3_account_by_user_id(user_id)
     if not row:
-        return "找不到已綁定帳號，請先 `e3 login <帳號> <密碼>`。"
-    return "⏳ E3 強制更新已開始，完成後會再推播最新同步結果給你。"
+        return f"⚠️ I can't find a linked account yet.\nStart with {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}." if _is_discord_user_key(line_user_id) else "找不到已綁定帳號，請先 `e3 login <帳號> <密碼>`。"
+    return "⏳ XE3 started a full refresh. I’ll bring back the updated result as soon as it’s ready." if _is_discord_user_key(line_user_id) else "⏳ E3 強制更新已開始，完成後會再推播最新同步結果給你。"
 
 
 def _check_e3_status(line_user_id):
     user_key = make_user_key(line_user_id) if line_user_id else None
     runtime_status = check_status(user_key=user_key)
     if not runtime_status["available"]:
-        return f"⚠️ E3 狀態：不可用\n找不到 E3 專案：{runtime_status['e3_root']}"
+        return (
+            f"⚠️ **XE3 status: unavailable**\n{_discord_separator(user_key)}\n"
+            f"XE3 can't find the E3 runtime at `{runtime_status['e3_root']}`."
+            if _is_discord_user_key(user_key)
+            else f"⚠️ E3 狀態：不可用\n找不到 E3 專案：{runtime_status['e3_root']}"
+        )
 
     if not line_user_id:
         return "⚠️ E3 狀態：需要 LINE 使用者身分"
@@ -209,7 +236,7 @@ def _check_e3_status(line_user_id):
     last_error = account_row["last_error"] or ""
     reminder_prefs = get_reminder_prefs(user_id)
     reminder_enabled = bool(reminder_prefs["enabled"]) if reminder_prefs else False
-    reminder_schedule = _default_reminder_schedule()
+    reminder_schedule = _load_reminder_schedule(reminder_prefs)
 
     if login_status == "ok" and has_password and (has_cookie or has_home_html or has_courses):
         headline = "🟢 E3 狀態：已登入"
@@ -218,19 +245,37 @@ def _check_e3_status(line_user_id):
     else:
         headline = "🟡 E3 狀態：已綁定，尚未就緒"
 
-    lines = [headline]
-    lines.append(f"帳號：{account_row['e3_account']}")
-    lines.append(f"姓名：{user_name or '尚未取得'}")
-    lines.append(f"Email：{user_email or '尚未取得'}")
-    lines.append(f"密碼：{'已儲存' if has_password else '未儲存'}")
-    lines.append(f"Cookie：{'可用' if has_cookie else '未找到'}")
-    lines.append(f"課程快取：{'可用' if has_courses else '未找到'}")
-    lines.append(f"提醒：{'開啟' if reminder_enabled else '關閉'}")
-    lines.append(f"提醒時段：{', '.join(reminder_schedule) if reminder_schedule else '未設定'}")
+    if _is_discord_user_key(user_key):
+        lines = [
+            f"{headline}",
+            _discord_separator(user_key),
+            f"👤 **Account:** `{account_row['e3_account']}`",
+            f"🪪 **Name:** {_discord_bold(user_name or 'Not available yet', user_key)}",
+            f"📧 **Email:** {user_email or 'Not available yet'}",
+            f"🔐 **Password:** {'saved' if has_password else 'not saved'}",
+            f"🍪 **Session cookie:** {'ready' if has_cookie else 'missing'}",
+            f"📚 **Course cache:** {'ready' if has_courses else 'missing'}",
+            f"⏰ **Reminders:** {'on' if reminder_enabled else 'off'}",
+            f"🕘 **Schedule:** {', '.join(reminder_schedule) if reminder_schedule else 'not set'}",
+        ]
+    else:
+        lines = [headline]
+        lines.append(f"帳號：{account_row['e3_account']}")
+        lines.append(f"姓名：{user_name or '尚未取得'}")
+        lines.append(f"Email：{user_email or '尚未取得'}")
+        lines.append(f"密碼：{'已儲存' if has_password else '未儲存'}")
+        lines.append(f"Cookie：{'可用' if has_cookie else '未找到'}")
+        lines.append(f"課程快取：{'可用' if has_courses else '未找到'}")
+        lines.append(f"提醒：{'開啟' if reminder_enabled else '關閉'}")
+        lines.append(f"提醒時段：{', '.join(reminder_schedule) if reminder_schedule else '未設定'}")
     if last_error:
-        lines.append(f"最近錯誤：{last_error}")
+        lines.append(f"⚠️ **Last error:** {last_error}" if _is_discord_user_key(user_key) else f"最近錯誤：{last_error}")
     if not (has_password and (has_cookie or has_home_html or has_courses)):
-        lines.append("建議：輸入 `e3 relogin` 或重新 `e3 login <帳號> <密碼>`。")
+        lines.append(
+            f"💡 Try {_discord_command_hint('e3 relogin', user_key)} or sign in again with {_discord_command_hint('e3 login <帳號> <密碼>', user_key)}."
+            if _is_discord_user_key(user_key)
+            else "建議：輸入 `e3 relogin` 或重新 `e3 login <帳號> <密碼>`。"
+        )
     return "\n".join(lines)
 
 
@@ -245,24 +290,55 @@ def _list_courses(logger, line_user_id):
         cache_status = get_cache_status(make_user_key(line_user_id))
     except Exception as exc:
         logger.error("e3_list_courses_failed error=%s", exc)
-        return "E3 本地資料讀取失敗，請先 `e3 login <帳號> <密碼>` 或 `e3 relogin`。"
+        return (
+            f"⚠️ XE3 couldn't load your local E3 data.\nTry {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)} or {_discord_command_hint('e3 relogin', line_user_id)}."
+            if _is_discord_user_key(line_user_id)
+            else "E3 本地資料讀取失敗，請先 `e3 login <帳號> <密碼>` 或 `e3 relogin`。"
+        )
 
     if not isinstance(data, dict) or not data:
-        return "目前沒有可用課程資料，請先 `e3 login <帳號> <密碼>`。"
+        return _discord_empty_state(
+            f"I can't see any course data yet. Start with {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}.",
+            line_user_id,
+        ) if _is_discord_user_key(line_user_id) else "目前沒有可用課程資料，請先 `e3 login <帳號> <密碼>`。"
 
     semester_tag = _current_semester_tag()
     current_courses = _current_semester_courses(data, semester_tag=semester_tag)
 
     if not current_courses:
-        return f"目前找不到 {semester_tag} 學期課程，請先 `e3 relogin` 重新同步。"
+        return (
+            _discord_empty_state(
+                f"我目前還找不到 **{semester_tag}** 的課程資料。\n試試 {_discord_command_hint('e3 relogin', line_user_id)} 重新整理。",
+                line_user_id,
+                emoji="📚",
+            )
+            if _is_discord_user_key(line_user_id)
+            else f"目前找不到 {semester_tag} 學期課程，請先 `e3 relogin` 重新同步。"
+        )
 
     file_links = file_snapshot.get("file_links") or {}
-    text_lines = [f"📚 你的 {semester_tag} 學期 E3 課程：", _format_cache_status_text(cache_status)]
+    if _is_discord_user_key(line_user_id):
+        text_lines = [
+            f"📚 **{semester_tag} 學期課程列表**",
+            "這裡是你目前同步到 XE3 的課程。",
+            _discord_separator(line_user_id),
+            _format_cache_status_text(cache_status),
+            "",
+        ]
+    else:
+        text_lines = [f"📚 你的 {semester_tag} 學期 E3 課程：", _format_cache_status_text(cache_status)]
     bubbles = []
     for idx, (display_name, payload) in enumerate(current_courses[:10], start=1):
         summary = _build_course_summary(idx, display_name, payload, file_links.get(str((payload or {}).get("_course_id") or "").strip()) or {})
-        text_lines.append(f"{idx}. {summary['course_label']}")
-        text_lines.append(f"   作業 {summary['homework_count']}｜成績 {summary['grade_count']}｜檔案 {summary['file_count']}")
+        if _is_discord_user_key(line_user_id):
+            text_lines.append(f"• **{summary['course_label']}**")
+            text_lines.append(
+                f"  作業 `{summary['homework_count']}` · 成績 `{summary['grade_count']}` · 檔案 `{summary['file_count']}`"
+            )
+            text_lines.append("")
+        else:
+            text_lines.append(f"{idx}. {summary['course_label']}")
+            text_lines.append(f"   作業 {summary['homework_count']}｜成績 {summary['grade_count']}｜檔案 {summary['file_count']}")
         bubbles.append(_build_course_bubble(summary))
 
     messages = [item for item in [_build_cache_status_flex(cache_status, "課程快取")] if item]
@@ -293,11 +369,33 @@ def extract_grade_items(courses):
     for display_name, payload in courses.items():
         if not isinstance(payload, dict):
             continue
-        grades = payload.get("grades") or {}
-        if not isinstance(grades, dict):
-            continue
+        grades_payload = payload.get("grades") or {}
         course_id = str(payload.get("_course_id") or "").strip()
         course_name = _course_name_for_display(display_name)
+        if isinstance(grades_payload, dict) and isinstance(grades_payload.get("grade_items"), list):
+            for row in grades_payload.get("grade_items") or []:
+                if not isinstance(row, dict):
+                    continue
+                score = row.get("score")
+                if not _is_meaningful_grade(score):
+                    continue
+                if row.get("is_category") or row.get("is_calculated"):
+                    continue
+                item_text = re.sub(r"\s+", " ", str(row.get("item_name") or "").replace("\u000b", " ")).strip()
+                score_text = re.sub(r"\s+", " ", str(score or "")).strip()
+                if not item_text or not score_text:
+                    continue
+                items.append(
+                    {
+                        "course_id": course_id,
+                        "course_name": course_name,
+                        "item_name": item_text,
+                        "score": score_text,
+                    }
+                )
+            continue
+
+        grades = grades_payload if isinstance(grades_payload, dict) else {}
         for item_name, score in grades.items():
             if not _is_meaningful_grade(score):
                 continue
@@ -339,18 +437,26 @@ def sync_grade_items(user_id, courses):
     return changes
 
 
-def _format_grade_change_summary(changes):
+def _format_grade_change_summary(changes, user_key=None):
     if not changes:
         return ""
-    lines = ["📊 新成績："]
+    lines = ["📊 **New grade updates**" if _is_discord_user_key(user_key) else "📊 新成績："]
     for idx, item in enumerate(changes[:5], start=1):
         course_name = _shorten_course_name(item["course_name"], max_len=24)
         if item.get("old_score"):
-            lines.append(f"{idx}. {course_name}｜{item['item_name']}：{item['old_score']} -> {item['score']}")
+            lines.append(
+                f"• **{course_name}** · {item['item_name']} · **{item['old_score']} → {item['score']}**"
+                if _is_discord_user_key(user_key)
+                else f"{idx}. {course_name}｜{item['item_name']}：{item['old_score']} -> {item['score']}"
+            )
         else:
-            lines.append(f"{idx}. {course_name}｜{item['item_name']}：{item['score']}")
+            lines.append(
+                f"• **{course_name}** · {item['item_name']} · **{item['score']}**"
+                if _is_discord_user_key(user_key)
+                else f"{idx}. {course_name}｜{item['item_name']}：{item['score']}"
+            )
     if len(changes) > 5:
-        lines.append(f"另有 {len(changes) - 5} 筆更新。")
+        lines.append(f"• ...and `{len(changes) - 5}` more" if _is_discord_user_key(user_key) else f"另有 {len(changes) - 5} 筆更新。")
     return "\n".join(lines)
 
 
@@ -364,21 +470,37 @@ def _list_grades(logger, line_user_id):
         cache_status = get_cache_status(make_user_key(line_user_id))
     except Exception as exc:
         logger.error("e3_list_grades_failed error=%s", exc)
-        return "E3 成績資料讀取失敗，請先 `e3 relogin`。"
+        return (
+            f"⚠️ XE3 couldn't load your grade data.\nTry {_discord_command_hint('e3 relogin', line_user_id)}."
+            if _is_discord_user_key(line_user_id)
+            else "E3 成績資料讀取失敗，請先 `e3 relogin`。"
+        )
 
     grade_items = extract_grade_items(data)
     if not grade_items:
-        return "目前沒有可用成績資料。"
+        return _discord_empty_state("目前還沒有新成績，先喘口氣吧。🎉", line_user_id, emoji="📊") if _is_discord_user_key(line_user_id) else "目前沒有可用成績資料。"
     grouped = _group_grade_items_by_course(grade_items)
-    lines = ["📊 E3 成績：", _format_cache_status_text(cache_status)]
+    if _is_discord_user_key(line_user_id):
+        lines = ["📊 **成績總覽**", _format_cache_status_text(cache_status), ""]
+    else:
+        lines = ["📊 E3 成績：", _format_cache_status_text(cache_status)]
     bubbles = []
     for idx, course_group in enumerate(grouped[:10], start=1):
-        lines.append(f"{idx}. {course_group['course_label']}")
-        for item in course_group["items"][:3]:
-            lines.append(f"   {item['item_name']}：{item['score']}")
-        remaining = len(course_group["items"]) - 3
-        if remaining > 0:
-            lines.append(f"   ...另有 {remaining} 筆")
+        if _is_discord_user_key(line_user_id):
+            lines.append(f"**{course_group['course_label']}**")
+            for item in course_group["items"][:3]:
+                lines.append(f"• {item['item_name']} · **{item['score']}**")
+            remaining = len(course_group["items"]) - 3
+            if remaining > 0:
+                lines.append(f"• ...and `{remaining}` more")
+            lines.append("")
+        else:
+            lines.append(f"{idx}. {course_group['course_label']}")
+            for item in course_group["items"][:3]:
+                lines.append(f"   {item['item_name']}：{item['score']}")
+            remaining = len(course_group["items"]) - 3
+            if remaining > 0:
+                lines.append(f"   ...另有 {remaining} 筆")
         bubbles.append(_build_grade_bubble(course_group))
 
     messages = [item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]
@@ -577,14 +699,18 @@ def _list_files(tokens, logger, line_user_id):
 
     keyword = " ".join(tokens[1:]).strip() if len(tokens) >= 2 else ""
     if not keyword:
-        return "用法：e3 files <課名關鍵字>"
+        return f"請使用 {_discord_command_hint('e3 files <課名關鍵字>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 files <課名關鍵字>"
 
     try:
         snapshot = fetch_file_links(make_user_key(line_user_id))
         cache_status = get_cache_status(make_user_key(line_user_id))
     except Exception as exc:
         logger.error("e3_list_files_failed error=%s", exc)
-        return "E3 檔案資料讀取失敗，請先 `e3 relogin`。"
+        return (
+            f"⚠️ XE3 couldn't load your file index.\nTry {_discord_command_hint('e3 relogin', line_user_id)}."
+            if _is_discord_user_key(line_user_id)
+            else "E3 檔案資料讀取失敗，請先 `e3 relogin`。"
+        )
 
     courses = snapshot.get("courses") or {}
     file_links = snapshot.get("file_links") or {}
@@ -601,9 +727,13 @@ def _list_files(tokens, logger, line_user_id):
         matches.append((course_id, course_name, links))
 
     if not matches:
-        return f"找不到包含「{keyword}」的課程檔案，請先 `e3 relogin` 更新資料。"
+        return (
+            f"📎 我找不到和 **{keyword}** 相符的教材。\n如果這門課是最近才加入的，可以試試 {_discord_command_hint('e3 relogin', line_user_id)}。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到包含「{keyword}」的課程檔案，請先 `e3 relogin` 更新資料。"
+        )
 
-    lines = [f"📎 與「{keyword}」相關的課程檔案：", _format_cache_status_text(cache_status)]
+    lines = [f"📎 **Materials related to {keyword}**", _format_cache_status_text(cache_status), ""] if _is_discord_user_key(line_user_id) else [f"📎 與「{keyword}」相關的課程檔案：", _format_cache_status_text(cache_status)]
     bubbles = []
     for course_id, course_name, links in matches[:5]:
         all_files = _collect_file_entries(course_id, course_name, links)
@@ -614,13 +744,19 @@ def _list_files(tokens, logger, line_user_id):
             preview_lines.append(f"還有 {remaining} 個資料夾，點「查看資料夾」查看。")
         if not preview_lines:
             preview_lines = ["目前沒有可用檔案"]
-        lines.append(f"- {course_id} {course_name}".strip())
-        for line in preview_lines:
-            lines.append(f"  {line}")
+        if _is_discord_user_key(line_user_id):
+            lines.append(f"**{course_id} {course_name}**".strip())
+            for line in preview_lines:
+                lines.append(f"• {line}")
+            lines.append("")
+        else:
+            lines.append(f"- {course_id} {course_name}".strip())
+            for line in preview_lines:
+                lines.append(f"  {line}")
         bubbles.append(_build_file_course_bubble(course_id, course_name, preview_lines))
 
     if not bubbles:
-        return f"「{keyword}」目前沒有可用檔案連結。"
+        return _discord_empty_state(f"I found the course, but there aren't any downloadable materials for **{keyword}** yet.", line_user_id, emoji="📎") if _is_discord_user_key(line_user_id) else f"「{keyword}」目前沒有可用檔案連結。"
 
     messages = [item for item in [_build_cache_status_flex(cache_status, "檔案快取")] if item]
     messages.append(
@@ -730,10 +866,12 @@ def _count_completed_assignments(payload):
 
 
 def _count_grade_items(payload):
-    grades = (payload or {}).get("grades") or {}
-    if not isinstance(grades, dict):
+    grades_payload = (payload or {}).get("grades") or {}
+    if not isinstance(grades_payload, dict):
         return 0
-    return sum(1 for score in grades.values() if _is_meaningful_grade(score))
+    if isinstance(grades_payload.get("grade_items"), list):
+        return sum(1 for row in (grades_payload.get("grade_items") or []) if isinstance(row, dict) and _is_meaningful_grade(row.get("score")))
+    return sum(1 for score in grades_payload.values() if _is_meaningful_grade(score))
 
 
 def _count_file_items(link_payload):
@@ -950,17 +1088,34 @@ def _sync_events_for_user(user_id, courses, calendar_events=None):
 
 
 def _format_home_preview(preview):
+    user_key = preview.get("_user_key")
     lines = []
     user_name = preview.get("user_name") or ""
     user_email = preview.get("user_email") or ""
     if user_name:
-        lines.append(f"👤 姓名：{user_name}")
+        lines.append(f"👤 **Name:** {_discord_bold(user_name, user_key)}" if _is_discord_user_key(user_key) else f"👤 姓名：{user_name}")
     if user_email:
-        lines.append(f"📧 Email：{user_email}")
+        lines.append(f"📧 **Email:** {user_email}" if _is_discord_user_key(user_key) else f"📧 Email：{user_email}")
     if not lines:
-        lines.append("👤 姓名：未取得")
-        lines.append("📧 Email：未取得")
+        if _is_discord_user_key(user_key):
+            lines.append("👤 **Name:** Not available yet")
+            lines.append("📧 **Email:** Not available yet")
+        else:
+            lines.append("👤 姓名：未取得")
+            lines.append("📧 Email：未取得")
     return "\n".join(lines)
+
+
+def _discord_command_hint(command: str, user_key=None) -> str:
+    return f"`{command}`" if _is_discord_user_key(user_key) else command
+
+
+def _discord_separator(user_key=None) -> str:
+    return "──────────" if _is_discord_user_key(user_key) else ""
+
+
+def _discord_empty_state(message: str, user_key=None, emoji: str = "✨") -> str:
+    return f"{emoji} {message}" if _is_discord_user_key(user_key) else message
 
 
 def _current_semester_tag(now=None):
@@ -1042,6 +1197,13 @@ def _is_discord_user_key(user_key):
     return str(user_key or "").startswith("discord:")
 
 
+def _discord_bold(text, user_key=None):
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    return f"**{raw}**" if _is_discord_user_key(user_key) else raw
+
+
 def _discord_relative_due_tag(value, user_key=None):
     if not _is_discord_user_key(user_key):
         return ""
@@ -1051,6 +1213,15 @@ def _discord_relative_due_tag(value, user_key=None):
     return f" <t:{int(dt.timestamp())}:R>"
 
 
+def _discord_full_due_tag(value, user_key=None):
+    if not _is_discord_user_key(user_key):
+        return ""
+    dt = _normalize_due_at(value)
+    if dt is None:
+        return ""
+    return f"<t:{int(dt.timestamp())}:F>"
+
+
 def _format_due_at_for_display(value, user_key=None):
     if not value:
         return "N/A"
@@ -1058,6 +1229,9 @@ def _format_due_at_for_display(value, user_key=None):
     dt = _normalize_due_at(value)
     if dt is None:
         return str(value)
+
+    if _is_discord_user_key(user_key):
+        return f"{_discord_full_due_tag(value, user_key)} · {_discord_relative_due_tag(value, user_key).strip()}"
 
     weekdays = ["一", "二", "三", "四", "五", "六", "日"]
     return dt.strftime("%m/%d") + f" ({weekdays[dt.weekday()]}) " + dt.strftime("%H:%M") + _discord_relative_due_tag(value, user_key)
@@ -1070,6 +1244,32 @@ def _format_event_type_label(event_type):
         "exam": "考試",
     }
     return mapping.get(event_type, event_type)
+
+
+def _event_payload(row):
+    payload_json = _row_value(row, "payload_json", "") or ""
+    if not payload_json:
+        return {}
+    try:
+        return json.loads(payload_json)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _event_title_for_display(row, payload=None):
+    payload = payload or {}
+    title = str(row["title"] or "").strip()
+    if title.startswith("課綱考試｜"):
+        title = title.split("｜", 1)[1].strip()
+    title = re.sub(r"\s+", " ", title).strip()
+    return title or "未命名事件"
+
+
+def _event_type_label_for_display(row, payload=None):
+    payload = payload or {}
+    if str(payload.get("source") or "").strip() == "course_outline_syllabus" and str(row["event_type"] or "") == "exam":
+        return "課綱考試"
+    return _format_event_type_label(row["event_type"])
 
 
 def _parse_event_type_filter(tokens):
@@ -1085,6 +1285,44 @@ def _parse_event_type_filter(tokens):
 
 def _default_reminder_schedule():
     return ["09:00", "21:00"]
+
+
+def _load_reminder_schedule(prefs) -> list[str]:
+    raw = None
+    if prefs is None:
+        raw = None
+    elif isinstance(prefs, dict):
+        raw = prefs.get("schedule_json")
+    else:
+        try:
+            raw = prefs["schedule_json"]
+        except (KeyError, IndexError, TypeError):
+            raw = None
+    if not raw:
+        return _default_reminder_schedule()
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return _default_reminder_schedule()
+    if not isinstance(parsed, list):
+        return _default_reminder_schedule()
+    normalized = []
+    for value in parsed:
+        slot = str(value or "").strip()
+        if slot and slot not in normalized:
+            normalized.append(slot)
+    return normalized or _default_reminder_schedule()
+
+
+def _schedule_choice_from_value(value: str) -> list[str] | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"both", "all", "09+21", "09:00+21:00"}:
+        return ["09:00", "21:00"]
+    if normalized in {"morning", "am", "09", "09:00"}:
+        return ["09:00"]
+    if normalized in {"evening", "pm", "21", "21:00"}:
+        return ["21:00"]
+    return None
 
 
 def _timeline_heading(event_type):
@@ -1122,72 +1360,17 @@ def _line_response(text, messages=None):
 
 def _format_cache_status_text(cache_status):
     if not cache_status or not cache_status.get("exists"):
-        return "🕒 Cache: unavailable. Use Force Update to sync from E3."
+        return "*(目前還沒有本地快取，XE3 會在下次同步後建立。)*" if cache_status is not None else "🕒 目前沒有快取，XE3 會在背景重新整理。"
 
     age_minutes = int(cache_status.get("age_minutes") or 0)
     ttl_minutes = int(cache_status.get("ttl_minutes") or 15)
     if cache_status.get("is_fresh"):
-        return f"🕒 Cache: {age_minutes} min old, serving local snapshot instantly."
-    return f"⚠️ Cache: {age_minutes} min old, older than {ttl_minutes} min. Tap Force Update for fresh E3 data."
+        return f"*(資料於 {age_minutes} 分鐘前同步完成，目前是最新狀態 ✨)*"
+    return f"*(Local snapshot is {age_minutes} min old. XE3 will refresh it in the background; freshness window is {ttl_minutes} min.)*"
 
 
 def _build_cache_status_flex(cache_status, title):
-    if not cache_status or not cache_status.get("exists"):
-        header_text = "No local cache yet"
-        body_text = "Use Force Update to fetch the latest data from E3."
-        accent = "#B45309"
-    elif cache_status.get("is_fresh"):
-        return None
-    else:
-        age_minutes = int(cache_status.get("age_minutes") or 0)
-        ttl_minutes = int(cache_status.get("ttl_minutes") or 15)
-        header_text = f"Stale cache · {age_minutes} min old"
-        body_text = f"Older than the {ttl_minutes}-minute freshness window. Force Update if you need real-time data."
-        accent = "#B45309"
-
-    return {
-        "type": "flex",
-        "altText": f"{title}: {header_text}",
-        "contents": {
-            "type": "bubble",
-            "size": "kilo",
-            "header": {
-                "type": "box",
-                "layout": "vertical",
-                "backgroundColor": accent,
-                "paddingAll": "12px",
-                "contents": [
-                    {"type": "text", "text": title, "color": "#FFFFFF", "size": "xs"},
-                    {"type": "text", "text": header_text, "color": "#FFFFFF", "weight": "bold", "wrap": True},
-                ],
-            },
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "sm",
-                "contents": [
-                    {"type": "text", "text": body_text, "size": "sm", "wrap": True, "color": "#334155"},
-                ],
-            },
-            "footer": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {
-                        "type": "button",
-                        "style": "primary",
-                        "height": "sm",
-                        "color": accent,
-                        "action": {
-                            "type": "message",
-                            "label": "Force Update",
-                            "text": "e3 refresh",
-                        },
-                    }
-                ],
-            },
-        },
-    }
+    return None
 
 
 def _store_last_event_index(line_user_id, ordered_groups):
@@ -1204,12 +1387,14 @@ def _store_last_event_index(line_user_id, ordered_groups):
 
 
 def _format_reminder_summary(enabled, schedule, timezone_name="Asia/Taipei"):
+    schedule_text = ", ".join(schedule) if schedule else "未設定"
     return (
         "⏰ E3 提醒設定\n"
-        f"狀態：{'開啟' if enabled else '關閉'}\n"
-        f"時區：{timezone_name}\n"
-        f"時段：{', '.join(schedule) if schedule else '未設定'}\n"
-        "提醒時間固定為每天 09:00 與 21:00，可直接點按按鈕開關。"
+        "──────────\n"
+        f"🟢 狀態：{'開啟' if enabled else '關閉'}\n"
+        f"🌏 時區：{timezone_name}\n"
+        f"🕘 時段：{schedule_text}\n"
+        "🧪 可先按 Test Reminder 看實際訊息內容。"
     )
 
 
@@ -1255,7 +1440,7 @@ def _build_reminder_settings_flex(enabled, schedule, alt_text):
                     },
                     {
                         "type": "text",
-                        "text": "每天固定時段自動推送近期事件",
+                        "text": "⏰ 每天固定時段自動推送近期事件",
                         "color": "#CCFBF1",
                         "size": "xs",
                         "margin": "sm",
@@ -1277,29 +1462,42 @@ def _build_reminder_settings_flex(enabled, schedule, alt_text):
                         "contents": [
                             {
                                 "type": "text",
-                                "text": f"狀態｜{status_text}",
+                                "text": f"🟢 狀態｜{status_text}",
                                 "weight": "bold",
                                 "color": status_color,
                                 "size": "sm",
                             },
                             {
                                 "type": "text",
-                                "text": "時區｜Asia/Taipei",
+                                "text": "🌏 時區｜Asia/Taipei",
                                 "size": "xs",
                                 "color": "#475569",
                             },
                             {
                                 "type": "text",
-                                "text": f"時段｜{schedule_text}",
+                                "text": f"🕘 時段｜{schedule_text}",
                                 "size": "sm",
                                 "wrap": True,
                                 "color": "#0F172A",
+                            },
+                            {
+                                "type": "text",
+                                "text": "──────────",
+                                "size": "xs",
+                                "color": "#94A3B8",
+                            },
+                            {
+                                "type": "text",
+                                "text": "📦 每天會先用本地快取整理，再在時段內送出提醒。",
+                                "size": "xs",
+                                "wrap": True,
+                                "color": "#475569",
                             },
                         ],
                     },
                     {
                         "type": "text",
-                        "text": "快速切換",
+                        "text": "⚙️ 快速操作",
                         "weight": "bold",
                         "size": "sm",
                         "color": "#334155",
@@ -1309,20 +1507,20 @@ def _build_reminder_settings_flex(enabled, schedule, alt_text):
                         "layout": "horizontal",
                         "spacing": "sm",
                         "contents": [
-                            _button("開啟", "e3 remind on", style="primary", color="#15803D"),
-                            _button("關閉", "e3 remind off", style="primary", color="#B91C1C"),
+                            _button("開啟提醒", "e3 remind on", style="primary", color="#15803D"),
+                            _button("關閉提醒", "e3 remind off", style="primary", color="#B91C1C"),
                         ],
                     },
                     {
                         "type": "text",
-                        "text": "提醒時間",
+                        "text": "🧭 提醒節奏",
                         "weight": "bold",
                         "size": "sm",
                         "color": "#334155",
                     },
                     {
                         "type": "text",
-                        "text": "每天固定推送兩次：09:00、21:00",
+                        "text": "09:00：早安摘要 + 近期截止提醒\n21:00：晚間截止整理",
                         "size": "sm",
                         "wrap": True,
                         "color": "#334155",
@@ -1349,9 +1547,11 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None, line_user_
         "calendar": "#2563EB",
     }.get(event_type, "#4B5563")
     for idx, row in rows[:10]:
+        payload = _event_payload(row)
         due_at = _format_due_at_for_display(row["due_at"], line_user_id)
         course_name = _course_name_for_display(row["course_name"] or row["course_id"] or "-")
-        title = _shorten_title(row["title"], max_len=44)
+        title = _shorten_title(_event_title_for_display(row, payload), max_len=44)
+        type_label = _event_type_label_for_display(row, payload)
         footer_contents = [
             {
                 "type": "button",
@@ -1411,6 +1611,12 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None, line_user_
                             "size": "sm",
                             "wrap": True,
                             "color": "#374151",
+                        },
+                        {
+                            "type": "text",
+                            "text": type_label,
+                            "size": "xs",
+                            "color": "#6B7280",
                         },
                         {
                             "type": "text",
@@ -1475,6 +1681,34 @@ def _detail_file_buttons(payload, line_user_id):
     return buttons
 
 
+def _payload_file_entries(payload, line_user_id, title_fallback):
+    if not line_user_id or not isinstance(payload, dict):
+        return []
+
+    entries = []
+    for kind, items_list, accent in (
+        ("作業附件", payload.get("attachments") or [], "#D97706"),
+        ("已繳檔案", payload.get("submitted_files") or [], "#475569"),
+    ):
+        for item in items_list:
+            if not isinstance(item, dict):
+                continue
+            source_url = str(item.get("url") or "").strip()
+            title = str(item.get("name") or "").strip() or kind
+            if not source_url:
+                continue
+            entries.append(
+                {
+                    "kind": kind,
+                    "course_name": title_fallback,
+                    "title": title,
+                    "url": build_proxy_url(line_user_id, source_url, filename=title),
+                    "accent": accent,
+                }
+            )
+    return entries
+
+
 def _row_value(row, key, default=None):
     if row is None:
         return default
@@ -1503,13 +1737,9 @@ def _timeline_homework_file_buttons(row, line_user_id):
 
 
 def _build_detail_flex(row, index, alt_text, line_user_id=None):
-    payload = {}
-    payload_json = row["payload_json"] or ""
-    if payload_json:
-        try:
-            payload = json.loads(payload_json)
-        except json.JSONDecodeError:
-            payload = {}
+    payload = _event_payload(row)
+    title = _event_title_for_display(row, payload)
+    type_label = _event_type_label_for_display(row, payload)
 
     action_buttons = [
         {
@@ -1565,9 +1795,9 @@ def _build_detail_flex(row, index, alt_text, line_user_id=None):
                 "layout": "vertical",
                 "spacing": "sm",
                 "contents": [
-                    {"type": "text", "text": _format_event_type_label(row["event_type"]), "size": "sm", "color": "#6B7280"},
+                    {"type": "text", "text": type_label, "size": "sm", "color": "#6B7280"},
                     {"type": "text", "text": _course_name_for_display(row["course_name"] or row["course_id"] or "-"), "weight": "bold", "wrap": True},
-                    {"type": "text", "text": row["title"], "wrap": True, "size": "sm"},
+                    {"type": "text", "text": title, "wrap": True, "size": "sm"},
                     {"type": "separator", "margin": "md"},
                     {"type": "text", "text": f"截止：{_format_due_at_full(row['due_at'], line_user_id)}", "size": "sm", "wrap": True},
                     {"type": "text", "text": f"顯示日期：{payload.get('date_label') or '-'}", "size": "sm", "wrap": True},
@@ -1594,6 +1824,97 @@ def _collect_course_calendar_events(snapshot, course_id):
         items.append(event)
     items.sort(key=lambda item: item.get("due_at") or "")
     return items[:3]
+
+
+def _clean_outline_text(value):
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _course_outline_summary(payload):
+    if not isinstance(payload, dict):
+        return {}
+
+    timetable = payload.get("timetable") or {}
+    if not isinstance(timetable, dict):
+        timetable = {}
+
+    outline = timetable.get("course_outline_data") or {}
+    if not isinstance(outline, dict):
+        outline = {}
+
+    base = outline.get("base_normalized") or outline.get("base") or {}
+    desc = outline.get("description_normalized") or outline.get("description") or {}
+    syllabus = outline.get("syllabus_normalized") or outline.get("syllabus") or []
+    if not isinstance(base, dict):
+        base = {}
+    if not isinstance(desc, dict):
+        desc = {}
+    if not isinstance(syllabus, list):
+        syllabus = []
+
+    exam_lines = []
+    for row in syllabus:
+        if not isinstance(row, dict):
+            continue
+        topic = _clean_outline_text(row.get("class_data"))
+        class_date = _clean_outline_text(row.get("class_date"))
+        if not topic or not class_date:
+            continue
+        if not any(keyword in topic.lower() for keyword in ("exam", "midterm", "final", "quiz", "期中", "期末", "考試", "測驗")):
+            continue
+        exam_lines.append(f"{class_date}｜{topic}")
+
+    return {
+        "teacher": _clean_outline_text(base.get("tea_name") or base.get("Instructors") or base.get("teacher_id")),
+        "credits": _clean_outline_text(base.get("cos_credit")),
+        "schedule": _clean_outline_text(base.get("cos_time") or desc.get("crs_meeting_time")),
+        "textbook": _clean_outline_text(desc.get("crs_textbook")),
+        "prerequisite": _clean_outline_text(desc.get("crs_prerequisite")),
+        "grading": _clean_outline_text(desc.get("crs_exam_score")),
+        "outline": _clean_outline_text(desc.get("crs_outline")),
+        "meeting_place": _clean_outline_text(desc.get("crs_meeting_place")),
+        "contact": _clean_outline_text(desc.get("crs_contact")),
+        "exam_lines": exam_lines[:3],
+        "syllabus_count": len(syllabus),
+    }
+
+
+def _course_grade_summary(payload):
+    grades = payload.get("grades") or {}
+    if not isinstance(grades, dict):
+        return {}
+
+    summary = grades.get("summary") or {}
+    if not isinstance(summary, dict):
+        summary = {}
+    items = grades.get("grade_items") or []
+    if not isinstance(items, list):
+        items = []
+
+    graded = []
+    feedback_count = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        score = str(item.get("score") or "").strip()
+        if score and score != "-":
+            graded.append(item)
+        if str(item.get("feedback") or "").strip():
+            feedback_count += 1
+
+    latest_lines = []
+    for item in graded[:3]:
+        title = _shorten_title(str(item.get("item_name") or "評分項目"), 28)
+        score = str(item.get("score") or "-").strip() or "-"
+        score_range = str(item.get("range") or "").strip()
+        latest_lines.append(f"{title}｜{score}" + (f" / {score_range}" if score_range and score_range != "-" else ""))
+
+    return {
+        "total_items": int(summary.get("total_items") or len(items) or 0),
+        "scored_items": int(summary.get("scored_items") or len(graded) or 0),
+        "feedback_count": feedback_count,
+        "latest_lines": latest_lines,
+    }
 
 
 def _collect_course_homework_items(payload):
@@ -1660,6 +1981,18 @@ def _build_course_detail_flex(detail, alt_text):
             "wrap": True,
         },
     ]
+    if detail.get("course_info_lines"):
+        body_contents.append({"type": "text", "text": "課綱重點", "weight": "bold", "size": "sm", "margin": "md"})
+        for line in detail["course_info_lines"]:
+            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
+    if detail.get("grade_summary_lines"):
+        body_contents.append({"type": "text", "text": "成績摘要", "weight": "bold", "size": "sm", "margin": "md"})
+        for line in detail["grade_summary_lines"]:
+            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
+    if detail.get("exam_lines"):
+        body_contents.append({"type": "text", "text": "課綱考試提醒", "weight": "bold", "size": "sm", "margin": "md"})
+        for line in detail["exam_lines"]:
+            body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
     if detail["homework_lines"]:
         body_contents.append({"type": "text", "text": "作業", "weight": "bold", "size": "sm", "margin": "md"})
         for line in detail["homework_lines"]:
@@ -1813,6 +2146,8 @@ def _format_due_at_full(value, user_key=None):
     dt = _normalize_due_at(value)
     if dt is None:
         return str(value)
+    if _is_discord_user_key(user_key):
+        return f"{_discord_full_due_tag(value, user_key)} · {_discord_relative_due_tag(value, user_key).strip()}"
     return dt.strftime("%Y/%m/%d %H:%M") + _discord_relative_due_tag(value, user_key)
 
 
@@ -1827,40 +2162,43 @@ def _extract_detail_index(action, tokens):
 
 
 def _format_event_detail(row, index, user_key=None):
-    payload = {}
-    payload_json = row["payload_json"] or ""
-    if payload_json:
-        try:
-            payload = json.loads(payload_json)
-        except json.JSONDecodeError:
-            payload = {}
+    payload = _event_payload(row)
+    type_label = _event_type_label_for_display(row, payload)
+    title = _event_title_for_display(row, payload)
 
-    lines = [f"🔎 事件詳情 #{index}"]
-    lines.append(f"類型：{_format_event_type_label(row['event_type'])}")
-    lines.append(f"課程：{_course_name_for_display(row['course_name'] or row['course_id'] or '-')}")
-    lines.append(f"標題：{row['title']}")
-    lines.append(f"截止：{_format_due_at_full(row['due_at'], user_key)}")
+    lines = [f"🔎 **事件詳情 #{index}**" if _is_discord_user_key(user_key) else f"🔎 事件詳情 #{index}"]
+    lines.append("──────────" if _is_discord_user_key(user_key) else "")
+    lines.append(f"🗂️ 類型：{_discord_bold(type_label, user_key)}")
+    lines.append(f"📚 課程：{_discord_bold(_course_name_for_display(row['course_name'] or row['course_id'] or '-'), user_key)}")
+    lines.append(f"📝 標題：{_discord_bold(title, user_key)}")
+    lines.append(f"⏰ 截止：{_format_due_at_full(row['due_at'], user_key)}")
 
     date_label = payload.get("date_label")
     if date_label:
-        lines.append(f"顯示日期：{date_label}")
+        lines.append(f"📅 顯示日期：{date_label}")
 
     url = payload.get("url")
     if url:
-        lines.append(f"連結：{url}")
+        lines.append(f"🔗 連結：{url}")
 
     event_id = payload.get("event_id")
     if event_id:
-        lines.append(f"事件 ID：{event_id}")
+        lines.append(f"🆔 事件 ID：`{event_id}`" if _is_discord_user_key(user_key) else f"事件 ID：{event_id}")
 
     attachments = payload.get("attachments") or []
     submitted_files = payload.get("submitted_files") or []
     if attachments:
-        lines.append(f"附件：{len(attachments)} 個")
+        lines.append(f"📎 附件：{len(attachments)} 個")
+        for item in attachments[:3]:
+            if isinstance(item, dict):
+                lines.append(f"• {str(item.get('name') or '附件').strip()}")
     if submitted_files:
-        lines.append(f"已繳檔案：{len(submitted_files)} 個")
+        lines.append(f"📤 已繳檔案：{len(submitted_files)} 個")
+        for item in submitted_files[:3]:
+            if isinstance(item, dict):
+                lines.append(f"• {str(item.get('name') or '已繳檔案').strip()}")
 
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line != "")
 
 
 def _format_timeline(rows, header):
@@ -1910,9 +2248,9 @@ def _build_timeline_urgency_groups(rows):
 
     now_utc = datetime.now(timezone.utc)
     buckets = [
-        ("urgent", "🚨 Due within 48h", []),
-        ("week", "📅 This Week", []),
-        ("later", "📌 Later", []),
+        ("urgent", "🚨 48 小時內", []),
+        ("week", "📅 本週內", []),
+        ("later", "📌 之後", []),
     ]
 
     for row in ordered_rows:
@@ -1977,15 +2315,26 @@ def _build_timeline_messages(rows, header, event_type=None, line_user_id=None):
         for idx, row in items:
             due_at = _format_due_at_for_display(row["due_at"], line_user_id)
             course_name = _shorten_course_name(row["course_name"] or row["course_id"] or "-")
-            title = _shorten_title(row["title"])
+            payload = _event_payload(row)
+            title = _shorten_title(_event_title_for_display(row, payload))
             icon = "👉" if row["event_type"] == "homework" else "📍"
-            type_label = _format_event_type_label(row["event_type"])
-            section_lines.append(f"{idx}. {due_at} ｜{course_name}")
-            if use_triage or group_event_type == "mixed":
-                section_lines.append(f"   {icon} [{type_label}] {title}")
+            type_label = _event_type_label_for_display(row, payload)
+            if _is_discord_user_key(line_user_id):
+                urgency_icon = "🚨" if group_event_type == "urgent" else ("📅" if group_event_type == "week" else "📌")
+                section_lines.append(f"{urgency_icon} **{course_name}**")
+                if use_triage or group_event_type == "mixed":
+                    section_lines.append(f"• [{type_label}] {title}")
+                else:
+                    section_lines.append(f"• {title}")
+                section_lines.append(f"• 截止 {due_at}")
+                section_lines.append("")
             else:
-                section_lines.append(f"   {icon} {title}")
-            section_lines.append("")
+                section_lines.append(f"{idx}. {due_at} ｜{course_name}")
+                if use_triage or group_event_type == "mixed":
+                    section_lines.append(f"   {icon} [{type_label}] {title}")
+                else:
+                    section_lines.append(f"   {icon} {title}")
+                section_lines.append("")
         if section_lines[-1] == "":
             section_lines.pop()
         section_text = "\n".join(section_lines)
@@ -2033,7 +2382,21 @@ def _event_detail(action, tokens, line_user_id):
 
     text = _format_event_detail(row, index, line_user_id)
     flex = _build_detail_flex(row, index, text, line_user_id=line_user_id)
-    return _line_response(text, messages=[flex] if flex else None)
+    payload = {}
+    payload_json = row["payload_json"] or ""
+    if payload_json:
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            payload = {}
+
+    messages = [flex] if flex else []
+    file_entries = _payload_file_entries(payload, line_user_id, str(row["title"] or "事件檔案"))
+    if file_entries:
+        file_flex = _build_file_download_flex(file_entries, f"📎 {row['title']} 檔案", str(row["title"] or "事件檔案"))
+        if file_flex:
+            messages.append(file_flex)
+    return _line_response(text, messages=messages or None)
 
 
 def _course_detail(action, tokens, logger, line_user_id):
@@ -2043,7 +2406,7 @@ def _course_detail(action, tokens, logger, line_user_id):
 
     index = _extract_course_index(action, tokens)
     if index is None or index <= 0:
-        return "用法：e3 課程詳情 <編號>"
+        return f"請使用 {_discord_command_hint('e3 課程詳情 <編號>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 課程詳情 <編號>"
 
     try:
         courses = fetch_courses(make_user_key(line_user_id))
@@ -2051,13 +2414,21 @@ def _course_detail(action, tokens, logger, line_user_id):
         file_snapshot = fetch_file_links(make_user_key(line_user_id))
     except Exception as exc:
         logger.error("e3_course_detail_failed error=%s", exc)
-        return "課程詳情讀取失敗，請先 `e3 relogin`。"
+        return (
+            f"⚠️ XE3 couldn't load that course detail.\nTry {_discord_command_hint('e3 relogin', line_user_id)} first."
+            if _is_discord_user_key(line_user_id)
+            else "課程詳情讀取失敗，請先 `e3 relogin`。"
+        )
 
     semester_tag = _current_semester_tag()
     current_courses = _current_semester_courses(courses, semester_tag=semester_tag)
 
     if index > len(current_courses):
-        return f"找不到第 {index} 門課程，請先輸入 `e3 course` 確認編號。"
+        return (
+            f"⚠️ 我找不到課程 `#{index}`。\n先用 {_discord_command_hint('e3 course', line_user_id)} 確認目前的編號。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到第 {index} 門課程，請先輸入 `e3 course` 確認編號。"
+        )
 
     display_name, payload = current_courses[index - 1]
     course_id = str((payload or {}).get("_course_id") or "").strip()
@@ -2079,24 +2450,75 @@ def _course_detail(action, tokens, logger, line_user_id):
         "calendar_count": len(calendar_items),
         "file_count": _count_file_items(links),
         "homework_lines": [
-            f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'])}"
+            f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
             for item in homework_items
         ] or ["目前沒有未完成作業"],
         "calendar_lines": [
-            f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'])}"
+            f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
             for item in calendar_items
         ] or ["目前沒有近期行事曆"],
         "file_lines": file_lines or ["目前沒有可用檔案"],
     }
-
-    text_lines = [
-        f"📘 課程詳情 #{index}",
-        f"課程：{course_id} {course_name}".strip(),
-        f"未完成作業：{detail['homework_count']}｜已完成作業：{detail['completed_homework_count']}｜行事曆：{detail['calendar_count']}｜檔案：{detail['file_count']}",
-        "作業：" + ("；".join(detail["homework_lines"]) if detail["homework_lines"] else "-"),
-        "行事曆：" + ("；".join(detail["calendar_lines"]) if detail["calendar_lines"] else "-"),
-        "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
+    outline_info = _course_outline_summary(payload)
+    grade_info = _course_grade_summary(payload)
+    detail["course_info_lines"] = [
+        f"👨‍🏫 教師｜{outline_info['teacher']}",
+        f"🎓 學分｜{outline_info['credits']}",
+        f"🕒 時段｜{outline_info['schedule']}",
+        f"📍 地點｜{outline_info['meeting_place']}",
+        f"📚 教材｜{_shorten_title(outline_info['textbook'], 36)}",
+        f"🧭 先修｜{_shorten_title(outline_info['prerequisite'], 36)}",
+        f"📊 評分｜{_shorten_title(outline_info['grading'], 36)}",
     ]
+    detail["course_info_lines"] = [line for line in detail["course_info_lines"] if not line.endswith("｜")]
+    detail["grade_summary_lines"] = [
+        f"📊 已登錄成績｜{grade_info['scored_items']} / {grade_info['total_items']}",
+        f"💬 回饋項目｜{grade_info['feedback_count']}",
+        *[f"• {line}" for line in grade_info["latest_lines"]],
+    ]
+    detail["grade_summary_lines"] = [line for line in detail["grade_summary_lines"] if not line.endswith("｜0 / 0") or grade_info["latest_lines"]]
+    if grade_info["total_items"] == 0 and not grade_info["latest_lines"]:
+        detail["grade_summary_lines"] = ["📊 目前還沒有可用的成績摘要"]
+    detail["exam_lines"] = [f"🧪 {line}" for line in outline_info["exam_lines"]] or ["目前尚未從課綱辨識到明確考試日期"]
+
+    if _is_discord_user_key(line_user_id):
+        text_lines = [
+            f"📘 **課程詳情 #{index}**",
+            _discord_separator(line_user_id),
+            f"📚 **{course_id} {course_name}**".strip(),
+            f"📝 作業 `{detail['homework_count']}` 未完成 · ✅ `{detail['completed_homework_count']}` 已完成",
+            f"📅 行事曆 `{detail['calendar_count']}` · 📎 教材 `{detail['file_count']}`",
+            "",
+            f"🧾 **課綱重點**",
+            *[f"• {line}" for line in detail["course_info_lines"]],
+            "",
+            f"📊 **成績摘要**",
+            *[f"• {line}" for line in detail["grade_summary_lines"]],
+            "",
+            f"🧪 **課綱考試提醒**",
+            *[f"• {line}" for line in detail["exam_lines"]],
+            "",
+            f"📝 **作業**",
+            *[f"• {line}" for line in detail["homework_lines"]],
+            "",
+            f"📅 **近期行事曆**",
+            *[f"• {line}" for line in detail["calendar_lines"]],
+            "",
+            f"📎 **教材 / 檔案**",
+            *[f"• {line}" for line in detail["file_lines"]],
+        ]
+    else:
+        text_lines = [
+            f"📘 課程詳情 #{index}",
+            f"課程：{course_id} {course_name}".strip(),
+            f"未完成作業：{detail['homework_count']}｜已完成作業：{detail['completed_homework_count']}｜行事曆：{detail['calendar_count']}｜檔案：{detail['file_count']}",
+            "課綱重點：" + ("；".join(detail["course_info_lines"]) if detail["course_info_lines"] else "-"),
+            "成績摘要：" + ("；".join(detail["grade_summary_lines"]) if detail["grade_summary_lines"] else "-"),
+            "課綱考試提醒：" + ("；".join(detail["exam_lines"]) if detail["exam_lines"] else "-"),
+            "作業：" + ("；".join(detail["homework_lines"]) if detail["homework_lines"] else "-"),
+            "行事曆：" + ("；".join(detail["calendar_lines"]) if detail["calendar_lines"] else "-"),
+            "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
+        ]
     text = "\n".join(text_lines)
     flex = _build_course_detail_flex(detail, text)
     return _line_response(text, messages=[flex] if flex else None)
@@ -2109,13 +2531,17 @@ def _course_homework(action, tokens, logger, line_user_id):
 
     target = _extract_course_target(action, tokens, "課程作業", "homework")
     if not target:
-        return "用法：e3 課程作業 <課號或課名>"
+        return f"請使用 {_discord_command_hint('e3 課程作業 <課號或課名>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 課程作業 <課號或課名>"
 
     try:
         courses = fetch_courses(make_user_key(line_user_id))
     except Exception as exc:
         logger.error("e3_course_homework_failed error=%s", exc)
-        return "課程作業讀取失敗，請先 `e3 relogin`。"
+        return (
+            f"⚠️ XE3 couldn't load that homework list.\nTry {_discord_command_hint('e3 relogin', line_user_id)}."
+            if _is_discord_user_key(line_user_id)
+            else "課程作業讀取失敗，請先 `e3 relogin`。"
+        )
 
     semester_tag = _current_semester_tag()
     matched_course = None
@@ -2128,20 +2554,31 @@ def _course_homework(action, tokens, logger, line_user_id):
             break
 
     if not matched_course:
-        return f"找不到「{target}」的課程作業。"
+        return (
+            f"📝 我找不到和 **{target}** 對應的課程。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到「{target}」的課程作業。"
+        )
 
     course_id, course_name, payload = matched_course
     items = _collect_course_homework_entries(payload)
 
     if not items:
-        return f"{course_name} 目前沒有可查看的作業。"
+        return _discord_empty_state(f"先鬆一口氣，**{course_name}** 目前沒有需要查看的作業。🎉", line_user_id, emoji="📝") if _is_discord_user_key(line_user_id) else f"{course_name} 目前沒有可查看的作業。"
 
-    lines = [f"📝 {course_name} 作業列表（{len(items)} 筆）"]
+    lines = [f"📝 **{course_name} homework** (`{len(items)}` item(s))", _discord_separator(line_user_id)] if _is_discord_user_key(line_user_id) else [f"📝 {course_name} 作業列表（{len(items)} 筆）"]
     for idx, item in enumerate(items[:10], start=1):
         status_text = "已完成" if item.get("completed") else "未完成"
-        lines.append(f"{idx}. [{status_text}] {item['title']}｜{_format_due_at_for_display(item['due_at'], line_user_id)}")
+        if _is_discord_user_key(line_user_id):
+            icon = "✅" if item.get("completed") else "🚨"
+            lines.append(f"{icon} **{item['title']}**")
+            lines.append(f"• Status: `{status_text}`")
+            lines.append(f"• Due {_format_due_at_for_display(item['due_at'], line_user_id)}")
+            lines.append("")
+        else:
+            lines.append(f"{idx}. [{status_text}] {item['title']}｜{_format_due_at_for_display(item['due_at'], line_user_id)}")
     if len(items) > 10:
-        lines.append(f"還有 {len(items) - 10} 筆作業。")
+        lines.append(f"…and `{len(items) - 10}` more." if _is_discord_user_key(line_user_id) else f"還有 {len(items) - 10} 筆作業。")
     text = "\n".join(lines)
     flex = _build_course_homework_flex(course_name, course_id, items, text, line_user_id=line_user_id)
     return _line_response(text, messages=[flex] if flex else None)
@@ -2154,13 +2591,17 @@ def _course_homework_detail(action, tokens, logger, line_user_id):
 
     target, index = _extract_indexed_target(action, tokens, "作業詳情")
     if not target or not index:
-        return "用法：e3 作業詳情 <課號或課名> i1"
+        return f"請使用 {_discord_command_hint('e3 作業詳情 <課號或課名> i1', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 作業詳情 <課號或課名> i1"
 
     try:
         courses = fetch_courses(make_user_key(line_user_id))
     except Exception as exc:
         logger.error("e3_course_homework_detail_failed error=%s", exc)
-        return "作業詳情讀取失敗，請先 `e3 relogin`。"
+        return (
+            f"⚠️ XE3 couldn't load that homework detail.\nTry {_discord_command_hint('e3 relogin', line_user_id)}."
+            if _is_discord_user_key(line_user_id)
+            else "作業詳情讀取失敗，請先 `e3 relogin`。"
+        )
 
     semester_tag = _current_semester_tag()
     matched_course = None
@@ -2173,12 +2614,16 @@ def _course_homework_detail(action, tokens, logger, line_user_id):
             break
 
     if not matched_course:
-        return f"找不到「{target}」的課程作業。"
+        return f"📝 我找不到和 **{target}** 對應的課程。" if _is_discord_user_key(line_user_id) else f"找不到「{target}」的課程作業。"
 
     course_id, course_name, payload = matched_course
     items = _collect_course_homework_entries(payload)
     if index > len(items):
-        return f"找不到第 {index} 個作業，請先輸入 `e3 課程作業 {course_id or course_name}`。"
+        return (
+            f"⚠️ 我找不到作業 `#{index}`。\n先用 {_discord_command_hint(f'e3 課程作業 {course_id or course_name}', line_user_id)} 看看目前列表。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到第 {index} 個作業，請先輸入 `e3 課程作業 {course_id or course_name}`。"
+        )
 
     selected = items[index - 1]
     raw = selected.get("_raw") or {}
@@ -2186,20 +2631,20 @@ def _course_homework_detail(action, tokens, logger, line_user_id):
     attachments = [item for item in (raw.get("attachments") or []) if isinstance(item, dict)]
     submitted_files = [item for item in (raw.get("submitted_files") or []) if isinstance(item, dict)]
 
-    lines = [f"📝 {course_name} / 作業詳情 #{index}"]
-    lines.append(f"標題：{selected['title']}")
-    lines.append(f"狀態：{'已完成' if selected.get('completed') else '未完成'}")
-    lines.append(f"截止：{_format_due_at_full(selected.get('due_at'), line_user_id)}")
+    lines = [f"📝 **{course_name} / 作業詳情 #{index}**", _discord_separator(line_user_id)] if _is_discord_user_key(line_user_id) else [f"📝 {course_name} / 作業詳情 #{index}"]
+    lines.append(f"📝 標題：{_discord_bold(selected['title'], line_user_id)}" if _is_discord_user_key(line_user_id) else f"標題：{selected['title']}")
+    lines.append(f"📌 狀態：{'已完成' if selected.get('completed') else '未完成'}" if _is_discord_user_key(line_user_id) else f"狀態：{'已完成' if selected.get('completed') else '未完成'}")
+    lines.append(f"⏰ 截止：{_format_due_at_full(selected.get('due_at'), line_user_id)}")
     if attachments:
-        lines.append(f"附件：{len(attachments)} 個")
+        lines.append(f"📎 附件：{len(attachments)} 個" if _is_discord_user_key(line_user_id) else f"附件：{len(attachments)} 個")
         for item in attachments[:3]:
-            lines.append(f"  - {str(item.get('name') or '附件').strip()}")
+            lines.append(f"• {str(item.get('name') or '附件').strip()}" if _is_discord_user_key(line_user_id) else f"  - {str(item.get('name') or '附件').strip()}")
     if submitted_files:
-        lines.append(f"已繳檔案：{len(submitted_files)} 個")
+        lines.append(f"📤 已繳檔案：{len(submitted_files)} 個" if _is_discord_user_key(line_user_id) else f"已繳檔案：{len(submitted_files)} 個")
         for item in submitted_files[:3]:
-            lines.append(f"  - {str(item.get('name') or '已繳檔案').strip()}")
+            lines.append(f"• {str(item.get('name') or '已繳檔案').strip()}" if _is_discord_user_key(line_user_id) else f"  - {str(item.get('name') or '已繳檔案').strip()}")
     if detail_url:
-        lines.append(f"連結：{detail_url}")
+        lines.append(f"🔗 連結：{detail_url}" if _is_discord_user_key(line_user_id) else f"連結：{detail_url}")
 
     file_entries = []
     for kind, items_list, accent in (
@@ -2543,7 +2988,7 @@ def _handle_remind(tokens, line_user_id):
     subcommand = tokens[1].lower() if len(tokens) >= 2 else "show"
 
     if subcommand in {"show", "狀態"}:
-        schedule = _default_reminder_schedule()
+        schedule = _load_reminder_schedule(prefs)
         text = _format_reminder_summary(bool(prefs["enabled"]), schedule, prefs["timezone"])
         flex = _build_reminder_settings_flex(bool(prefs["enabled"]), schedule, text)
         return _line_response(text, messages=[flex] if flex else None)
@@ -2551,7 +2996,7 @@ def _handle_remind(tokens, line_user_id):
     if subcommand in {"on", "開啟"}:
         update_reminder_enabled(user_id, True)
         prefs = get_reminder_prefs(user_id)
-        schedule = _default_reminder_schedule()
+        schedule = _load_reminder_schedule(prefs)
         text = "✅ 已開啟 E3 自動提醒。\n\n" + _format_reminder_summary(True, schedule, prefs["timezone"])
         flex = _build_reminder_settings_flex(True, schedule, text)
         return _line_response(text, messages=[flex] if flex else None)
@@ -2559,12 +3004,23 @@ def _handle_remind(tokens, line_user_id):
     if subcommand in {"off", "關閉"}:
         update_reminder_enabled(user_id, False)
         prefs = get_reminder_prefs(user_id)
-        schedule = _default_reminder_schedule()
+        schedule = _load_reminder_schedule(prefs)
         text = "🛑 已關閉 E3 自動提醒。\n\n" + _format_reminder_summary(False, schedule, prefs["timezone"])
         flex = _build_reminder_settings_flex(False, schedule, text)
         return _line_response(text, messages=[flex] if flex else None)
 
-    return "⚠️ 用法：`e3 remind show`、`e3 remind on`、`e3 remind off`"
+    if subcommand in {"schedule", "time", "時段"}:
+        choice = _schedule_choice_from_value(tokens[2] if len(tokens) >= 3 else "")
+        if not choice:
+            return "⚠️ 用法：`e3 remind schedule both|morning|evening`"
+        update_reminder_schedule(user_id, choice)
+        prefs = get_reminder_prefs(user_id)
+        enabled = bool(prefs["enabled"]) if prefs else False
+        text = "🕘 已更新提醒時段。\n\n" + _format_reminder_summary(enabled, choice, prefs["timezone"])
+        flex = _build_reminder_settings_flex(enabled, choice, text)
+        return _line_response(text, messages=[flex] if flex else None)
+
+    return "⚠️ 用法：`e3 remind show`、`e3 remind on`、`e3 remind off`、`e3 remind schedule both|morning|evening`"
 
 
 def _login(action, logger, line_user_id):
@@ -2574,7 +3030,7 @@ def _login(action, logger, line_user_id):
 
     tokens = action.split()
     if len(tokens) < 3:
-        return "用法：e3 login <帳號> <密碼>"
+            return f"請使用 {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 login <帳號> <密碼>"
 
     account = tokens[1].strip()
     password = tokens[2].strip()
@@ -2584,15 +3040,27 @@ def _login(action, logger, line_user_id):
         courses = result["courses"]
         calendar_events = result.get("calendar_events") or []
         preview = result["home_preview"]
+        if isinstance(preview, dict):
+            preview = dict(preview)
+            preview["_user_key"] = line_user_id
         events = _sync_events_for_user(user_id, courses, calendar_events=calendar_events)
         grade_changes = sync_grade_items(user_id, courses)
         upsert_e3_account(user_id, account, encrypt_secret(password), status="ok", error=None)
-        reply = (
-            "✅ E3 登入成功。\n"
-            f"已同步課程：{len(courses)} 門，時間軸事件：{len(events)} 筆。\n"
-            f"{_format_home_preview(preview)}"
-        )
-        grade_summary = _format_grade_change_summary(grade_changes)
+        if _is_discord_user_key(line_user_id):
+            reply = (
+                "✅ **You're in. XE3 is synced and ready.**\n"
+                f"{_discord_separator(line_user_id)}\n"
+                f"📚 Synced **{len(courses)}** course(s)\n"
+                f"🗓️ Tracked **{len(events)}** timeline event(s)\n"
+                f"{_format_home_preview(preview)}"
+            )
+        else:
+            reply = (
+                "✅ E3 登入成功。\n"
+                f"已同步課程：{len(courses)} 門，時間軸事件：{len(events)} 筆。\n"
+                f"{_format_home_preview(preview)}"
+            )
+        grade_summary = _format_grade_change_summary(grade_changes, line_user_id)
         if grade_summary:
             reply += "\n" + grade_summary
         return reply
@@ -2609,12 +3077,12 @@ def _relogin(logger, line_user_id):
 
     row = get_e3_account_by_user_id(user_id)
     if not row:
-        return "找不到已綁定帳號，請先 `e3 login <帳號> <密碼>`。"
+        return f"⚠️ I can't find a linked account yet.\nStart with {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}." if _is_discord_user_key(line_user_id) else "找不到已綁定帳號，請先 `e3 login <帳號> <密碼>`。"
 
     account = row["e3_account"]
     encrypted_password = row["encrypted_password"]
     if not encrypted_password:
-        return "找不到已儲存密碼，請重新執行 `e3 login <帳號> <密碼>`。"
+        return f"⚠️ Your saved credentials are missing.\nPlease sign in again with {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}." if _is_discord_user_key(line_user_id) else "找不到已儲存密碼，請重新執行 `e3 login <帳號> <密碼>`。"
 
     try:
         password = decrypt_secret(encrypted_password)
@@ -2622,15 +3090,27 @@ def _relogin(logger, line_user_id):
         courses = result["courses"]
         calendar_events = result.get("calendar_events") or []
         preview = result["home_preview"]
+        if isinstance(preview, dict):
+            preview = dict(preview)
+            preview["_user_key"] = line_user_id
         events = _sync_events_for_user(user_id, courses, calendar_events=calendar_events)
         grade_changes = sync_grade_items(user_id, courses)
         update_login_state(user_id, "ok", None)
-        reply = (
-            "✅ E3 重新登入成功。\n"
-            f"已同步課程：{len(courses)} 門，時間軸事件：{len(events)} 筆。\n"
-            f"{_format_home_preview(preview)}"
-        )
-        grade_summary = _format_grade_change_summary(grade_changes)
+        if _is_discord_user_key(line_user_id):
+            reply = (
+                "✅ **All caught up. XE3 refreshed your E3 data.**\n"
+                f"{_discord_separator(line_user_id)}\n"
+                f"📚 Synced **{len(courses)}** course(s)\n"
+                f"🗓️ Tracked **{len(events)}** timeline event(s)\n"
+                f"{_format_home_preview(preview)}"
+            )
+        else:
+            reply = (
+                "✅ E3 重新登入成功。\n"
+                f"已同步課程：{len(courses)} 門，時間軸事件：{len(events)} 筆。\n"
+                f"{_format_home_preview(preview)}"
+            )
+        grade_summary = _format_grade_change_summary(grade_changes, line_user_id)
         if grade_summary:
             reply += "\n" + grade_summary
         return reply
@@ -2639,7 +3119,7 @@ def _relogin(logger, line_user_id):
         update_login_state(user_id, "error", str(exc))
         if "Exceeded 30 redirects" in str(exc):
             return _format_e3_error(exc)
-        return "E3 重新登入失敗，請重新輸入 `e3 login <帳號> <密碼>`。"
+        return f"⚠️ XE3 couldn't refresh your E3 session.\nPlease sign in again with {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}." if _is_discord_user_key(line_user_id) else "E3 重新登入失敗，請重新輸入 `e3 login <帳號> <密碼>`。"
 
 
 def _logout(line_user_id):
@@ -2649,7 +3129,7 @@ def _logout(line_user_id):
 
     delete_user_data(user_id)
     clear_runtime_data(make_user_key(line_user_id))
-    return "🧹 E3 已登出，並清除本地綁定、事件快取與登入工作目錄。"
+    return "🧹 **You're signed out.** XE3 cleared your local link, event cache, and login workspace." if _is_discord_user_key(line_user_id) else "🧹 E3 已登出，並清除本地綁定、事件快取與登入工作目錄。"
 
 
 def _upcoming(tokens, line_user_id):
@@ -2663,7 +3143,7 @@ def _upcoming(tokens, line_user_id):
 
     rows = get_upcoming_events(user_id, limit=10)
     if not rows:
-        return "目前沒有近期事件，請先 `e3 login` 或 `e3 relogin` 進行同步。"
+        return _discord_empty_state(f"目前還沒有近期事件。\n可以先用 {_discord_command_hint('e3 login', line_user_id)} 或 {_discord_command_hint('e3 relogin', line_user_id)} 同步資料。", line_user_id, emoji="⏰") if _is_discord_user_key(line_user_id) else "目前沒有近期事件，請先 `e3 login` 或 `e3 relogin` 進行同步。"
     cache_status = get_cache_status(make_user_key(line_user_id))
     try:
         courses = fetch_courses(make_user_key(line_user_id))
@@ -2671,15 +3151,15 @@ def _upcoming(tokens, line_user_id):
         courses = {}
     rows = _filter_active_homework_rows(rows, courses)
     if event_type == "homework" and not rows:
-        return "目前沒有未繳且尚未過期的作業。"
+        return _discord_empty_state("先喘口氣吧，目前沒有未繳且即將到期的作業。🎉", line_user_id, emoji="📝") if _is_discord_user_key(line_user_id) else "目前沒有未繳且尚未過期的作業。"
     text, messages, ordered_groups = _build_timeline_messages(
         rows,
-        "⏰ 近期提醒（前 10 筆）：",
+        "⏰ **近期提醒**" if _is_discord_user_key(line_user_id) else "⏰ 近期提醒（前 10 筆）：",
         event_type=event_type,
         line_user_id=line_user_id,
     )
     if not text:
-        return "目前沒有符合條件的近期事件。"
+        return _discord_empty_state("目前沒有符合條件的近期事件。", line_user_id, emoji="📅") if _is_discord_user_key(line_user_id) else "目前沒有符合條件的近期事件。"
     text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
     messages = [item for item in [_build_cache_status_flex(cache_status, "近期事件快取")] if item] + (messages or [])
     _store_last_event_index(line_user_id, ordered_groups)
@@ -2712,7 +3192,7 @@ def _timeline(tokens, line_user_id, logger):
 
     rows = get_timeline_events(user_id, limit=20)
     if not rows:
-        return "目前沒有可用時間軸事件，請先 `e3 login` 或 `e3 relogin`。"
+        return _discord_empty_state(f"目前還沒有可用的時間軸資料，先試試 {_discord_command_hint('e3 login', line_user_id)} 或 {_discord_command_hint('e3 relogin', line_user_id)}。", line_user_id, emoji="🗓️") if _is_discord_user_key(line_user_id) else "目前沒有可用時間軸事件，請先 `e3 login` 或 `e3 relogin`。"
     try:
         courses = (snapshot or {}).get("courses") or fetch_courses(make_user_key(line_user_id))
     except Exception:
@@ -2720,12 +3200,12 @@ def _timeline(tokens, line_user_id, logger):
     rows = _filter_active_homework_rows(rows, courses)
     text, messages, ordered_groups = _build_timeline_messages(
         rows,
-        "🗓️ E3 時間軸（前 20 筆）：",
+        "🗓️ **學業時間軸**" if _is_discord_user_key(line_user_id) else "🗓️ E3 時間軸（前 20 筆）：",
         event_type=event_type,
         line_user_id=line_user_id,
     )
     if not text:
-        return "目前沒有符合條件的時間軸事件。"
+        return _discord_empty_state("目前沒有符合條件的時間軸事件。", line_user_id, emoji="📅") if _is_discord_user_key(line_user_id) else "目前沒有符合條件的時間軸事件。"
     text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
     messages = [item for item in [_build_cache_status_flex(cache_status, "時間軸快取")] if item] + (messages or [])
     _store_last_event_index(line_user_id, ordered_groups)
