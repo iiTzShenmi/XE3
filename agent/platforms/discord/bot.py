@@ -21,6 +21,22 @@ from agent.features.e3.db import get_discord_delivery_target, get_user_id, init_
 from agent.features.e3.reminders import build_test_reminder_payloads, start_reminder_worker
 from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
 from agent.features.weather import handle_city_weather
+from agent.platforms.discord.rendering import (
+    all_file_entries,
+    bubble_description,
+    bubble_header_lines,
+    bubble_title,
+    build_file_selector_summary,
+    build_grouped_selector_summary,
+    build_timeline_selector_summary,
+    display_index_emoji,
+    embed_option_description,
+    hex_to_color,
+    is_file_entry,
+    repeated_message_label,
+    select_option_label,
+    select_summary_title,
+)
 from agent.system_status import build_system_report
 
 
@@ -138,92 +154,6 @@ def _chunk_text(text: str, limit: int = 1900) -> list[str]:
     return chunks
 
 
-def _flatten_bubble_text(node: Any) -> list[str]:
-    lines: list[str] = []
-    if isinstance(node, dict):
-        if node.get("type") == "text":
-            text = str(node.get("text") or "").strip()
-            if text:
-                lines.append(text)
-        for key in ("contents", "header", "body", "footer", "hero"):
-            if key in node:
-                lines.extend(_flatten_bubble_text(node[key]))
-    elif isinstance(node, list):
-        for item in node:
-            lines.extend(_flatten_bubble_text(item))
-    return lines
-
-
-def _flatten_bubble_description(node: Any) -> list[str]:
-    lines: list[str] = []
-    if isinstance(node, dict):
-        node_type = str(node.get("type") or "")
-        if node_type == "text":
-            text = str(node.get("text") or "").strip()
-            if text:
-                lines.append(text)
-        elif node_type == "separator":
-            lines.append("")
-        for key in ("contents", "header", "body", "footer", "hero"):
-            if key in node:
-                lines.extend(_flatten_bubble_description(node[key]))
-    elif isinstance(node, list):
-        for item in node:
-            lines.extend(_flatten_bubble_description(item))
-    return lines
-
-
-def _bubble_title(bubble: dict[str, Any]) -> str:
-    header = bubble.get("header") or {}
-    texts = [line for line in _flatten_bubble_text(header) if line]
-    if texts:
-        if len(texts) >= 2:
-            return texts[1]
-        return texts[0]
-    body_texts = [line for line in _flatten_bubble_text(bubble.get("body") or {}) if line]
-    return body_texts[0] if body_texts else "XE3"
-
-
-def _bubble_header_lines(bubble: dict[str, Any]) -> list[str]:
-    header = bubble.get("header") or {}
-    return [line for line in _flatten_bubble_text(header) if line]
-
-
-def _bubble_description(bubble: dict[str, Any]) -> str:
-    parts: list[str] = []
-    body = bubble.get("body") or {}
-    footer = bubble.get("footer") or {}
-    parts.extend(_flatten_bubble_description(body))
-    footer_lines = _flatten_bubble_description(footer)
-    if footer_lines:
-        parts.append("")
-        parts.extend(footer_lines)
-    cleaned: list[str] = []
-    previous_blank = False
-    for line in parts:
-        if line is None:
-            continue
-        if line == "":
-            if not previous_blank:
-                cleaned.append("")
-            previous_blank = True
-            continue
-        cleaned.append(line)
-        previous_blank = False
-    text = "\n".join(cleaned).strip()
-    return text[:4000] if text else "沒有更多內容。"
-
-
-def _hex_to_color(value: str | None) -> discord.Color | None:
-    raw = str(value or "").strip().lstrip("#")
-    if len(raw) != 6:
-        return None
-    try:
-        return discord.Color(int(raw, 16))
-    except ValueError:
-        return None
-
-
 async def _send_text_chunks(target, text: str, *, ephemeral: bool = False) -> None:
     chunks = _chunk_text(text)
     for idx, chunk in enumerate(chunks):
@@ -264,20 +194,6 @@ _SCHEDULE_PRESETS: list[tuple[str, str, list[str]]] = [
     ("僅 21:00", "只接收晚間整理", ["21:00"]),
 ]
 
-_EMOJI_INDEX = {
-    1: "1️⃣",
-    2: "2️⃣",
-    3: "3️⃣",
-    4: "4️⃣",
-    5: "5️⃣",
-    6: "6️⃣",
-    7: "7️⃣",
-    8: "8️⃣",
-    9: "9️⃣",
-    10: "🔟",
-}
-
-
 def _schedule_command_for_slots(slots: list[str]) -> str:
     normalized = list(slots)
     if normalized == ["09:00"]:
@@ -285,10 +201,6 @@ def _schedule_command_for_slots(slots: list[str]) -> str:
     if normalized == ["21:00"]:
         return "e3 remind schedule evening"
     return "e3 remind schedule both"
-
-
-def _display_index_emoji(idx: int) -> str:
-    return _EMOJI_INDEX.get(idx, f"{idx}.")
 
 
 class ReminderToggleButton(discord.ui.Button):
@@ -438,249 +350,6 @@ def _primary_action(actions: list[dict[str, str]]) -> dict[str, str] | None:
     return None
 
 
-def _embed_option_description(embed: discord.Embed, action: dict[str, str] | None = None) -> str:
-    action_value = str((action or {}).get("value") or "").strip()
-    desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
-    if action_value.startswith("e3 詳情"):
-        course = desc_lines[0] if len(desc_lines) >= 1 else ""
-        due = str(embed.title or "").strip()
-        type_hint = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
-        parts = [part for part in (course, due, type_hint) if part]
-        if parts:
-            return "｜".join(parts)[:100]
-    footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
-    if footer_text:
-        if footer_text == "作業附件":
-            return "老師附件"
-        if footer_text == "已繳檔案":
-            return "你的提交"
-        return footer_text[:100]
-    text = str(embed.description or "").replace("\n", " ").strip()
-    return text[:100] if text else "點選後查看詳細內容"
-
-
-def _select_option_label(embed: discord.Embed, action: dict[str, str]) -> str:
-    action_value = str(action.get("value") or "").strip()
-    desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
-    if action_value.startswith("e3 詳情"):
-        if len(desc_lines) >= 2:
-            return desc_lines[1][:100]
-        if desc_lines:
-            return desc_lines[0][:100]
-    if action.get("kind") == "uri":
-        footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
-        prefix = ""
-        if footer_text == "作業附件":
-            prefix = "📎 老師附件｜"
-        elif footer_text == "已繳檔案":
-            prefix = "📤 你的提交｜"
-        if desc_lines:
-            return f"{prefix}{desc_lines[0][:97]}".strip()[:100]
-    return str(embed.title or action.get("label") or "項目")[:100]
-
-
-def _is_file_entry(entry: tuple[str, str, dict[str, str]]) -> bool:
-    return bool(entry and (entry[2] or {}).get("kind") == "uri")
-
-
-def _repeated_message_label(entries: list[tuple[str, str, dict[str, str]]]) -> str | None:
-    if not entries:
-        return None
-    actions = [entry[2] or {} for entry in entries]
-    if not all(str(action.get("kind") or "") == "message" for action in actions):
-        return None
-    labels = {str(action.get("label") or "").strip() for action in actions}
-    labels.discard("")
-    if len(labels) == 1:
-        return next(iter(labels))
-    return None
-
-
-def _all_file_entries(entries: list[tuple[str, str, dict[str, str]]]) -> bool:
-    return bool(entries) and all(_is_file_entry(entry) for entry in entries)
-
-
-def _select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
-    if entries and all(_is_file_entry(entry) for entry in entries):
-        return "選擇檔案"
-    repeated_label = _repeated_message_label(entries)
-    if repeated_label and "詳情" in repeated_label:
-        return "選擇作業詳情"
-    if repeated_label == "查看檔案":
-        return "選擇教材"
-    if repeated_label:
-        return f"選擇要{repeated_label}的項目"
-    return "選擇項目"
-
-
-def _parse_timeline_selector_candidate(embed: discord.Embed, action: dict[str, str]) -> dict[str, str] | None:
-    action_value = str(action.get("value") or "").strip()
-    if not action_value.startswith("e3 詳情"):
-        return None
-    desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
-    if len(desc_lines) < 3:
-        return None
-    type_hint = desc_lines[2]
-    if "作業" in type_hint:
-        event_type = "homework"
-    elif "考試" in type_hint:
-        event_type = "exam"
-    elif "行事曆" in type_hint:
-        event_type = "calendar"
-    else:
-        return None
-    due_text = str(embed.title or "").strip()
-    due_full = due_text
-    due_relative = ""
-    if "·" in due_text:
-        parts = [part.strip() for part in due_text.split("·", 1)]
-        if len(parts) == 2:
-            due_full, due_relative = parts
-    return {
-        "event_type": event_type,
-        "course": desc_lines[0],
-        "title": desc_lines[1],
-        "due_full": due_full,
-        "due_relative": due_relative,
-        "type_hint": type_hint,
-    }
-
-
-def _build_timeline_selector_summary(
-    candidates: list[tuple[discord.Embed, list[dict[str, str]]]],
-    entries: list[tuple[str, str, dict[str, str]]],
-) -> discord.Embed | None:
-    parsed_rows: list[tuple[int, dict[str, str]]] = []
-    for idx, ((embed, actions), entry) in enumerate(zip(candidates, entries), start=1):
-        action = _primary_action(actions)
-        if not action:
-            return None
-        parsed = _parse_timeline_selector_candidate(embed, action)
-        if not parsed:
-            return None
-        parsed_rows.append((idx, parsed))
-
-    if not parsed_rows:
-        return None
-
-    sections: dict[str, list[str]] = {"homework": [], "exam": [], "calendar": []}
-    for idx, parsed in parsed_rows:
-        if parsed["event_type"] == "homework":
-            prefix = "📝 作業"
-        elif parsed["event_type"] == "exam":
-            prefix = "⚠️ 考試"
-        else:
-            prefix = "🗓️ 行事曆"
-        relative = f" **{parsed['due_relative']}**" if parsed["due_relative"] else ""
-        sections[parsed["event_type"]].append(
-            "\n".join(
-                [
-                    f"{_display_index_emoji(idx)} **{parsed['title']}**",
-                    f"{prefix}｜{parsed['course']}{relative}",
-                    f"🗓️ **{parsed['due_full']}**",
-                ]
-            )
-        )
-
-    summary = discord.Embed(
-        title="選擇作業詳情",
-        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
-        color=discord.Color.blurple(),
-    )
-    summary.add_field(
-        name="🟠 作業",
-        value="\n\n".join(sections["homework"]) if sections["homework"] else "🎉 目前沒有未完成作業",
-        inline=False,
-    )
-    summary.add_field(
-        name="🔴 考試",
-        value="\n\n".join(sections["exam"]) if sections["exam"] else "🎉 目前沒有近期考試",
-        inline=False,
-    )
-    if sections["calendar"]:
-        summary.add_field(
-            name="🟢 行事曆",
-            value="\n\n".join(sections["calendar"]),
-            inline=False,
-        )
-    return summary
-
-
-def _build_file_selector_summary(
-    candidates: list[tuple[discord.Embed, list[dict[str, str]]]],
-    entries: list[tuple[str, str, dict[str, str]]],
-) -> discord.Embed | None:
-    if not entries or not all(_is_file_entry(entry) for entry in entries):
-        return None
-
-    teacher_lines: list[str] = []
-    submitted_lines: list[str] = []
-    other_lines: list[str] = []
-
-    for embed, _actions in candidates[:MAX_SELECT_OPTIONS]:
-        desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
-        filename = desc_lines[0] if desc_lines else str(embed.title or "未命名檔案").strip()
-        footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
-        line = f"▶️ {filename}"
-        if footer_text == "作業附件":
-            teacher_lines.append(line)
-        elif footer_text == "已繳檔案":
-            submitted_lines.append(line)
-        else:
-            other_lines.append(line)
-
-    summary = discord.Embed(
-        title="選擇檔案",
-        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
-        color=discord.Color.blurple(),
-    )
-    if teacher_lines:
-        summary.add_field(name="📎 老師附件", value="\n".join(teacher_lines), inline=False)
-    if submitted_lines:
-        summary.add_field(name="📤 你的提交", value="\n".join(submitted_lines), inline=False)
-    if other_lines:
-        summary.add_field(name="📁 其他檔案", value="\n".join(other_lines), inline=False)
-    return summary if summary.fields else None
-
-
-def _build_grouped_selector_summary(
-    entries: list[tuple[str, str, dict[str, str]]],
-) -> discord.Embed | None:
-    if not entries:
-        return None
-    if any(_is_file_entry(entry) for entry in entries):
-        return None
-
-    repeated_label = _repeated_message_label(entries)
-    if repeated_label == "查看檔案":
-        section_name = "📎 教材"
-        title = "選擇教材"
-    elif repeated_label and "詳情" in repeated_label:
-        section_name = "📘 項目"
-        title = "選擇詳情"
-    elif repeated_label and "課程" in repeated_label:
-        section_name = "📚 課程"
-        title = "選擇課程"
-    else:
-        section_name = "📚 項目"
-        title = _select_summary_title(entries)
-
-    lines: list[str] = []
-    for label, desc, _action in entries[:MAX_SELECT_OPTIONS]:
-        clean_label = str(label or "").strip()
-        clean_desc = str(desc or "").strip()
-        if clean_desc:
-            lines.append(f"▶️ {clean_label}\n　{clean_desc}")
-        else:
-            lines.append(f"▶️ {clean_label}")
-
-    summary = discord.Embed(
-        title=title,
-        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
-        color=discord.Color.blurple(),
-    )
-    summary.add_field(name=section_name, value="\n\n".join(lines), inline=False)
-    return summary
 
 
 def _extract_proxy_token(url: str) -> str | None:
@@ -848,11 +517,11 @@ def _extract_embeds_and_views(bot: commands.Bot, payload: Any, user_id: int) -> 
             bubbles = [item for item in (contents.get("contents") or []) if isinstance(item, dict)]
         for bubble in bubbles:
             embed = discord.Embed(
-                title=_bubble_title(bubble),
-                description=_bubble_description(bubble),
-                color=_hex_to_color(((bubble.get("header") or {}).get("backgroundColor"))) or discord.Color.blurple(),
+                title=bubble_title(bubble),
+                description=bubble_description(bubble),
+                color=hex_to_color(((bubble.get("header") or {}).get("backgroundColor"))) or discord.Color.blurple(),
             )
-            header_lines = _bubble_header_lines(bubble)
+            header_lines = bubble_header_lines(bubble)
             if header_lines:
                 header_hint = header_lines[0].strip()
                 if header_hint and header_hint != str(embed.title or "").strip():
@@ -899,10 +568,10 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
             if not action:
                 selector_entries = []
                 break
-            selector_entries.append((_select_option_label(embed, action), _embed_option_description(embed, action), action))
+            selector_entries.append((select_option_label(embed, action), embed_option_description(embed, action), action))
 
-    repeated_label_cards = bool(selector_entries and _repeated_message_label(selector_entries))
-    file_selector_cards = bool(selector_entries and _all_file_entries(selector_entries) and len(selector_entries) > 1)
+    repeated_label_cards = bool(selector_entries and repeated_message_label(selector_entries))
+    file_selector_cards = bool(selector_entries and all_file_entries(selector_entries) and len(selector_entries) > 1)
     should_use_selector = (
         selector_entries
         and len(selector_entries) <= MAX_SELECT_OPTIONS
@@ -915,20 +584,20 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
 
     content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
     if should_use_selector:
-        summary = _build_file_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], selector_entries[:MAX_SELECT_OPTIONS])
+        summary = build_file_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], selector_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = _build_timeline_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], selector_entries[:MAX_SELECT_OPTIONS])
+            summary = build_timeline_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], selector_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = _build_grouped_selector_summary(selector_entries[:MAX_SELECT_OPTIONS])
+            summary = build_grouped_selector_summary(selector_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
             summary = discord.Embed(
-                title=_select_summary_title(selector_entries),
+                title=select_summary_title(selector_entries),
                 description='請從下方下拉選單挑一個，我會直接幫你打開，不洗版。',
                 color=discord.Color.blurple(),
             )
             for idx, (label, desc, action) in enumerate(selector_entries[:MAX_SELECT_OPTIONS], start=1):
-                value = (desc[:1024] or "點選後開啟檔案") if _is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
-                summary.add_field(name=f'{_display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
+                value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
+                summary.add_field(name=f'{display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
         await message.edit(content=content, embeds=[summary], view=CommandSelectView(bot, user_id, selector_entries))
         return True
 
@@ -981,24 +650,24 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
             action = _primary_action(actions)
             if not action:
                 continue
-            entries.append((_select_option_label(embed, action), _embed_option_description(embed, action), action))
+            entries.append((select_option_label(embed, action), embed_option_description(embed, action), action))
         if not entries:
             return
-        summary = _build_file_selector_summary(chunk[:MAX_SELECT_OPTIONS], entries[:MAX_SELECT_OPTIONS])
+        summary = build_file_selector_summary(chunk[:MAX_SELECT_OPTIONS], entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = _build_timeline_selector_summary(chunk[:MAX_SELECT_OPTIONS], entries[:MAX_SELECT_OPTIONS])
+            summary = build_timeline_selector_summary(chunk[:MAX_SELECT_OPTIONS], entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = _build_grouped_selector_summary(entries[:MAX_SELECT_OPTIONS])
+            summary = build_grouped_selector_summary(entries[:MAX_SELECT_OPTIONS])
         if summary is None:
             summary = discord.Embed(
-                title=_select_summary_title(entries),
+                title=select_summary_title(entries),
                 description='請從下方下拉選單挑一個，我會直接幫你打開，不洗版。',
                 color=discord.Color.blurple(),
             )
             preview_entries = entries[:25]
             for idx, (label, desc, action) in enumerate(preview_entries, start=1):
-                value = (desc[:1024] or "點選後開啟檔案") if _is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
-                summary.add_field(name=f'{_display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
+                value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
+                summary.add_field(name=f'{display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
         await _send_with(target, embeds=[summary], view=CommandSelectView(bot, user_id, entries))
         sent_any = True
 
@@ -1022,9 +691,9 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
             if not action:
                 selector_entries = []
                 break
-            selector_entries.append((_select_option_label(embed, action), _embed_option_description(embed, action), action))
-        repeated_label_cards = bool(selector_entries and _repeated_message_label(selector_entries))
-        file_selector_cards = bool(selector_entries and _all_file_entries(selector_entries) and len(selector_entries) > 1)
+            selector_entries.append((select_option_label(embed, action), embed_option_description(embed, action), action))
+        repeated_label_cards = bool(selector_entries and repeated_message_label(selector_entries))
+        file_selector_cards = bool(selector_entries and all_file_entries(selector_entries) and len(selector_entries) > 1)
 
     if selector_candidates and (
         file_selector_cards
