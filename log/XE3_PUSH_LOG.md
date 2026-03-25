@@ -21,6 +21,7 @@
 | 2026-03-25 | `eb5f707` | 整理 E3 event / reminder / response formatting |
 | 2026-03-25 | `f2a1470` | 細修 Discord interaction 與檔案短連結 |
 | 2026-03-25 | `d691dd9` | 統一 Discord 回應方式、重整課程摘要與提醒 embed |
+| 2026-03-25 | `dda738d` | 細修 Discord selector summary 與課程摘要可讀性 |
 
 ## Milestones
 
@@ -63,6 +64,12 @@
 - 提醒與成績更新通知改成 Discord embed 風格
 - scheduled reminder 在「沒有事件」時也會送簡潔版提醒
 - 一般 `/e3 ...` slash command 改成公開回應，互動元件優先原地更新訊息
+
+### 8. Selector Summary 與摘要版 UI 再整理
+- timeline selector 改成分區顯示：作業 / 考試 / 行事曆
+- homework 檔案 selector 改成分區顯示：老師附件 / 你的提交
+- 其他常用 selector 也改成同一種 grouped summary 風格
+- 課程摘要加上更乾淨的段落、空行與完成狀態標記
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
