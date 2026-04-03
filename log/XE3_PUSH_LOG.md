@@ -29,7 +29,7 @@
 | 2026-04-03 | `27f931e` | 拆分 Discord delivery / sender 與 E3 timeline/file 顯示模組 |
 | 2026-04-03 | `3f503e1` | 修正 Discord `/e3 files` autocomplete key 對齊，補一輪 smoke test |
 | 2026-04-03 | `0d119ba` | 改善 Discord selector 版型、成績選課流程與考試去重 |
-| 2026-04-03 | `TBD` | 新增 `/e3 today`、`/e3 week` 與 Phase 1 embed / 週視圖版型 |
+| 2026-04-03 | `da8286d` | 新增 `/e3 today`、`/e3 week` 與 Phase 1 embed / 週視圖版型 |
 
 ## Milestones
 
