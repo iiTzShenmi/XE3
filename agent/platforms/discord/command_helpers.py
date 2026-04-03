@@ -5,11 +5,11 @@ from typing import Callable
 
 from discord import app_commands
 
-from agent.features.e3.client import fetch_courses
+from agent.features.e3.client import fetch_courses, make_user_key
 
 
 def cached_course_choices(discord_user_id: int, user_key_builder: Callable[[int], str], logger: logging.Logger) -> list[tuple[str, str]]:
-    user_key = user_key_builder(discord_user_id)
+    user_key = make_user_key(user_key_builder(discord_user_id))
     try:
         courses = fetch_courses(user_key)
     except Exception:
