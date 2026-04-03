@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import fcntl
+import threading
+import time
+from datetime import timedelta, timezone
+from typing import Any, Callable, Optional
+
+from agent.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
+
+from .client import login_and_sync, make_user_key
+from .db import (
+    get_e3_account_by_user_id,
+    get_events_due_between,
+    get_grade_items,
+    list_reminder_targets,
+    list_sync_targets,
+    log_notification,
+    mark_missing_events_inactive,
+    notification_sent,
+    update_login_state,
+    upsert_event,
+    upsert_grade_item,
+)
+from .events import extract_events_from_fetch_all
+from .reminder_payloads import (
+    COUNTDOWN_HOURS,
+    DEFAULT_LOOKAHEAD_HOURS,
+    build_digest_payload,
+    build_empty_digest_payload,
+    extract_grade_items,
+    format_countdown_payload,
+    format_grade_payload,
+    load_schedule,
+    taipei_now,
+)
+from .secrets import decrypt_secret
+
+_STARTED = False
+_LOCK = threading.Lock()
+_WORKER_LOCK_HANDLE: Optional[Any] = None
+
+
+def sync_grade_items(user_id: int, courses: dict[str, Any]) -> list[dict[str, Any]]:
+    existing = {(row["course_id"], row["item_name"]): row["score"] for row in get_grade_items(user_id)}
+    changes = []
+    for item in extract_grade_items(courses):
+        key = (item["course_id"], item["item_name"])
+        old_score = existing.get(key)
+        if old_score != item["score"]:
+            change = dict(item)
+            change["old_score"] = old_score
+            changes.append(change)
+        upsert_grade_item(user_id, item["course_id"], item["course_name"], item["item_name"], item["score"])
+    return changes
+
+
+def sync_user_snapshot(row: Any, logger) -> tuple[list[dict[str, Any]], bool]:
+    account_row = get_e3_account_by_user_id(row["user_id"])
+    if not account_row or not account_row["encrypted_password"]:
+        return [], False
+
+    try:
+        password = decrypt_secret(account_row["encrypted_password"])
+        result = login_and_sync(
+            account_row["e3_account"],
+            password,
+            make_user_key(row["line_user_id"]),
+            update_data=True,
+            update_links=False,
+        )
+        courses = result["courses"]
+        calendar_events = result.get("calendar_events") or []
+        events = extract_events_from_fetch_all(courses, calendar_events=calendar_events)
+        active_event_uids = []
+        for event in events:
+            active_event_uids.append(event["event_uid"])
+            upsert_event(
+                user_id=row["user_id"],
+                event_uid=event["event_uid"],
+                event_type=event["event_type"],
+                course_id=event.get("course_id"),
+                course_name=event.get("course_name"),
+                title=event["title"],
+                due_at=event["due_at"],
+                payload_json=event["payload_json"],
+            )
+        mark_missing_events_inactive(row["user_id"], active_event_uids)
+        grade_changes = sync_grade_items(row["user_id"], courses)
+        update_login_state(row["user_id"], "ok", None)
+        return grade_changes, True
+    except Exception as exc:
+        logger.exception("e3_periodic_sync_failed user=%s", row["line_user_id"])
+        update_login_state(row["user_id"], "error", str(exc))
+        return [], False
+
+
+def maybe_periodic_sync(row: Any, now, push_fn, logger) -> None:
+    interval_minutes = e3_sync_interval_minutes()
+    if interval_minutes <= 0 or now.minute % interval_minutes != 0:
+        return
+
+    dedupe_key = now.strftime("%Y-%m-%d %H:%M")
+    if notification_sent(row["user_id"], "periodic_sync", dedupe_key):
+        return
+
+    grade_changes, ok = sync_user_snapshot(row, logger)
+    log_notification(row["user_id"], "periodic_sync", "sent" if ok else "failed", details=dedupe_key)
+    if not ok:
+        return
+
+    for change in grade_changes:
+        change_key = f"{change['course_id']}|{change['item_name']}|{change['score']}"
+        if notification_sent(row["user_id"], "grade_posted", change_key):
+            continue
+        push_ok = push_fn(row["line_user_id"], format_grade_payload(change))
+        log_notification(row["user_id"], "grade_posted", "sent" if push_ok else "failed", details=change_key)
+
+
+def process_periodic_syncs(now, push_fn, logger, target_predicate=None) -> None:
+    for row in list_sync_targets():
+        if target_predicate and not target_predicate(str(row["line_user_id"])):
+            continue
+        if row["login_status"] != "ok":
+            continue
+        maybe_periodic_sync(row, now, push_fn, logger)
+
+
+def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
+    now = taipei_now()
+    current_slot = now.strftime("%H:%M")
+    start_iso = now.astimezone(timezone.utc).isoformat()
+    end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
+    interval_seconds = e3_reminder_poll_seconds()
+    tolerance = max(interval_seconds * 2, 300)
+
+    process_periodic_syncs(now, push_fn, logger, target_predicate=target_predicate)
+
+    for row in list_reminder_targets():
+        if target_predicate and not target_predicate(str(row["line_user_id"])):
+            continue
+        if row["login_status"] != "ok":
+            continue
+
+        for hours_left in COUNTDOWN_HOURS:
+            window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)
+            window_end = (now + timedelta(hours=hours_left, seconds=tolerance)).astimezone(timezone.utc)
+            countdown_rows = get_events_due_between(
+                row["user_id"],
+                window_start.isoformat(),
+                window_end.isoformat(),
+                limit=10,
+            )
+            for event_row in countdown_rows:
+                countdown_key = f"{event_row['event_uid']}|{hours_left}h"
+                if notification_sent(row["user_id"], "countdown_alert", countdown_key):
+                    continue
+                ok = push_fn(row["line_user_id"], format_countdown_payload(event_row, hours_left, row["line_user_id"]))
+                log_notification(
+                    row["user_id"],
+                    "countdown_alert",
+                    "sent" if ok else "failed",
+                    details=countdown_key,
+                    event_uid=event_row["event_uid"],
+                )
+
+        schedule = load_schedule(row)
+        if current_slot not in schedule:
+            continue
+
+        dedupe_key = f"{now.date().isoformat()} {current_slot}"
+        if notification_sent(row["user_id"], "scheduled_digest", dedupe_key):
+            continue
+
+        events = get_events_due_between(row["user_id"], start_iso, end_iso, limit=8)
+        if not events:
+            payload = build_empty_digest_payload(current_slot, row["line_user_id"])
+            ok = push_fn(row["line_user_id"], payload)
+            log_notification(
+                row["user_id"],
+                "scheduled_digest",
+                "sent" if ok else "failed",
+                details=f"{dedupe_key}|empty",
+            )
+            if not ok:
+                logger.error("e3_reminder_push_failed user=%s slot=%s empty_digest=1", row["line_user_id"], current_slot)
+            continue
+
+        payload = build_digest_payload(events, current_slot, row["line_user_id"])
+        ok = push_fn(row["line_user_id"], payload)
+        log_notification(
+            row["user_id"],
+            "scheduled_digest",
+            "sent" if ok else "failed",
+            details=dedupe_key,
+        )
+        if not ok:
+            logger.error("e3_reminder_push_failed user=%s slot=%s", row["line_user_id"], current_slot)
+
+
+def worker_loop(push_fn: Callable[[str, Any], bool], logger, interval_seconds: int, target_predicate=None) -> None:
+    while True:
+        try:
+            process_due_reminders(push_fn, logger, target_predicate=target_predicate)
+        except Exception:
+            logger.exception("e3_reminder_loop_failed")
+        time.sleep(interval_seconds)
+
+
+def acquire_worker_lock() -> bool:
+    global _WORKER_LOCK_HANDLE
+    lock_path = reminder_worker_lock_file()
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return False
+    _WORKER_LOCK_HANDLE = handle
+    return True
+
+
+def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger, target_predicate=None) -> bool:
+    global _STARTED
+    with _LOCK:
+        if _STARTED:
+            return False
+        if not acquire_worker_lock():
+            logger.info("e3_reminder_worker_skipped reason=lock_held")
+            return False
+        _STARTED = True
+
+    interval_seconds = e3_reminder_poll_seconds()
+    worker = threading.Thread(
+        target=worker_loop,
+        args=(push_fn, logger, interval_seconds, target_predicate),
+        daemon=True,
+        name="e3-reminder-worker",
+    )
+    worker.start()
+    return True
+
+
+def build_test_reminder_payloads(user_id: int) -> list[str]:
+    now = taipei_now()
+    start_iso = now.astimezone(timezone.utc).isoformat()
+    end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
+    events = get_events_due_between(user_id, start_iso, end_iso, limit=5)
+    if not events:
+        user_key = "discord:test"
+        return [
+            build_empty_digest_payload("09:00", user_key=user_key),
+            build_empty_digest_payload("21:00", user_key=user_key),
+        ]
+    user_key = "discord:test"
+    return [
+        build_digest_payload(events, "09:00", user_key=user_key) or "",
+        build_digest_payload(events, "21:00", user_key=user_key) or "",
+    ]
