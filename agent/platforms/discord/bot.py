@@ -21,17 +21,19 @@ from agent.features.e3.db import get_discord_delivery_target, get_user_id, init_
 from agent.features.e3.reminders import build_test_reminder_payloads, start_reminder_worker
 from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
 from agent.features.weather import handle_city_weather
+from agent.platforms.discord.message_utils import (
+    extract_embed_items,
+    response_text as _response_text,
+    send_text_chunks as _send_text_chunks,
+    special_text_embed as _special_text_embed,
+)
 from agent.platforms.discord.rendering import (
     all_file_entries,
-    bubble_description,
-    bubble_header_lines,
-    bubble_title,
     build_file_selector_summary,
     build_grouped_selector_summary,
     build_timeline_selector_summary,
     display_index_emoji,
     embed_option_description,
-    hex_to_color,
     is_file_entry,
     repeated_message_label,
     select_option_label,
@@ -86,84 +88,6 @@ def _reminder_channel_payload(payload: Any, discord_user_id: int) -> Any:
             wrapped["messages"] = [{"type": "text", "text": mention}] + list(messages)
             return wrapped
     return f"{mention}\n{payload}"
-
-
-def _response_text(payload: Any) -> str:
-    if isinstance(payload, dict):
-        text = str(payload.get("text") or "").strip()
-        if text:
-            return text
-        messages = payload.get("messages") or []
-        parts = []
-        for item in messages:
-            if isinstance(item, dict) and item.get("type") == "text":
-                chunk = str(item.get("text") or "").strip()
-                if chunk:
-                    parts.append(chunk)
-        if parts:
-            return "\n\n".join(parts)
-        return str(payload)
-    return str(payload)
-
-
-def _special_text_embed(text: str) -> discord.Embed | None:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    normalized = raw.replace("**", "").strip()
-    if normalized.startswith("⏰ E3 提醒") or normalized.startswith("⏰ E3 倒數提醒") or normalized.startswith("⏰ 提醒測試"):
-        lines = [line.rstrip() for line in raw.splitlines()]
-        title = (lines[0].replace("**", "").strip() if lines else "⏰ XE3 提醒")
-        body = "\n".join(line for line in lines[1:] if line is not None).strip()
-        embed = discord.Embed(
-            title=title,
-            description=body or "目前沒有提醒內容。",
-            color=discord.Color.orange(),
-        )
-        return embed
-    if normalized.startswith("📊 成績更新"):
-        lines = [line.rstrip() for line in raw.splitlines()]
-        title = (lines[0].replace("**", "").strip() if lines else "📊 成績更新")
-        body = "\n".join(line.replace("**", "") for line in lines[1:] if line is not None).strip()
-        embed = discord.Embed(
-            title=title,
-            description=body or "有新的成績內容。",
-            color=discord.Color.green(),
-        )
-        return embed
-    return None
-
-
-def _chunk_text(text: str, limit: int = 1900) -> list[str]:
-    raw = str(text or "").strip()
-    if not raw:
-        return ["（空白回覆）"]
-    if len(raw) <= limit:
-        return [raw]
-
-    chunks = []
-    remaining = raw
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit)
-        if split_at <= 0:
-            split_at = limit
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-async def _send_text_chunks(target, text: str, *, ephemeral: bool = False) -> None:
-    chunks = _chunk_text(text)
-    for idx, chunk in enumerate(chunks):
-        if isinstance(target, discord.Interaction):
-            if not target.response.is_done() and idx == 0:
-                await target.response.send_message(chunk, ephemeral=ephemeral)
-            else:
-                await target.followup.send(chunk, ephemeral=ephemeral)
-        else:
-            await target.send(chunk)
 
 
 def _is_reminder_actions(actions: list[dict[str, str]]) -> bool:
@@ -464,78 +388,11 @@ class E3LoginModal(discord.ui.Modal, title="E3 登入"):
         await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot)
 
 
-def _bubble_actions(bubble: dict[str, Any]) -> list[dict[str, str]]:
-    actions: list[dict[str, str]] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            if node.get("type") == "button":
-                action = node.get("action") or {}
-                action_type = action.get("type")
-                if action_type == "message":
-                    actions.append({"kind": "message", "label": str(action.get("label") or "開啟"), "value": str(action.get("text") or "")})
-                elif action_type == "uri":
-                    actions.append({"kind": "uri", "label": str(action.get("label") or "開啟"), "value": str(action.get("uri") or "")})
-            for value in node.values():
-                walk(value)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(bubble)
-    return actions
-
-
 def _extract_embeds_and_views(bot: commands.Bot, payload: Any, user_id: int) -> list[tuple[discord.Embed | None, list[dict[str, str]], str | None]]:
-    if not isinstance(payload, dict):
-        text = _response_text(payload)
-        special = _special_text_embed(text)
-        if special is not None:
-            return [(special, [], None)]
-        return [(None, [], text)]
-
-    messages = payload.get("messages") or []
+    del bot, user_id
     items: list[tuple[discord.Embed | None, list[dict[str, str]], str | None]] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if message.get("type") == "text":
-            text = str(message.get("text") or "")
-            special = _special_text_embed(text)
-            if special is not None:
-                items.append((special, [], None))
-            else:
-                items.append((None, [], text))
-            continue
-        if message.get("type") != "flex":
-            continue
-        contents = message.get("contents") or {}
-        bubbles = []
-        if contents.get("type") == "bubble":
-            bubbles = [contents]
-        elif contents.get("type") == "carousel":
-            bubbles = [item for item in (contents.get("contents") or []) if isinstance(item, dict)]
-        for bubble in bubbles:
-            embed = discord.Embed(
-                title=bubble_title(bubble),
-                description=bubble_description(bubble),
-                color=hex_to_color(((bubble.get("header") or {}).get("backgroundColor"))) or discord.Color.blurple(),
-            )
-            header_lines = bubble_header_lines(bubble)
-            if header_lines:
-                header_hint = header_lines[0].strip()
-                if header_hint and header_hint != str(embed.title or "").strip():
-                    embed.set_footer(text=header_hint[:2048])
-            actions = _bubble_actions(bubble)
-            items.append((embed, actions, None))
-
-    if not items:
-        text = _response_text(payload)
-        special = _special_text_embed(text)
-        if special is not None:
-            items.append((special, [], None))
-        else:
-            items.append((None, [], text))
+    for item in extract_embed_items(payload):
+        items.append((item.get("embed"), list(item.get("actions") or []), item.get("text")))
     return items
 
 

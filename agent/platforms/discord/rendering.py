@@ -3,6 +3,8 @@ from typing import Any
 
 import discord
 
+from agent.features.e3.payloads import META_KEY
+
 
 _EMOJI_INDEX = {
     1: "1️⃣",
@@ -108,7 +110,28 @@ def hex_to_color(value: str | None) -> discord.Color | None:
         return None
 
 
+def action_meta(action: dict[str, Any] | None) -> dict[str, Any]:
+    raw = (action or {}).get(META_KEY)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
 def embed_option_description(embed: discord.Embed, action: dict[str, str] | None = None) -> str:
+    meta = action_meta(action)
+    option_description = str(meta.get("option_description") or "").strip()
+    if option_description:
+        return option_description[:100]
+    if str(meta.get("entry_kind") or "").strip() == "timeline_event":
+        parts = [
+            str(meta.get("course_name") or "").strip(),
+            str(meta.get("due_label") or "").strip(),
+            str(meta.get("event_type_label") or "").strip(),
+        ]
+        parts = [part for part in parts if part]
+        if parts:
+            return "｜".join(parts)[:100]
+    file_role_label = str(meta.get("file_role_label") or "").strip()
+    if file_role_label:
+        return file_role_label[:100]
     action_value = str((action or {}).get("value") or "").strip()
     desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
     if action_value.startswith("e3 詳情"):
@@ -130,6 +153,10 @@ def embed_option_description(embed: discord.Embed, action: dict[str, str] | None
 
 
 def select_option_label(embed: discord.Embed, action: dict[str, str]) -> str:
+    meta = action_meta(action)
+    option_label = str(meta.get("option_label") or meta.get("item_title") or "").strip()
+    if option_label:
+        return option_label[:100]
     action_value = str(action.get("value") or "").strip()
     desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
     if action_value.startswith("e3 詳情"):
@@ -150,7 +177,12 @@ def select_option_label(embed: discord.Embed, action: dict[str, str]) -> str:
 
 
 def is_file_entry(entry: tuple[str, str, dict[str, str]]) -> bool:
-    return bool(entry and (entry[2] or {}).get("kind") == "uri")
+    if not entry:
+        return False
+    meta = action_meta(entry[2] or {})
+    if str(meta.get("entry_kind") or "").strip() == "file":
+        return True
+    return bool((entry[2] or {}).get("kind") == "uri")
 
 
 def repeated_message_label(entries: list[tuple[str, str, dict[str, str]]]) -> str | None:
@@ -159,6 +191,10 @@ def repeated_message_label(entries: list[tuple[str, str, dict[str, str]]]) -> st
     actions = [entry[2] or {} for entry in entries]
     if not all(str(action.get("kind") or "") == "message" for action in actions):
         return None
+    meta_labels = {str(action_meta(action).get("group_label") or "").strip() for action in actions}
+    meta_labels.discard("")
+    if len(meta_labels) == 1:
+        return next(iter(meta_labels))
     labels = {str(action.get("label") or "").strip() for action in actions}
     labels.discard("")
     if len(labels) == 1:
@@ -171,6 +207,18 @@ def all_file_entries(entries: list[tuple[str, str, dict[str, str]]]) -> bool:
 
 
 def select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
+    if entries:
+        meta = action_meta(entries[0][2] or {})
+        explicit = str(meta.get("selector_summary_title") or "").strip()
+        if explicit:
+            return explicit
+        selector_kind = str(meta.get("selector_kind") or "").strip()
+        if selector_kind == "timeline_event":
+            return "選擇近期事件"
+        if selector_kind == "file":
+            return "選擇檔案"
+        if selector_kind == "course_homework_detail":
+            return "選擇作業詳情"
     if entries and all(is_file_entry(entry) for entry in entries):
         return "選擇檔案"
     repeated_label = repeated_message_label(entries)
@@ -184,6 +232,15 @@ def select_summary_title(entries: list[tuple[str, str, dict[str, str]]]) -> str:
 
 
 def _parse_timeline_selector_candidate(embed: discord.Embed, action: dict[str, str]) -> dict[str, str] | None:
+    meta = action_meta(action)
+    if str(meta.get("entry_kind") or "").strip() == "timeline_event":
+        return {
+            "event_type": str(meta.get("event_type") or ""),
+            "course": str(meta.get("course_name") or ""),
+            "title": str(meta.get("item_title") or ""),
+            "due_full": str(meta.get("due_full") or meta.get("due_label") or ""),
+            "due_relative": str(meta.get("due_relative") or ""),
+        }
     action_value = str(action.get("value") or "").strip()
     if not action_value.startswith("e3 詳情"):
         return None
@@ -282,10 +339,11 @@ def build_file_selector_summary(
     submitted_lines: list[str] = []
     other_lines: list[str] = []
 
-    for embed, _actions in candidates:
+    for (embed, _actions), (_, _, action) in zip(candidates, entries):
+        meta = action_meta(action)
         desc_lines = [line.strip() for line in str(embed.description or "").splitlines() if line.strip()]
-        filename = desc_lines[0] if desc_lines else str(embed.title or "未命名檔案").strip()
-        footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
+        filename = str(meta.get("item_title") or "").strip() or (desc_lines[0] if desc_lines else str(embed.title or "未命名檔案").strip())
+        footer_text = str(meta.get("file_role_label") or "").strip() or str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
         line = f"▶️ {filename}"
         if footer_text == "作業附件":
             teacher_lines.append(line)
@@ -314,8 +372,14 @@ def build_grouped_selector_summary(
     if not entries or any(is_file_entry(entry) for entry in entries):
         return None
 
+    first_meta = action_meta(entries[0][2] or {}) if entries else {}
     repeated_label = repeated_message_label(entries)
-    if repeated_label == "查看檔案":
+    explicit_section = str(first_meta.get("selector_section") or "").strip()
+    explicit_title = str(first_meta.get("selector_summary_title") or "").strip()
+    if explicit_section:
+        section_name = explicit_section
+        title = explicit_title or select_summary_title(entries)
+    elif repeated_label == "查看檔案":
         section_name = "📎 教材"
         title = "選擇教材"
     elif repeated_label and "詳情" in repeated_label:

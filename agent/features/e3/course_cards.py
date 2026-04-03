@@ -1,3 +1,6 @@
+from .payloads import attach_message_meta
+
+
 def build_course_detail_flex(detail, alt_text):
     body_contents = [
         {"type": "text", "text": detail["course_name"], "weight": "bold", "wrap": True, "size": "lg"},
@@ -20,11 +23,18 @@ def build_course_detail_flex(detail, alt_text):
         body_contents.append({"type": "text", "text": "成績摘要", "weight": "bold", "size": "sm", "margin": "md"})
         for line in detail["grade_summary_lines"]:
             body_contents.append({"type": "text", "text": line, "size": "sm", "wrap": True})
-    return {
+    return attach_message_meta(
+        {
         "type": "flex",
         "altText": alt_text,
         "contents": {
             "type": "bubble",
+            "xe3_meta": {
+                "selector_kind": "course_detail",
+                "item_title": detail["course_name"],
+                "course_name": detail["course_name"],
+                "course_id": detail["course_id"],
+            },
             "size": "mega",
             "header": {
                 "type": "box",
@@ -55,6 +65,13 @@ def build_course_detail_flex(detail, alt_text):
                             "type": "message",
                             "label": "重點摘要",
                             "text": f"e3 課程摘要 {detail['index']}",
+                            "xe3_meta": {
+                                "selector_kind": "course_summary",
+                                "entry_kind": "course_summary",
+                                "item_title": detail["course_name"],
+                                "course_name": detail["course_name"],
+                                "course_id": detail["course_id"],
+                            },
                         },
                     },
                     {
@@ -65,6 +82,13 @@ def build_course_detail_flex(detail, alt_text):
                             "type": "message",
                             "label": "查看教材",
                             "text": f"e3 檔案資料夾 {detail['course_id'] or detail['course_name']}",
+                            "xe3_meta": {
+                                "selector_kind": "file_folder",
+                                "entry_kind": "course_materials",
+                                "item_title": detail["course_name"],
+                                "course_name": detail["course_name"],
+                                "course_id": detail["course_id"],
+                            },
                         },
                     },
                     {
@@ -75,6 +99,13 @@ def build_course_detail_flex(detail, alt_text):
                             "type": "message",
                             "label": "查看作業",
                             "text": f"e3 課程作業 {detail['course_id'] or detail['course_name']}",
+                            "xe3_meta": {
+                                "selector_kind": "course_homework_detail",
+                                "entry_kind": "course_homework",
+                                "item_title": detail["course_name"],
+                                "course_name": detail["course_name"],
+                                "course_id": detail["course_id"],
+                            },
                         },
                     },
                     {
@@ -86,12 +117,20 @@ def build_course_detail_flex(detail, alt_text):
                             "type": "message",
                             "label": "回到課程列表",
                             "text": "e3 course",
+                            "xe3_meta": {
+                                "selector_kind": "course_summary",
+                            },
                         },
                     },
                 ],
             },
         },
-    }
+    },
+        selector_kind="course_detail",
+        item_title=detail["course_name"],
+        course_name=detail["course_name"],
+        course_id=detail["course_id"],
+    )
 
 
 def build_course_summary_flex(detail, alt_text, index):
@@ -147,11 +186,18 @@ def build_course_summary_flex(detail, alt_text, index):
             ]
         )
 
-    return {
+    return attach_message_meta(
+        {
         "type": "flex",
         "altText": alt_text,
         "contents": {
             "type": "bubble",
+            "xe3_meta": {
+                "selector_kind": "course_summary",
+                "item_title": detail["course_name"],
+                "course_name": detail["course_name"],
+                "course_id": detail["course_id"],
+            },
             "size": "mega",
             "header": {
                 "type": "box",
@@ -182,6 +228,13 @@ def build_course_summary_flex(detail, alt_text, index):
                             "type": "message",
                             "label": "課程詳情",
                             "text": f"e3 課程詳情 {index}",
+                            "xe3_meta": {
+                                "selector_kind": "course_detail",
+                                "entry_kind": "course_detail",
+                                "item_title": detail["course_name"],
+                                "course_name": detail["course_name"],
+                                "course_id": detail["course_id"],
+                            },
                         },
                     },
                     {
@@ -192,6 +245,13 @@ def build_course_summary_flex(detail, alt_text, index):
                             "type": "message",
                             "label": "查看教材",
                             "text": f"e3 檔案資料夾 {detail['course_id'] or detail['course_name']}",
+                            "xe3_meta": {
+                                "selector_kind": "file_folder",
+                                "entry_kind": "course_materials",
+                                "item_title": detail["course_name"],
+                                "course_name": detail["course_name"],
+                                "course_id": detail["course_id"],
+                            },
                         },
                     },
                     {
@@ -202,6 +262,13 @@ def build_course_summary_flex(detail, alt_text, index):
                             "type": "message",
                             "label": "查看作業",
                             "text": f"e3 課程作業 {detail['course_id'] or detail['course_name']}",
+                            "xe3_meta": {
+                                "selector_kind": "course_homework_detail",
+                                "entry_kind": "course_homework",
+                                "item_title": detail["course_name"],
+                                "course_name": detail["course_name"],
+                                "course_id": detail["course_id"],
+                            },
                         },
                     },
                     {
@@ -212,9 +279,17 @@ def build_course_summary_flex(detail, alt_text, index):
                             "type": "message",
                             "label": "回到課程列表",
                             "text": "e3 course",
+                            "xe3_meta": {
+                                "selector_kind": "course_summary",
+                            },
                         },
                     },
                 ],
             },
         },
-    }
+    },
+        selector_kind="course_summary",
+        item_title=detail["course_name"],
+        course_name=detail["course_name"],
+        course_id=detail["course_id"],
+    )

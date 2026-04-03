@@ -4,11 +4,12 @@ import re
 from datetime import datetime, timedelta, timezone
 from logging import Logger
 from typing import Any, Optional
-from urllib.parse import quote, urlsplit, urlunsplit
 
 from .client import check_status, fetch_courses, fetch_file_links, fetch_timeline_snapshot, get_cache_status, login_and_sync, make_user_key
 from .client import clear_runtime_data
+from . import course_runtime, file_catalog
 from .course_cards import build_course_detail_flex, build_course_summary_flex
+from .payloads import attach_message_meta, line_response
 from .db import (
     delete_user_data,
     ensure_reminder_prefs,
@@ -334,7 +335,12 @@ def _list_courses(logger, line_user_id):
         text_lines = [f"📚 你的 {semester_tag} 學期 E3 課程：", _format_cache_status_text(cache_status)]
     bubbles = []
     for idx, (display_name, payload) in enumerate(current_courses[:10], start=1):
-        summary = _build_course_summary(idx, display_name, payload, file_links.get(str((payload or {}).get("_course_id") or "").strip()) or {})
+        summary = course_runtime.build_course_summary(
+            idx,
+            display_name,
+            payload,
+            file_links.get(str((payload or {}).get("_course_id") or "").strip()) or {},
+        )
         if _is_discord_user_key(line_user_id):
             text_lines.append(f"• **{summary['course_label']}**")
             text_lines.append(
@@ -741,8 +747,8 @@ def _list_files(tokens, logger, line_user_id):
     lines = [f"📎 **Materials related to {keyword}**", _format_cache_status_text(cache_status), ""] if _is_discord_user_key(line_user_id) else [f"📎 與「{keyword}」相關的課程檔案：", _format_cache_status_text(cache_status)]
     bubbles = []
     for course_id, course_name, links in matches[:5]:
-        all_files = _collect_file_entries(course_id, course_name, links)
-        folder_groups = _group_file_entries(all_files)
+        all_files = file_catalog.collect_file_entries(course_id, course_name, links)
+        folder_groups = file_catalog.group_file_entries(all_files)
         preview_lines = [f"{folder}｜{len(items)} 個檔案" for folder, items in folder_groups[:3]]
         remaining = max(0, len(folder_groups) - len(preview_lines))
         if remaining:
@@ -870,95 +876,21 @@ def _count_completed_assignments(payload):
     return count
 
 
-def _count_grade_items(payload):
-    grades_payload = (payload or {}).get("grades") or {}
-    if not isinstance(grades_payload, dict):
-        return 0
-    if isinstance(grades_payload.get("grade_items"), list):
-        return sum(1 for row in (grades_payload.get("grade_items") or []) if isinstance(row, dict) and _is_meaningful_grade(row.get("score")))
-    return sum(1 for score in grades_payload.values() if _is_meaningful_grade(score))
-
-
-def _count_file_items(link_payload):
-    handouts = link_payload.get("handouts") or []
-    assignments = link_payload.get("assignments") or {}
-    assignment_count = 0
-    for entry in assignments.values():
-        assignment_count += len((entry or {}).get("web_files") or [])
-    return len(handouts) + assignment_count
-
-
-def _sanitize_line_uri(url):
-    raw = str(url or "").strip()
-    if not raw:
-        return ""
-    parts = urlsplit(raw)
-    if parts.scheme not in {"http", "https"} or not parts.netloc:
-        return ""
-    safe_path = quote(parts.path, safe="/:@-._~!$&'()*+,;=")
-    safe_query = quote(parts.query, safe="=&/:?@-._~!$'()*+,;")
-    safe_fragment = quote(parts.fragment, safe="-._~!$&'()*+,;=:@/?")
-    return urlunsplit((parts.scheme, parts.netloc, safe_path, safe_query, safe_fragment))
-
-
-def _collect_file_entries(course_id, course_name, links):
-    entries = []
-    for item in links.get("handouts") or []:
-        entries.append(
-            {
-                "course_id": course_id,
-                "course_name": course_name,
-                "folder": item.get("folder") or "講義",
-                "kind": "講義",
-                "title": item.get("name") or "未命名檔案",
-                "source_url": _sanitize_line_uri(item.get("url") or ""),
-                "accent": "#2563EB",
-            }
-        )
-    for assignment_title, entry in (links.get("assignments") or {}).items():
-        for web_file in (entry or {}).get("web_files") or []:
-            entries.append(
-                {
-                    "course_id": course_id,
-                    "course_name": course_name,
-                    "folder": assignment_title or "作業附件",
-                    "kind": "作業附件",
-                    "title": f"{assignment_title} / {web_file.get('name') or '附件'}",
-                    "source_url": _sanitize_line_uri(web_file.get("url") or ""),
-                    "accent": "#D97706",
-                }
-            )
-    return entries
-
-
-def _group_file_entries(entries):
-    groups = {}
-    for entry in entries:
-        folder = str(entry.get("folder") or "未分類").strip()
-        groups.setdefault(folder, []).append(entry)
-    ordered = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
-    return ordered
-
-
-def _build_course_summary(index, display_name, payload, link_payload):
-    course_id = str((payload or {}).get("_course_id") or "").strip()
-    course_name = _course_name_for_display(display_name)
-    course_label = f"{course_id} {course_name}".strip()
-    return {
-        "index": index,
-        "course_id": course_id,
-        "course_name": course_name,
-        "course_label": course_label,
-        "homework_count": _count_active_assignments(payload),
-        "grade_count": _count_grade_items(payload),
-        "file_count": _count_file_items(link_payload or {}),
-    }
-
-
 def _build_course_bubble(summary):
     return {
         "type": "bubble",
         "size": "kilo",
+        "xe3_meta": {
+            "selector_kind": "course_summary",
+            "entry_kind": "course_summary",
+            "item_title": summary["course_name"],
+            "course_name": summary["course_name"],
+            "course_id": summary["course_id"],
+            "selector_summary_title": "選擇課程",
+            "selector_section": "📘 課程",
+            "option_label": summary["course_label"] or summary["course_name"],
+            "option_description": f"作業 {summary['homework_count']}｜成績 {summary['grade_count']}｜檔案 {summary['file_count']}",
+        },
         "header": {
             "type": "box",
             "layout": "vertical",
@@ -993,6 +925,15 @@ def _build_course_bubble(summary):
                         "type": "message",
                         "label": "查看課程",
                         "text": f"e3 課程摘要 {summary['index']}",
+                        "xe3_meta": {
+                            "selector_kind": "course_summary",
+                            "entry_kind": "course_summary",
+                            "item_title": summary["course_name"],
+                            "course_name": summary["course_name"],
+                            "course_id": summary["course_id"],
+                            "option_label": summary["course_label"] or summary["course_name"],
+                            "option_description": f"作業 {summary['homework_count']}｜成績 {summary['grade_count']}｜檔案 {summary['file_count']}",
+                        },
                     },
                 },
                 {
@@ -1003,6 +944,13 @@ def _build_course_bubble(summary):
                         "type": "message",
                         "label": "查看教材",
                         "text": f"e3 檔案資料夾 {summary['course_id'] or summary['course_name']}",
+                        "xe3_meta": {
+                            "selector_kind": "file_folder",
+                            "entry_kind": "course_materials",
+                            "item_title": summary["course_name"],
+                            "course_name": summary["course_name"],
+                            "course_id": summary["course_id"],
+                        },
                     },
                 },
                 {
@@ -1013,6 +961,13 @@ def _build_course_bubble(summary):
                         "type": "message",
                         "label": "查看作業",
                         "text": f"e3 課程作業 {summary['course_id'] or summary['course_name']}",
+                        "xe3_meta": {
+                            "selector_kind": "course_homework_detail",
+                            "entry_kind": "course_homework",
+                            "item_title": summary["course_name"],
+                            "course_name": summary["course_name"],
+                            "course_id": summary["course_id"],
+                        },
                     },
                 },
             ],
@@ -1024,6 +979,17 @@ def _build_file_course_bubble(course_id, course_name, preview_lines):
     return {
         "type": "bubble",
         "size": "kilo",
+        "xe3_meta": {
+            "selector_kind": "file_folder",
+            "entry_kind": "file_folder",
+            "item_title": course_name,
+            "course_name": course_name,
+            "course_id": course_id,
+            "selector_summary_title": "選擇教材",
+            "selector_section": "📎 教材",
+            "option_label": course_name,
+            "option_description": "｜".join(preview_lines[:2]) or "點選後查看教材",
+        },
         "header": {
             "type": "box",
             "layout": "vertical",
@@ -1059,6 +1025,15 @@ def _build_file_course_bubble(course_id, course_name, preview_lines):
                         "type": "message",
                         "label": "查看資料夾",
                         "text": f"e3 檔案資料夾 {course_id or course_name}",
+                        "xe3_meta": {
+                            "selector_kind": "file_folder",
+                            "entry_kind": "file_folder",
+                            "item_title": course_name,
+                            "course_name": course_name,
+                            "course_id": course_id,
+                            "option_label": course_name,
+                            "option_description": "｜".join(preview_lines[:2]) or "點選後查看教材",
+                        },
                     },
                 }
             ],
@@ -1367,10 +1342,7 @@ def _filter_rows_within_days(rows, days: int):
 
 
 def _line_response(text, messages=None):
-    payload = {"text": text}
-    if messages:
-        payload["messages"] = messages
-    return payload
+    return line_response(text, messages=messages)
 
 
 def _format_cache_status_text(cache_status):
@@ -1577,6 +1549,21 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None, line_user_
                     "type": "message",
                     "label": "查看詳情",
                     "text": f"e3 詳情 {idx}",
+                    "xe3_meta": {
+                        "selector_kind": "timeline_event",
+                        "selector_section": {
+                            "homework": "🟠 作業",
+                            "exam": "🔴 考試",
+                            "calendar": "🟢 行事曆",
+                        }.get(str(row["event_type"] or ""), "🗓️ 近期事件"),
+                        "entry_kind": "timeline_event",
+                        "event_type": str(row["event_type"] or ""),
+                        "item_title": title,
+                        "course_name": course_name,
+                        "due_label": due_at,
+                        "option_label": title,
+                        "option_description": f"{type_label}｜{course_name}｜{due_at}",
+                    },
                 },
             }
         ]
@@ -1586,6 +1573,22 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None, line_user_
             {
                 "type": "bubble",
                 "size": "kilo",
+                "xe3_meta": {
+                    "selector_kind": "timeline_event",
+                    "selector_section": {
+                        "homework": "🟠 作業",
+                        "exam": "🔴 考試",
+                        "calendar": "🟢 行事曆",
+                    }.get(str(row["event_type"] or ""), "🗓️ 近期事件"),
+                    "entry_kind": "timeline_event",
+                    "event_type": str(row["event_type"] or ""),
+                    "item_title": title,
+                    "course_name": course_name,
+                    "due_label": due_at,
+                    "option_label": title,
+                    "option_description": f"{type_label}｜{course_name}｜{due_at}",
+                    "selector_summary_title": "選擇近期事件",
+                },
                 "header": {
                     "type": "box",
                     "layout": "vertical",
@@ -1653,14 +1656,14 @@ def _build_timeline_flex(rows, alt_text, hero_title, event_type=None, line_user_
     if not bubbles:
         return None
 
-    return {
+    return attach_message_meta({
         "type": "flex",
         "altText": alt_text,
         "contents": {
             "type": "carousel",
             "contents": bubbles,
         },
-    }
+    }, selector_kind="timeline_event", selector_summary_title="選擇近期事件")
 
 
 def _detail_file_buttons(payload, line_user_id):
@@ -1690,6 +1693,14 @@ def _detail_file_buttons(payload, line_user_id):
                     "type": "uri",
                     "label": f"{label_prefix}{idx}",
                     "uri": build_proxy_url(line_user_id, source_url, filename=title),
+                    "xe3_meta": {
+                        "selector_kind": "file",
+                        "entry_kind": "file",
+                        "file_role_label": "老師附件" if label_prefix == "附件" else "你的提交",
+                        "item_title": title,
+                        "option_label": f"{'📎' if label_prefix == '附件' else '📤'} {'老師附件' if label_prefix == '附件' else '你的提交'}｜{title}",
+                        "option_description": "老師附件" if label_prefix == "附件" else "你的提交",
+                    },
                 },
             }
         )
@@ -1789,6 +1800,13 @@ def _build_detail_flex(row, index, alt_text, line_user_id=None):
         "altText": alt_text,
         "contents": {
             "type": "bubble",
+            "xe3_meta": {
+                "selector_kind": "timeline_event_detail",
+                "entry_kind": "timeline_event_detail",
+                "item_title": title,
+                "course_name": _course_name_for_display(row["course_name"] or row["course_id"] or "-"),
+                "event_type": str(row["event_type"] or ""),
+            },
             "size": "mega",
             "header": {
                 "type": "box",
@@ -1992,112 +2010,6 @@ def _collect_course_homework_items(payload):
             }
         )
     return items[:3]
-
-
-def _collect_course_homework_entries(payload):
-    items = []
-    for item in _assignment_items(payload):
-        if not isinstance(item, dict):
-            continue
-        due_raw = item.get("due") or item.get("due_time") or item.get("due_date") or item.get("deadline") or item.get("截止")
-        completed = _is_assignment_completed(item)
-        attachments = [entry for entry in (item.get("attachments") or []) if isinstance(entry, dict)]
-        submitted_files = [entry for entry in (item.get("submitted_files") or []) if isinstance(entry, dict)]
-        category = str(item.get("category") or "").strip().lower()
-        if not completed and category and category not in {"in_progress", "upcoming"}:
-            continue
-        if completed and not (attachments or submitted_files):
-            continue
-        items.append(
-            {
-                "title": str(item.get("title") or item.get("name") or "未命名作業").strip(),
-                "due_at": due_raw,
-                "completed": completed,
-                "_raw": item,
-            }
-        )
-    items.sort(
-        key=lambda item: (
-            1 if item.get("completed") else 0,
-            _parse_due_at_sort_key(item.get("due_at")),
-            item.get("title") or "",
-        )
-    )
-    return items
-
-
-
-
-def _build_course_homework_flex(course_name, course_id, items, alt_text, line_user_id=None):
-    bubbles = []
-    for idx, item in enumerate(items[:10], start=1):
-        title = str(item.get("title") or "未命名作業").strip()
-        due_at = _format_due_at_for_display(item.get("due_at"), line_user_id)
-        payload = item.get("_raw") or {}
-        status_text = "已完成" if item.get("completed") else "未完成"
-        attachment_count = len(payload.get("attachments") or [])
-        submitted_count = len(payload.get("submitted_files") or [])
-        footer_contents = [
-            {
-                "type": "button",
-                "style": "primary",
-                "height": "sm",
-                "color": "#D97706",
-                "action": {
-                    "type": "message",
-                    "label": "查看詳情",
-                    "text": f"e3 作業詳情 {course_id or course_name} i{idx}",
-                },
-            }
-        ]
-        bubbles.append(
-            {
-                "type": "bubble",
-                "size": "kilo",
-                "header": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "backgroundColor": "#D97706",
-                    "paddingAll": "12px",
-                    "contents": [
-                        {"type": "text", "text": "作業", "color": "#FFFBEB", "size": "xs"},
-                        {"type": "text", "text": title, "color": "#FFFFFF", "weight": "bold", "wrap": True},
-                    ],
-                },
-                "body": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "spacing": "sm",
-                    "contents": [
-                        {"type": "text", "text": course_name, "wrap": True, "size": "sm"},
-                        {"type": "text", "text": status_text, "size": "sm", "color": "#475569", "wrap": True},
-                        {"type": "text", "text": due_at, "size": "sm", "color": "#475569", "wrap": True},
-                        {"type": "text", "text": f"附件 {attachment_count}｜已繳 {submitted_count}", "size": "xs", "color": "#6B7280", "wrap": True},
-                        {"type": "text", "text": f"編號 #{idx}", "size": "xs", "color": "#6B7280"},
-                    ],
-                },
-                "footer": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "spacing": "sm",
-                    "contents": footer_contents,
-                },
-            }
-        )
-
-    if not bubbles:
-        return None
-
-    return {
-        "type": "flex",
-        "altText": alt_text,
-        "contents": {
-            "type": "carousel",
-            "contents": bubbles,
-        },
-    }
-
-
 def _format_due_at_full(value, user_key=None):
     if not value:
         return "N/A"
@@ -2390,7 +2302,7 @@ def _course_detail(action, tokens, logger, line_user_id):
         )
 
     display_name, payload = current_courses[index - 1]
-    detail = _build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id)
+    detail = course_runtime.build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id)
     detail["index"] = index
 
     if _is_discord_user_key(line_user_id):
@@ -2422,69 +2334,8 @@ def _course_detail(action, tokens, logger, line_user_id):
             "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
         ]
     text = "\n".join(text_lines)
-    flex = _build_course_detail_flex(detail, text)
+    flex = build_course_detail_flex(detail, text)
     return _line_response(text, messages=[flex] if flex else None)
-
-
-def _build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id):
-    course_id = str((payload or {}).get("_course_id") or "").strip()
-    course_name = _course_name_for_display(display_name)
-    links = (file_snapshot.get("file_links") or {}).get(course_id) or {}
-    homework_items = _collect_course_homework_items(payload)
-    calendar_items = _collect_course_calendar_events(timeline_snapshot, course_id)
-    completion_map = _assignment_completion_map(payload)
-    all_file_entries = _collect_file_entries(course_id, course_name, links)
-    file_lines = [f"{entry['kind']}｜{entry['title']}" for entry in all_file_entries[:3]]
-    remaining_files = len(all_file_entries) - len(file_lines)
-    if remaining_files > 0:
-        file_lines.append(f"還有 {remaining_files} 個檔案，點「查看教材」查看。")
-
-    detail = {
-        "index": 0,
-        "course_id": course_id,
-        "course_name": course_name,
-        "homework_count": _count_active_assignments(payload),
-        "completed_homework_count": _count_completed_assignments(payload),
-        "calendar_count": len(calendar_items),
-        "file_count": _count_file_items(links),
-        "homework_lines": [
-            f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
-            for item in homework_items
-        ] or ["🎉 目前沒有未完成作業"],
-        "calendar_lines": [
-            (
-                ("✅ ~~已完成｜" if completion_map.get(_normalize_title_token(item.get("title"))) else "⚠️ 未完成｜")
-                + f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
-                + ("~~" if completion_map.get(_normalize_title_token(item.get("title"))) else "")
-            )
-            if completion_map.get(_normalize_title_token(item.get("title"))) is not None
-            else f"{_shorten_title(item['title'], 26)}｜{_format_due_at_for_display(item['due_at'], line_user_id)}"
-            for item in calendar_items
-        ] or ["🎉 目前沒有近期行事曆"],
-        "file_lines": file_lines or ["目前沒有可用檔案"],
-    }
-    outline_info = _course_outline_summary(payload)
-    grade_info = _course_grade_summary(payload)
-    detail["course_info_lines"] = [
-        f"👨‍🏫 教師｜{outline_info['teacher']}",
-        f"🎓 學分｜{outline_info['credits']}",
-        f"🕒 時段｜{outline_info['schedule']}",
-        f"📍 地點｜{outline_info['meeting_place']}",
-        f"📚 教材｜{_shorten_title(outline_info['textbook'], 36)}",
-        f"🧭 先修｜{_shorten_title(outline_info['prerequisite'], 36)}",
-        f"📊 評分｜{_shorten_title(outline_info['grading'], 36)}",
-    ]
-    detail["course_info_lines"] = [line for line in detail["course_info_lines"] if not line.endswith("｜")]
-    detail["grade_summary_lines"] = [
-        f"📊 已登錄成績｜{grade_info['scored_items']} / {grade_info['total_items']}",
-        f"💬 回饋項目｜{grade_info['feedback_count']}",
-        *[f"• {line}" for line in grade_info["latest_lines"]],
-    ]
-    detail["grade_summary_lines"] = [line for line in detail["grade_summary_lines"] if not line.endswith("｜0 / 0") or grade_info["latest_lines"]]
-    if grade_info["total_items"] == 0 and not grade_info["latest_lines"]:
-        detail["grade_summary_lines"] = ["📊 目前還沒有可用的成績摘要"]
-    detail["exam_lines"] = [f"⚠️ {line}" for line in outline_info["exam_lines"]] or ["🎉 目前沒有辨識到近期考試提醒"]
-    return detail
 
 
 def _course_summary(action, tokens, logger, line_user_id):
@@ -2518,7 +2369,7 @@ def _course_summary(action, tokens, logger, line_user_id):
         )
 
     display_name, payload = current_courses[index - 1]
-    detail = _build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id)
+    detail = course_runtime.build_course_detail_payload(display_name, payload, timeline_snapshot, file_snapshot, line_user_id)
     detail["index"] = index
 
     if _is_discord_user_key(line_user_id):
@@ -2554,7 +2405,7 @@ def _course_summary(action, tokens, logger, line_user_id):
             "檔案：" + ("；".join(detail["file_lines"]) if detail["file_lines"] else "-"),
         ]
     text = "\n".join(text_lines)
-    flex = _build_course_summary_flex(detail, text, index)
+    flex = build_course_summary_flex(detail, text, index)
     return _line_response(text, messages=[flex] if flex else None)
 
 
@@ -2595,7 +2446,7 @@ def _course_homework(action, tokens, logger, line_user_id):
         )
 
     course_id, course_name, payload = matched_course
-    items = _collect_course_homework_entries(payload)
+    items = course_runtime.collect_course_homework_entries(payload)
 
     if not items:
         return _discord_empty_state(f"先鬆一口氣，**{course_name}** 目前沒有需要查看的作業。🎉", line_user_id, emoji="📝") if _is_discord_user_key(line_user_id) else f"{course_name} 目前沒有可查看的作業。"
@@ -2614,7 +2465,7 @@ def _course_homework(action, tokens, logger, line_user_id):
     if len(items) > 10:
         lines.append(f"…and `{len(items) - 10}` more." if _is_discord_user_key(line_user_id) else f"還有 {len(items) - 10} 筆作業。")
     text = "\n".join(lines)
-    flex = _build_course_homework_flex(course_name, course_id, items, text, line_user_id=line_user_id)
+    flex = course_runtime.build_course_homework_flex(course_name, course_id, items, text, line_user_id=line_user_id)
     return _line_response(text, messages=[flex] if flex else None)
 
 
@@ -2651,7 +2502,7 @@ def _course_homework_detail(action, tokens, logger, line_user_id):
         return f"📝 我找不到和 **{target}** 對應的課程。" if _is_discord_user_key(line_user_id) else f"找不到「{target}」的課程作業。"
 
     course_id, course_name, payload = matched_course
-    items = _collect_course_homework_entries(payload)
+    items = course_runtime.collect_course_homework_entries(payload)
     if index > len(items):
         return (
             f"⚠️ 我找不到作業 `#{index}`。\n先用 {_discord_command_hint(f'e3 課程作業 {course_id or course_name}', line_user_id)} 看看目前列表。"
@@ -2722,6 +2573,16 @@ def _build_file_download_flex(entries, alt_text, course_name):
             {
                 "type": "bubble",
                 "size": "kilo",
+                "xe3_meta": {
+                    "selector_kind": "file",
+                    "entry_kind": "file",
+                    "item_title": entry["title"],
+                    "course_name": course_name,
+                    "file_role_label": "老師附件" if entry["kind"] in {"講義", "作業附件", "老師附件"} else "你的提交",
+                    "option_label": f"{'📎' if entry['kind'] in {'講義', '作業附件', '老師附件'} else '📤'} {'老師附件' if entry['kind'] in {'講義', '作業附件', '老師附件'} else '你的提交'}｜{entry['title']}",
+                    "option_description": "老師附件" if entry["kind"] in {"講義", "作業附件", "老師附件"} else "你的提交",
+                    "selector_summary_title": "選擇檔案",
+                },
                 "header": {
                     "type": "box",
                     "layout": "vertical",
@@ -2752,6 +2613,15 @@ def _build_file_download_flex(entries, alt_text, course_name):
                                 "type": "uri",
                                 "label": "開啟檔案",
                                 "uri": entry["url"],
+                                "xe3_meta": {
+                                    "selector_kind": "file",
+                                    "entry_kind": "file",
+                                    "item_title": entry["title"],
+                                    "course_name": course_name,
+                                    "file_role_label": "老師附件" if entry["kind"] in {"講義", "作業附件", "老師附件"} else "你的提交",
+                                    "option_label": f"{'📎' if entry['kind'] in {'講義', '作業附件', '老師附件'} else '📤'} {'老師附件' if entry['kind'] in {'講義', '作業附件', '老師附件'} else '你的提交'}｜{entry['title']}",
+                                    "option_description": "老師附件" if entry["kind"] in {"講義", "作業附件", "老師附件"} else "你的提交",
+                                },
                             },
                         }
                     ],
@@ -2760,14 +2630,14 @@ def _build_file_download_flex(entries, alt_text, course_name):
         )
     if not bubbles:
         return None
-    return {
+    return attach_message_meta({
         "type": "flex",
         "altText": alt_text,
         "contents": {
             "type": "carousel",
             "contents": bubbles,
         },
-    }
+    }, selector_kind="file", selector_summary_title="選擇檔案")
 
 
 def _build_file_folder_bubble(course_key, folder_name, file_count, index):
@@ -2908,11 +2778,11 @@ def _file_detail(action, tokens, logger, line_user_id):
         return f"找不到「{target}」的課程檔案。"
 
     course_id, course_name, links = matched_course
-    entries = _collect_file_entries(course_id, course_name, links)
+    entries = file_catalog.collect_file_entries(course_id, course_name, links)
     if not entries:
         return f"{course_name} 目前沒有可下載檔案。"
 
-    folder_groups = _group_file_entries(entries)
+    folder_groups = file_catalog.group_file_entries(entries)
     folder_name = None
     if folder_index is not None:
         if folder_index > len(folder_groups):
@@ -2990,7 +2860,7 @@ def _file_folders(action, tokens, logger, line_user_id):
         return f"找不到「{target}」的課程資料夾。"
 
     course_id, course_name, links = matched_course
-    groups = _group_file_entries(_collect_file_entries(course_id, course_name, links))
+    groups = file_catalog.group_file_entries(file_catalog.collect_file_entries(course_id, course_name, links))
     if not groups:
         return f"{course_name} 目前沒有可用資料夾。"
 
