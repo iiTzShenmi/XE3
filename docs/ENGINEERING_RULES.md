@@ -3,6 +3,14 @@
 This file records the architecture and maintenance rules we expect future changes to follow.
 It exists so we can re-review against the same baseline later instead of relying on memory.
 
+## 0. Critical Reminder For Future Codex
+- If you extract helpers into a new module, finish the wiring in the same round.
+- Replace old call sites and remove dead duplicate helpers before you stop.
+- Before pushing, always do all three:
+  1. `py_compile` for touched modules
+  2. restart the relevant service
+  3. update `log/XE3_PUSH_LOG.md`
+
 ## 1. Git and Runtime Must Stay Aligned
 - Keep the running bot and Git history as close as possible.
 - After each stable chunk of work:

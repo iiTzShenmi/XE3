@@ -7,25 +7,20 @@ from urllib.parse import urlparse
 
 import requests
 
-MAX_SELECT_OPTIONS = 25
-E3_EXECUTION_SEMAPHORE = asyncio.Semaphore(2)
-
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
 from agent.features.e3 import handle_e3_command, run_e3_async_command
-from agent.features.e3.client import fetch_courses
 from agent.features.e3.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
 from agent.features.e3.reminders import build_test_reminder_payloads, start_reminder_worker
 from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
 from agent.features.weather import handle_city_weather
+from agent.platforms.discord.command_helpers import autocomplete_course_files, build_help_text
 from agent.platforms.discord.message_utils import (
     extract_embed_items,
-    response_text as _response_text,
     send_text_chunks as _send_text_chunks,
-    special_text_embed as _special_text_embed,
 )
 from agent.platforms.discord.rendering import (
     all_file_entries,
@@ -39,10 +34,13 @@ from agent.platforms.discord.rendering import (
     select_option_label,
     select_summary_title,
 )
+from agent.platforms.discord.views import CommandButtonView, CommandSelectView, DiscordViewCallbacks, E3LoginModal, ReminderToggleView
 from agent.system_status import build_system_report
 
 
 logger = logging.getLogger(__name__)
+MAX_SELECT_OPTIONS = 25
+E3_EXECUTION_SEMAPHORE = asyncio.Semaphore(2)
 
 
 def _platform_user_key(user_id: int) -> str:
@@ -111,13 +109,6 @@ def _reminder_schedule_from_embed(embed: discord.Embed | None) -> list[str]:
             normalized.append(slot)
     return normalized or ["09:00", "21:00"]
 
-
-_SCHEDULE_PRESETS: list[tuple[str, str, list[str]]] = [
-    ("09:00 + 21:00", "早晚各提醒一次", ["09:00", "21:00"]),
-    ("僅 09:00", "只接收早安摘要", ["09:00"]),
-    ("僅 21:00", "只接收晚間整理", ["21:00"]),
-]
-
 def _schedule_command_for_slots(slots: list[str]) -> str:
     normalized = list(slots)
     if normalized == ["09:00"]:
@@ -127,143 +118,78 @@ def _schedule_command_for_slots(slots: list[str]) -> str:
     return "e3 remind schedule both"
 
 
-class ReminderToggleButton(discord.ui.Button):
-    def __init__(self, bot: commands.Bot, user_id: int, enabled: bool):
-        self.bot = bot
-        self.user_id = user_id
-        self.enabled = enabled
-        command_text = "e3 remind off" if enabled else "e3 remind on"
-        label = "關閉提醒" if enabled else "開啟提醒"
-        style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
-        super().__init__(label=label, style=style)
-        self.command_text = command_text
+def _normalize_command_text(command_text: str) -> str:
+    normalized = command_text.strip()
+    if not normalized.lower().startswith("e3"):
+        normalized = f"e3 {normalized}"
+    return normalized
 
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("這個提醒開關不是你的操作介面。")
-            return
-        payload = await asyncio.to_thread(handle_e3_command, self.command_text, logger, _platform_user_key(self.user_id))
-        edited = False
+
+async def _run_command_from_view(interaction: discord.Interaction, bot: commands.Bot, user_id: int, command_text: str) -> None:
+    payload = await asyncio.to_thread(handle_e3_command, _normalize_command_text(command_text), logger, _platform_user_key(user_id))
+    edited = False
+    message = getattr(interaction, "message", None)
+    if message is not None:
         try:
-            edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
+            edited = await _edit_message_from_payload(message, payload, bot=bot, user_id=user_id)
+        except discord.NotFound:
+            logger.info("discord_interaction_message_missing user=%s command=%s", user_id, command_text)
         except discord.DiscordException:
-            logger.exception("discord_reminder_toggle_edit_failed user=%s", self.user_id)
-        if not interaction.response.is_done():
-            if edited:
-                await interaction.response.defer()
-            else:
-                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
-        elif not edited:
-            await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+            logger.exception("discord_interaction_command_edit_failed user=%s command=%s", user_id, command_text)
+    if not interaction.response.is_done():
+        if edited:
+            await interaction.response.defer()
+        else:
+            await _send_payload(interaction, payload, bot=bot, user_id=user_id)
+    elif not edited:
+        await _send_payload(interaction, payload, bot=bot, user_id=user_id)
 
 
-class ReminderTestButton(discord.ui.Button):
-    def __init__(self, bot: commands.Bot, user_id: int):
-        self.bot = bot
-        self.user_id = user_id
-        super().__init__(label="測試提醒", style=discord.ButtonStyle.secondary)
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("這個測試按鈕不是你的操作介面。")
-            return
-        internal_user_id = get_user_id(_platform_user_key(self.user_id))
-        if not internal_user_id:
-            await interaction.response.send_message("請先登入 E3，再測試提醒功能。")
-            return
-        await interaction.response.defer()
-        payloads = await asyncio.to_thread(build_test_reminder_payloads, internal_user_id)
-        for idx, payload in enumerate(payloads):
-            if idx == 0:
-                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
-            else:
-                await _send_payload(interaction.followup, payload, bot=self.bot, user_id=self.user_id)
+async def _run_uri_action_from_view(interaction: discord.Interaction, user_id: int, action: dict[str, str], desc: str, selected_label: str) -> None:
+    await interaction.response.defer(thinking=True)
+    file_obj, error_text = await asyncio.to_thread(_download_discord_attachment, user_id, action, selected_label)
+    if file_obj is not None:
+        embed = discord.Embed(title=selected_label, description="已直接從 E3 傳送到 Discord。", color=discord.Color.blurple())
+        await interaction.followup.send(embed=embed, file=file_obj)
+        return
+    embed = discord.Embed(
+        title=selected_label,
+        description=error_text or desc or "請用下方按鈕開啟選取的檔案。",
+        color=discord.Color.blurple(),
+    )
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label=(action.get("label") or "開啟")[:80], url=action.get("value") or "https://discord.com"))
+    await interaction.followup.send(embed=embed, view=view)
 
 
-class ReminderScheduleSelect(discord.ui.Select):
-    def __init__(self, bot: commands.Bot, user_id: int, schedule: list[str]):
-        self.bot = bot
-        self.user_id = user_id
-        normalized = list(schedule or [])
-        options = []
-        for label, description, slots in _SCHEDULE_PRESETS:
-            options.append(
-                discord.SelectOption(
-                    label=label,
-                    description=description,
-                    value="|".join(slots),
-                    default=normalized == slots,
-                )
-            )
-        super().__init__(placeholder="調整提醒時段", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("這個提醒設定不是你的操作介面。")
-            return
-        slots = [slot for slot in str(self.values[0]).split("|") if slot]
-        command_text = _schedule_command_for_slots(slots)
-        payload = await asyncio.to_thread(handle_e3_command, command_text, logger, _platform_user_key(self.user_id))
-        edited = False
-        try:
-            edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
-        except discord.DiscordException:
-            logger.exception("discord_reminder_schedule_edit_failed user=%s command=%s", self.user_id, command_text)
-        if not interaction.response.is_done():
-            if edited:
-                await interaction.response.defer()
-            else:
-                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
-        elif not edited:
-            await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+async def _run_test_reminder_from_view(interaction: discord.Interaction, bot: commands.Bot, user_id: int) -> None:
+    internal_user_id = get_user_id(_platform_user_key(user_id))
+    if not internal_user_id:
+        await interaction.response.send_message("請先登入 E3，再測試提醒功能。")
+        return
+    await interaction.response.defer()
+    payloads = await asyncio.to_thread(build_test_reminder_payloads, internal_user_id)
+    for idx, payload in enumerate(payloads):
+        if idx == 0:
+            await _send_payload(interaction, payload, bot=bot, user_id=user_id)
+        else:
+            await _send_payload(interaction.followup, payload, bot=bot, user_id=user_id)
 
 
-class ReminderToggleView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, user_id: int, enabled: bool, schedule: list[str] | None = None, timeout: float = 600):
-        super().__init__(timeout=timeout)
-        self.add_item(ReminderToggleButton(bot, user_id, enabled))
-        self.add_item(ReminderTestButton(bot, user_id))
-        self.add_item(ReminderScheduleSelect(bot, user_id, schedule or ["09:00", "21:00"]))
+async def _run_login_modal_submit(interaction: discord.Interaction, bot: commands.Bot, account: str, password: str) -> None:
+    await _remember_interaction_target(interaction)
+    await interaction.response.defer(thinking=True)
+    await _execute_e3_payload(interaction, f"login {account} {password}", interaction.user.id, bot=bot)
 
 
-class CommandButtonView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, user_id: int, actions: list[dict[str, str]], timeout: float = 600):
-        super().__init__(timeout=timeout)
-        self.bot = bot
-        self.user_id = user_id
-        for action in actions[:5]:
-            kind = action.get("kind")
-            label = action.get("label") or "開啟"
-            if kind == "uri":
-                self.add_item(discord.ui.Button(label=label[:80], url=action.get("value") or "https://discord.com"))
-            elif kind == "message":
-                self.add_item(_MessageCommandButton(bot, user_id, label[:80], action.get("value") or ""))
-
-
-class _MessageCommandButton(discord.ui.Button):
-    def __init__(self, bot: commands.Bot, user_id: int, label: str, command_text: str):
-        super().__init__(label=label, style=discord.ButtonStyle.primary)
-        self.bot = bot
-        self.user_id = user_id
-        self.command_text = command_text
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("這個按鈕不是你的操作介面。")
-            return
-        payload = await asyncio.to_thread(handle_e3_command, f"e3 {self.command_text.strip()}" if not self.command_text.strip().lower().startswith("e3") else self.command_text.strip(), logger, _platform_user_key(self.user_id))
-        edited = False
-        try:
-            edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
-        except discord.DiscordException:
-            logger.exception("discord_message_button_edit_failed user=%s command=%s", self.user_id, self.command_text)
-        if not interaction.response.is_done():
-            if edited:
-                await interaction.response.defer()
-            else:
-                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
-        elif not edited:
-            await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
+def _view_callbacks(bot: commands.Bot) -> DiscordViewCallbacks:
+    return DiscordViewCallbacks(
+        run_command=lambda interaction, user_id, command_text: _run_command_from_view(interaction, bot, user_id, command_text),
+        run_uri_action=lambda interaction, user_id, action, desc, selected_label: _run_uri_action_from_view(interaction, user_id, action, desc, selected_label),
+        run_test_reminder=lambda interaction, user_id: _run_test_reminder_from_view(interaction, bot, user_id),
+        run_login_modal=lambda interaction, account, password: _run_login_modal_submit(interaction, bot, account, password),
+        schedule_command_for_slots=_schedule_command_for_slots,
+    )
 
 
 def _primary_action(actions: list[dict[str, str]]) -> dict[str, str] | None:
@@ -315,77 +241,6 @@ def _download_discord_attachment(user_id: int, action: dict[str, str], fallback_
     return discord.File(io.BytesIO(data), filename=filename), None
 
 
-class _CommandSelect(discord.ui.Select):
-    def __init__(self, bot: commands.Bot, user_id: int, entries: list[tuple[str, str, dict[str, str]]]):
-        self.entries = entries[:MAX_SELECT_OPTIONS]
-        options = [
-            discord.SelectOption(label=label[:100], description=(desc[:100] if desc else None), value=str(idx))
-            for idx, (label, desc, _) in enumerate(self.entries)
-        ]
-        super().__init__(placeholder="選擇一個項目", min_values=1, max_values=1, options=options)
-        self.bot = bot
-        self.user_id = user_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("這個下拉選單不是你的操作介面。")
-            return
-        _, desc, action = self.entries[int(self.values[0])]
-        if action.get("kind") == "message":
-            payload = await asyncio.to_thread(handle_e3_command, action.get("value") or "", logger, _platform_user_key(self.user_id))
-            edited = False
-            try:
-                edited = await _edit_message_from_payload(interaction.message, payload, bot=self.bot, user_id=self.user_id)
-            except discord.NotFound:
-                logger.info("discord_selector_message_missing user=%s command=%s", self.user_id, action.get("value") or "")
-            except discord.DiscordException:
-                logger.exception("discord_selector_edit_failed user=%s command=%s", self.user_id, action.get("value") or "")
-            if not interaction.response.is_done():
-                if edited:
-                    await interaction.response.defer()
-                else:
-                    await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
-            elif not edited:
-                await _send_payload(interaction, payload, bot=self.bot, user_id=self.user_id)
-            return
-        await interaction.response.defer(thinking=True)
-        if action.get("kind") == "uri":
-            selected_label = self.entries[int(self.values[0])][0] or action.get("label") or "開啟檔案"
-            file_obj, error_text = await asyncio.to_thread(_download_discord_attachment, self.user_id, action, selected_label)
-            if file_obj is not None:
-                embed = discord.Embed(title=selected_label, description='已直接從 E3 傳送到 Discord。', color=discord.Color.blurple())
-                await interaction.followup.send(embed=embed, file=file_obj)
-                return
-            embed = discord.Embed(title=selected_label, description=error_text or desc or '請用下方按鈕開啟選取的檔案。', color=discord.Color.blurple())
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label=(action.get("label") or "開啟")[:80], url=action.get("value") or "https://discord.com"))
-            await interaction.followup.send(embed=embed, view=view)
-
-
-class CommandSelectView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, user_id: int, entries: list[tuple[str, str, dict[str, str]]], timeout: float = 600):
-        super().__init__(timeout=timeout)
-        self.add_item(_CommandSelect(bot, user_id, entries))
-
-
-class E3LoginModal(discord.ui.Modal, title="E3 登入"):
-    account = discord.ui.TextInput(label="帳號", placeholder="請輸入 E3 帳號", max_length=128)
-    password = discord.ui.TextInput(
-        label="密碼",
-        placeholder="請輸入 E3 密碼",
-        style=discord.TextStyle.short,
-        max_length=128,
-    )
-
-    def __init__(self, bot: commands.Bot):
-        super().__init__()
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await _remember_interaction_target(interaction)
-        await interaction.response.defer(thinking=True)
-        command = f"login {self.account.value.strip()} {self.password.value.strip()}"
-        await _execute_e3_payload(interaction, command, interaction.user.id, bot=self.bot)
 
 
 def _extract_embeds_and_views(bot: commands.Bot, payload: Any, user_id: int) -> list[tuple[discord.Embed | None, list[dict[str, str]], str | None]]:
@@ -455,7 +310,7 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
             for idx, (label, desc, action) in enumerate(selector_entries[:MAX_SELECT_OPTIONS], start=1):
                 value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
                 summary.add_field(name=f'{display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
-        await message.edit(content=content, embeds=[summary], view=CommandSelectView(bot, user_id, selector_entries))
+        await message.edit(content=content, embeds=[summary], view=CommandSelectView(_view_callbacks(bot), user_id, selector_entries))
         return True
 
     view = _build_preferred_view(bot, user_id, embeds[0], actions)
@@ -468,8 +323,8 @@ async def _edit_message_from_payload(message: discord.Message, payload: Any, *, 
 
 def _build_preferred_view(bot: commands.Bot, user_id: int, embed: discord.Embed | None, actions: list[dict[str, str]]) -> discord.ui.View | None:
     if _is_reminder_actions(actions):
-        return ReminderToggleView(bot, user_id, _reminder_enabled_from_embed(embed), _reminder_schedule_from_embed(embed))
-    return CommandButtonView(bot, user_id, actions[:5]) if actions else None
+        return ReminderToggleView(_view_callbacks(bot), user_id, _reminder_enabled_from_embed(embed), _reminder_schedule_from_embed(embed))
+    return CommandButtonView(_view_callbacks(bot), user_id, actions[:5]) if actions else None
 
 
 async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int, ephemeral: bool = False) -> None:
@@ -525,7 +380,7 @@ async def _send_payload(target, payload: Any, *, bot: commands.Bot, user_id: int
             for idx, (label, desc, action) in enumerate(preview_entries, start=1):
                 value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
                 summary.add_field(name=f'{display_index_emoji(idx)} {label[:100]}', value=value, inline=False)
-        await _send_with(target, embeds=[summary], view=CommandSelectView(bot, user_id, entries))
+        await _send_with(target, embeds=[summary], view=CommandSelectView(_view_callbacks(bot), user_id, entries))
         sent_any = True
 
     selector_candidates: list[tuple[discord.Embed, list[dict[str, str]]]] = []
@@ -665,73 +520,15 @@ def _is_owner_check():
 
     return app_commands.check(predicate)
 
-
-def _cached_course_choices(discord_user_id: int) -> list[tuple[str, str]]:
-    user_key = _platform_user_key(discord_user_id)
-    try:
-        courses = fetch_courses(user_key)
-    except Exception:
-        logger.exception("discord_course_autocomplete_failed user=%s", discord_user_id)
-        return []
-
-    rows: list[tuple[str, str]] = []
-    for display_name, payload in (courses or {}).items():
-        if not isinstance(payload, dict):
-            continue
-        course_name = str(display_name or "").strip()
-        course_id = str(payload.get("_course_id") or "").strip()
-        if not course_name and not course_id:
-            continue
-        label = f"{course_id} {course_name}".strip()[:100]
-        value = course_id or course_name
-        if value:
-            rows.append((label, value[:100]))
-
-    rows.sort(key=lambda row: row[0].lower())
-    deduped: list[tuple[str, str]] = []
-    seen_values: set[str] = set()
-    for label, value in rows:
-        if value in seen_values:
-            continue
-        seen_values.add(value)
-        deduped.append((label, value))
-    return deduped[:25]
-
-
 async def _autocomplete_course_files(
     interaction: discord.Interaction,
     current: str,
 ) -> list[app_commands.Choice[str]]:
-    current_lower = str(current or "").strip().lower()
-    choices = []
-    for label, value in _cached_course_choices(interaction.user.id):
-        haystack = f"{label} {value}".lower()
-        if current_lower and current_lower not in haystack:
-            continue
-        choices.append(app_commands.Choice(name=label, value=value))
-    return choices[:25]
-
-
-def _build_help_text(prefix: str) -> str:
-    return (
-        "🤖 XE3 Discord 助手\n"
-        "──────────\n"
-        "📚 E3\n"
-        f"• /e3 login\n"
-        f"• /e3 relogin\n"
-        f"• /e3 course\n"
-        f"• /e3 timeline\n"
-        f"• /e3 grades\n"
-        f"• /e3 files\n"
-        f"• /e3 remind\n"
-        "──────────\n"
-        "🌦️ 工具\n"
-        f"• {prefix}weather <城市>\n"
-        f"• {prefix}chksys\n"
-        "──────────\n"
-        "🧰 備用前綴指令\n"
-        f"• {prefix}e3 help\n"
-        f"• {prefix}e3 login <帳號> <密碼>"
+    return await autocomplete_course_files(
+        interaction,
+        current,
+        user_key_builder=_platform_user_key,
+        logger=logger,
     )
 
 
@@ -757,11 +554,11 @@ def _create_bot() -> commands.Bot:
 
     @bot.command(name="homevault")
     async def homevault(ctx: commands.Context):
-        await _send_text_chunks(ctx, _build_help_text(str(bot.command_prefix)))
+        await _send_text_chunks(ctx, build_help_text(str(bot.command_prefix)))
 
     @bot.command(name="help")
     async def help_command(ctx: commands.Context):
-        await _send_text_chunks(ctx, _build_help_text(str(bot.command_prefix)))
+        await _send_text_chunks(ctx, build_help_text(str(bot.command_prefix)))
 
     @bot.command(name="weather")
     async def weather(ctx: commands.Context, *, city: str = ""):
@@ -799,12 +596,12 @@ def _create_bot() -> commands.Bot:
     @e3_group.command(name="help", description="顯示 E3 說明")
     async def e3_help(interaction: discord.Interaction):
         await _remember_interaction_target(interaction)
-        await interaction.response.send_message(_build_help_text(str(bot.command_prefix)))
+        await interaction.response.send_message(build_help_text(str(bot.command_prefix)))
 
     @e3_group.command(name="login", description="開啟 E3 登入視窗")
     async def e3_login(interaction: discord.Interaction):
         await _remember_interaction_target(interaction)
-        await interaction.response.send_modal(E3LoginModal(bot))
+        await interaction.response.send_modal(E3LoginModal(_view_callbacks(bot)))
 
     @e3_group.command(name="relogin", description="重新整理你的 E3 工作階段")
     async def e3_relogin(interaction: discord.Interaction):
