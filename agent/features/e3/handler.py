@@ -19,6 +19,7 @@ from .common import (
     is_assignment_completed as _is_assignment_completed,
     is_discord_user_key as _is_discord_user_key,
     matches_course_keyword as _matches_course_keyword,
+    normalize_due_at as _normalize_due_at,
     parse_due_at_sort_key as _parse_due_at_sort_key,
     shorten_course_name as _shorten_course_name,
     shorten_title as _shorten_title,
@@ -121,6 +122,8 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
                 f"• {_discord_command_hint('e3 relogin', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 logout', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 course', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 today', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 week', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 grades', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 files <課名關鍵字>', line_user_id)}\n"
                 "──────────\n"
@@ -139,13 +142,15 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
             "2) e3 relogin / e3 refresh\n"
             "3) e3 logout\n"
             "4) e3 課程 / e3 course\n"
-            "5) e3 近期 [作業/行事曆/考試]\n"
-            "6) e3 timeline / e3 行事曆 [作業/行事曆/考試]\n"
-            "7) e3 詳情 <編號>\n"
-            "8) e3 狀態\n"
-            "9) e3 grades / e3 成績\n"
-            "10) e3 files <課名關鍵字>\n"
-            "11) e3 remind show/on/off/schedule both|morning|evening\n"
+            "5) e3 today / e3 今日\n"
+            "6) e3 week / e3 本週\n"
+            "7) e3 近期 [作業/行事曆/考試]\n"
+            "8) e3 timeline / e3 行事曆 [作業/行事曆/考試]\n"
+            "9) e3 詳情 <編號>\n"
+            "10) e3 狀態\n"
+            "11) e3 grades / e3 成績\n"
+            "12) e3 files <課名關鍵字>\n"
+            "13) e3 remind show/on/off/schedule both|morning|evening\n"
             "說明：課程指令會顯示目前學期（例如 114上 / 114下）"
         )
 
@@ -199,6 +204,12 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
 
     if action_head == "考試":
         return _upcoming(["upcoming", "考試"], line_user_id)
+
+    if action_head == "今日" or verb == "today":
+        return _today(line_user_id, logger)
+
+    if action_head == "本週" or verb == "week":
+        return _week(line_user_id, logger)
 
     if action_head == "近期" or verb == "upcoming":
         return _upcoming(tokens, line_user_id)
@@ -1443,6 +1454,70 @@ def _build_reminder_settings_flex(enabled, schedule, alt_text):
     }
 
 
+def _build_text_summary_flex(title, text, *, color="#2563EB", alt_text=None):
+    lines = [line.rstrip() for line in str(text or "").splitlines()]
+    if lines and lines[0].strip() == title.strip():
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+    body_contents = []
+    for line in lines:
+        if not line.strip():
+            body_contents.append({"type": "separator", "margin": "md"})
+            continue
+        body_contents.append(
+            {
+                "type": "text",
+                "text": line,
+                "size": "sm",
+                "wrap": True,
+                "color": "#0F172A",
+            }
+        )
+
+    if not body_contents:
+        body_contents = [
+            {
+                "type": "text",
+                "text": "目前沒有更多內容。",
+                "size": "sm",
+                "wrap": True,
+                "color": "#475569",
+            }
+        ]
+
+    return {
+        "type": "flex",
+        "altText": alt_text or text,
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": color,
+                "paddingAll": "12px",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": title,
+                        "color": "#FFFFFF",
+                        "weight": "bold",
+                        "size": "lg",
+                    },
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": body_contents,
+            },
+        },
+    }
+
+
 def _collect_course_calendar_events(snapshot, course_id):
     items = []
     for event in snapshot.get("calendar_events") or []:
@@ -1740,13 +1815,13 @@ def _filter_rows_by_event_type(rows, event_type):
     return [row for row in rows if row["event_type"] == event_type]
 
 
-def _build_timeline_messages(rows, header, event_type=None, line_user_id=None):
+def _build_timeline_messages(rows, header, event_type=None, line_user_id=None, use_triage=None):
     filtered_rows = _filter_rows_by_event_type(rows, event_type)
     if not filtered_rows:
         return None, [], []
 
     filtered_rows = _timeline_rows_sorted(filtered_rows)
-    use_triage = event_type is None
+    use_triage = (event_type is None) if use_triage is None else bool(use_triage)
     ordered_groups = _build_timeline_urgency_groups(filtered_rows) if use_triage else _build_timeline_display_groups(filtered_rows)
     text_sections = []
     messages = []
@@ -2469,6 +2544,183 @@ def _upcoming(tokens, line_user_id):
     return _line_response(text, messages=messages or None)
 
 
+def _sync_timeline_snapshot_for_user(user_id, line_user_id, logger):
+    try:
+        snapshot = fetch_timeline_snapshot(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_timeline_snapshot_fetch_failed error=%s", exc)
+        return None, {}
+
+    if snapshot:
+        _sync_events_for_user(
+            user_id,
+            snapshot.get("courses") or {},
+            calendar_events=snapshot.get("calendar_events") or [],
+        )
+
+    try:
+        courses = (snapshot or {}).get("courses") or fetch_courses(make_user_key(line_user_id))
+    except Exception:
+        courses = {}
+    return snapshot, courses
+
+
+def _load_timeline_rows(user_id, line_user_id, logger, *, limit=50):
+    snapshot, courses = _sync_timeline_snapshot_for_user(user_id, line_user_id, logger)
+    rows = get_timeline_events(user_id, limit=limit)
+    rows = _filter_active_homework_rows(rows, courses)
+    return snapshot, courses, rows
+
+
+def _rows_due_between(rows, start_dt, end_dt):
+    filtered = []
+    for row in rows:
+        due_dt = _parse_due_at_sort_key(row["due_at"])
+        if start_dt <= due_dt <= end_dt:
+            filtered.append(row)
+    return filtered
+
+
+def _week_date_heading(value):
+    dt = _normalize_due_at(value)
+    if dt is None:
+        return "未指定日期"
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    return f"{weekdays[dt.weekday()]} {dt.month}/{dt.day}"
+
+
+def _build_week_messages(rows, line_user_id=None):
+    ordered_rows = _timeline_rows_sorted(rows)
+    if not ordered_rows:
+        return None
+
+    grouped = []
+    current_key = None
+    current_items = []
+    for row in ordered_rows:
+        dt = _normalize_due_at(row["due_at"])
+        date_key = dt.date().isoformat() if dt else str(row["due_at"] or "")
+        if date_key != current_key:
+            if current_items:
+                grouped.append((current_key, current_items))
+            current_key = date_key
+            current_items = [row]
+        else:
+            current_items.append(row)
+    if current_items:
+        grouped.append((current_key, current_items))
+
+    sections = ["📅 **本週重點**", ""]
+    for _date_key, items in grouped:
+        heading = _week_date_heading(items[0]["due_at"])
+        sections.extend(["━━━━━━━━━━━━", heading, "━━━━━━━━━━━━", ""])
+        for row in items:
+            payload = _event_payload(row)
+            course_name = _course_name_for_display(row["course_name"] or row["course_id"] or "-")
+            title = _event_title_for_display(row, payload)
+            if row["event_type"] == "homework":
+                icon = "📝"
+            elif row["event_type"] == "exam":
+                icon = "🧪"
+            else:
+                icon = "🗓️"
+            sections.append(f"{icon} **{course_name}**")
+            sections.append(f"• {title}")
+            sections.append(f"• 截止：{_format_due_at_full(row['due_at'], line_user_id)}")
+            sections.append("")
+
+    while sections and sections[-1] == "":
+        sections.pop()
+    return "\n".join(sections)
+
+
+def _today(line_user_id, logger):
+    user_id, err = _require_line_user(line_user_id)
+    if err:
+        return err
+
+    cache_status = get_cache_status(make_user_key(line_user_id))
+    _snapshot, _courses, rows = _load_timeline_rows(user_id, line_user_id, logger, limit=50)
+    if not rows:
+        if _is_discord_user_key(line_user_id):
+            text = f"🗓️ 目前還沒有可用的事件資料，先試試 {_discord_command_hint('e3 login', line_user_id)} 或 {_discord_command_hint('e3 relogin', line_user_id)}。"
+            return _line_response(text, messages=[_build_text_summary_flex("今天重點", text, color="#0F766E", alt_text=text)])
+        return "目前沒有可用事件資料，請先 `e3 login` 或 `e3 relogin`。"
+
+    taipei_tz = timezone(timedelta(hours=8))
+    now_local = datetime.now(taipei_tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = now_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+    rows = _rows_due_between(
+        rows,
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+    )
+
+    if not rows:
+        if _is_discord_user_key(line_user_id):
+            text = "🗓️ 今天暫時沒有作業、考試或課程事件。"
+            return _line_response(text, messages=[_build_text_summary_flex("今天重點", text, color="#0F766E", alt_text=text)])
+        return "今天暫時沒有作業、考試或課程事件。"
+
+    text, messages, ordered_groups = _build_timeline_messages(
+        rows,
+        "🗓️ **今天重點**" if _is_discord_user_key(line_user_id) else "🗓️ 今日重點：",
+        line_user_id=line_user_id,
+        use_triage=False,
+    )
+    if not text:
+        if _is_discord_user_key(line_user_id):
+            text = "🗓️ 今天暫時沒有作業、考試或課程事件。"
+            return _line_response(text, messages=[_build_text_summary_flex("今天重點", text, color="#0F766E", alt_text=text)])
+        return "今天暫時沒有作業、考試或課程事件。"
+    text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
+    summary_flex = _build_text_summary_flex("今天重點", text, color="#0F766E", alt_text=text)
+    messages = ([summary_flex] if summary_flex else []) + [item for item in [_build_cache_status_flex(cache_status, "今日事件快取")] if item] + (messages or [])
+    _store_last_event_index(line_user_id, ordered_groups)
+    return _line_response(text, messages=messages or None)
+
+
+def _week(line_user_id, logger):
+    user_id, err = _require_line_user(line_user_id)
+    if err:
+        return err
+
+    cache_status = get_cache_status(make_user_key(line_user_id))
+    _snapshot, _courses, rows = _load_timeline_rows(user_id, line_user_id, logger, limit=80)
+    if not rows:
+        if _is_discord_user_key(line_user_id):
+            text = f"📅 目前還沒有可用的事件資料，先試試 {_discord_command_hint('e3 login', line_user_id)} 或 {_discord_command_hint('e3 relogin', line_user_id)}。"
+            return _line_response(text, messages=[_build_text_summary_flex("本週重點", text, color="#1D4ED8", alt_text=text)])
+        return "目前沒有可用事件資料，請先 `e3 login` 或 `e3 relogin`。"
+
+    taipei_tz = timezone(timedelta(hours=8))
+    now_local = datetime.now(taipei_tz)
+    end_local = now_local + timedelta(days=7)
+    rows = _rows_due_between(
+        rows,
+        now_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+    )
+
+    if not rows:
+        if _is_discord_user_key(line_user_id):
+            text = "📅 未來 7 天暫時沒有作業、考試或課程事件。"
+            return _line_response(text, messages=[_build_text_summary_flex("本週重點", text, color="#1D4ED8", alt_text=text)])
+        return "未來 7 天暫時沒有作業、考試或課程事件。"
+
+    text = _build_week_messages(rows, line_user_id if _is_discord_user_key(line_user_id) else None)
+    if not text:
+        if _is_discord_user_key(line_user_id):
+            text = "📅 未來 7 天暫時沒有作業、考試或課程事件。"
+            return _line_response(text, messages=[_build_text_summary_flex("本週重點", text, color="#1D4ED8", alt_text=text)])
+        return "未來 7 天暫時沒有作業、考試或課程事件。"
+    text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
+    summary_flex = _build_text_summary_flex("本週重點", text, color="#1D4ED8", alt_text=text)
+    messages = ([summary_flex] if summary_flex else []) + [item for item in [_build_cache_status_flex(cache_status, "本週事件快取")] if item]
+    return _line_response(text, messages=messages or None)
+
+
 def _timeline(tokens, line_user_id, logger):
     user_id, err = _require_line_user(line_user_id)
     if err:
@@ -2478,29 +2730,10 @@ def _timeline(tokens, line_user_id, logger):
     if filter_error:
         return f"⚠️ {filter_error}"
 
-    try:
-        snapshot = fetch_timeline_snapshot(make_user_key(line_user_id))
-    except Exception as exc:
-        logger.error("e3_timeline_fetch_failed error=%s", exc)
-        snapshot = None
-
-    if snapshot:
-        _sync_events_for_user(
-            user_id,
-            snapshot.get("courses") or {},
-            calendar_events=snapshot.get("calendar_events") or [],
-        )
-
     cache_status = get_cache_status(make_user_key(line_user_id))
-
-    rows = get_timeline_events(user_id, limit=20)
+    _snapshot, _courses, rows = _load_timeline_rows(user_id, line_user_id, logger, limit=50)
     if not rows:
         return _discord_empty_state(f"目前還沒有可用的時間軸資料，先試試 {_discord_command_hint('e3 login', line_user_id)} 或 {_discord_command_hint('e3 relogin', line_user_id)}。", line_user_id, emoji="🗓️") if _is_discord_user_key(line_user_id) else "目前沒有可用時間軸事件，請先 `e3 login` 或 `e3 relogin`。"
-    try:
-        courses = (snapshot or {}).get("courses") or fetch_courses(make_user_key(line_user_id))
-    except Exception:
-        courses = {}
-    rows = _filter_active_homework_rows(rows, courses)
     rows = _filter_rows_within_days(rows, 30)
     text, messages, ordered_groups = _build_timeline_messages(
         rows,

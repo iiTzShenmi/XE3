@@ -359,6 +359,18 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, "course", interaction.user.id, bot=bot)
 
+    @e3_group.command(name="today", description="顯示今天的作業、考試與課程事件")
+    async def e3_today(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
+        await interaction.response.defer(thinking=True)
+        await _execute_e3_payload(interaction, "today", interaction.user.id, bot=bot)
+
+    @e3_group.command(name="week", description="顯示未來 7 天的作業、考試與課程事件")
+    async def e3_week(interaction: discord.Interaction):
+        await _remember_interaction_target(interaction)
+        await interaction.response.defer(thinking=True)
+        await _execute_e3_payload(interaction, "week", interaction.user.id, bot=bot)
+
     @e3_group.command(name="timeline", description="顯示近期作業與考試")
     @app_commands.describe(kind="可選：只看作業或只看考試")
     @app_commands.choices(kind=[
