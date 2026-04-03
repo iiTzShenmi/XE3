@@ -23,6 +23,8 @@
 | 2026-03-25 | `d691dd9` | 統一 Discord 回應方式、重整課程摘要與提醒 embed |
 | 2026-03-25 | `dda738d` | 細修 Discord selector summary 與課程摘要可讀性 |
 | 2026-03-25 | `ce0d2d3` | 清理本地快取並拆分 Discord / E3 顯示模組 |
+| 2026-04-03 | `970c4f7` | 重構 E3 / Discord payload rendering 與工程規則 |
+| 2026-04-03 | `bf103f7` | 拆分 reminder worker / payload 模組 |
 
 ## Milestones
 
@@ -77,6 +79,19 @@
 - 把 Discord selector / embed summary helper 抽成 `agent/platforms/discord/rendering.py`
 - 把課程摘要 / 課程詳情的 Flex card builder 抽成 `agent/features/e3/course_cards.py`
 - 讓 `bot.py` / `handler.py` 更專注在流程，而不是同時塞滿顯示細節
+
+### 10. 架構重構與維護規則
+- 新增 `docs/ENGINEERING_RULES.md`，把後續重構與 review 規則寫下來
+- 把 E3 共用邏輯拆成：
+  - `common.py`
+  - `file_catalog.py`
+  - `course_runtime.py`
+  - `payloads.py`
+- 把 Discord 訊息解析 / 文字分塊 helper 抽成 `agent/platforms/discord/message_utils.py`
+- selector / dropdown 摘要開始優先使用 `xe3_meta` 結構化 metadata，而不是猜字串
+- `reminders.py` 改成 façade，實際拆成：
+  - `reminder_payloads.py`
+  - `reminder_worker.py`
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
