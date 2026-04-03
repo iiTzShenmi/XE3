@@ -26,6 +26,7 @@
 | 2026-04-03 | `970c4f7` | 重構 E3 / Discord payload rendering 與工程規則 |
 | 2026-04-03 | `bf103f7` | 拆分 reminder worker / payload 模組 |
 | 2026-04-03 | `190f1e0` | 第二輪拆分 Discord views / command helpers |
+| 2026-04-03 | `27f931e` | 拆分 Discord delivery / sender 與 E3 timeline/file 顯示模組 |
 
 ## Milestones
 
@@ -99,6 +100,18 @@
 - 把 autocomplete / help text 輔助抽成 `agent/platforms/discord/command_helpers.py`
 - `bot.py` 現在更集中在 startup、command wiring 與核心流程
 - 在 `ENGINEERING_RULES.md` 補上「拆 helper 時要同輪完成 wiring / 清掉 dead duplicate」這條關鍵提醒
+
+
+### 12. 第三輪模組拆分
+- 把 Discord 檔案下載與 payload 傳送邏輯拆成：
+  - `agent/platforms/discord/file_delivery.py`
+  - `agent/platforms/discord/payload_sender.py`
+- `bot.py` 進一步縮小，只保留 startup / command wiring / 薄 wrapper
+- 把 E3 timeline / file 顯示 helper 拆成：
+  - `agent/features/e3/timeline_views.py`
+  - `agent/features/e3/file_views.py`
+- `handler.py` 清掉一批 duplicate common helper，改成直接依賴共享模組
+- 在 `ENGINEERING_RULES.md` 補上「不要複製既有 common helper」這條提醒
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
