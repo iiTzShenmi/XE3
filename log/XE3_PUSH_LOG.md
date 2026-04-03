@@ -28,6 +28,7 @@
 | 2026-04-03 | `190f1e0` | 第二輪拆分 Discord views / command helpers |
 | 2026-04-03 | `27f931e` | 拆分 Discord delivery / sender 與 E3 timeline/file 顯示模組 |
 | 2026-04-03 | `3f503e1` | 修正 Discord `/e3 files` autocomplete key 對齊，補一輪 smoke test |
+| 2026-04-03 | `0d119ba` | 改善 Discord selector 版型、成績選課流程與考試去重 |
 
 ## Milestones
 
@@ -120,6 +121,15 @@
   - `CommandSelectView`
   - `CommandButtonView`
   - `ReminderToggleView`
+
+### 13. Discord UI 細修與成績流程整理
+- `/e3 timeline` 的 selector summary 改成 description-style 排版：
+  - `━━━━━━━━━━━━`
+  - `🟠 作業 / 🔴 考試 / 🟢 行事曆`
+  - 每筆項目用固定三行版型顯示
+- `/e3 grades` 不再直接 dump 全部成績，改成先顯示「課程成績」dropdown，再進入單課成績詳情
+- homework / file / grouped selector summary 逐步對齊同一種乾淨、短、好掃描的排版
+- 課綱考試與 E3 calendar 考試加入跨來源 dedupe，避免同一天同類型考試重複出現
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
