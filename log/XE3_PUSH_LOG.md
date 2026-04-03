@@ -27,6 +27,7 @@
 | 2026-04-03 | `bf103f7` | 拆分 reminder worker / payload 模組 |
 | 2026-04-03 | `190f1e0` | 第二輪拆分 Discord views / command helpers |
 | 2026-04-03 | `27f931e` | 拆分 Discord delivery / sender 與 E3 timeline/file 顯示模組 |
+| 2026-04-03 | `3f503e1` | 修正 Discord `/e3 files` autocomplete key 對齊，補一輪 smoke test |
 
 ## Milestones
 
@@ -112,6 +113,13 @@
   - `agent/features/e3/file_views.py`
 - `handler.py` 清掉一批 duplicate common helper，改成直接依賴共享模組
 - 在 `ENGINEERING_RULES.md` 補上「不要複製既有 common helper」這條提醒
+
+- 補做一輪主要指令 smoke test，確認 `/e3 course`、`/e3 timeline`、`/e3 files`、`/e3 remind` 仍能產生有效 payload
+- 修正 Discord `/e3 files` autocomplete 直接拿 raw user key 導致選項為空的問題
+- 額外驗證 Discord payload sender 仍能組出：
+  - `CommandSelectView`
+  - `CommandButtonView`
+  - `ReminderToggleView`
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
