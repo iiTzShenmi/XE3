@@ -29,6 +29,7 @@
 | 2026-04-03 | `27f931e` | 拆分 Discord delivery / sender 與 E3 timeline/file 顯示模組 |
 | 2026-04-03 | `3f503e1` | 修正 Discord `/e3 files` autocomplete key 對齊，補一輪 smoke test |
 | 2026-04-03 | `0d119ba` | 改善 Discord selector 版型、成績選課流程與考試去重 |
+| 2026-04-03 | `TBD` | 新增 `/e3 today`、`/e3 week` 與 Phase 1 embed / 週視圖版型 |
 
 ## Milestones
 
@@ -130,6 +131,18 @@
 - `/e3 grades` 不再直接 dump 全部成績，改成先顯示「課程成績」dropdown，再進入單課成績詳情
 - homework / file / grouped selector summary 逐步對齊同一種乾淨、短、好掃描的排版
 - 課綱考試與 E3 calendar 考試加入跨來源 dedupe，避免同一天同類型考試重複出現
+
+### 14. Phase 1 便利功能：Today / Week
+- 新增 `/e3 today`
+  - 顯示今天的作業、考試與課程事件
+  - 空狀態也統一改成 embed / card 風格
+- 新增 `/e3 week`
+  - 顯示未來 7 天內事件
+  - 改成按日期分段，而不是單純事件流水
+- Discord slash command 與 help 文案同步補上：
+  - `/e3 today`
+  - `/e3 week`
+- Phase 1 新增功能統一走 embed/flex 顯示，和現有 Discord 回應保持一致
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
