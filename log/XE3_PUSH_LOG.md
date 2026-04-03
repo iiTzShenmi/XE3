@@ -25,6 +25,7 @@
 | 2026-03-25 | `ce0d2d3` | 清理本地快取並拆分 Discord / E3 顯示模組 |
 | 2026-04-03 | `970c4f7` | 重構 E3 / Discord payload rendering 與工程規則 |
 | 2026-04-03 | `bf103f7` | 拆分 reminder worker / payload 模組 |
+| 2026-04-03 | `190f1e0` | 第二輪拆分 Discord views / command helpers |
 
 ## Milestones
 
@@ -92,6 +93,12 @@
 - `reminders.py` 改成 façade，實際拆成：
   - `reminder_payloads.py`
   - `reminder_worker.py`
+
+### 11. 第二輪 Discord 維護性整理
+- 把 Discord button / select / modal 類別抽成 `agent/platforms/discord/views.py`
+- 把 autocomplete / help text 輔助抽成 `agent/platforms/discord/command_helpers.py`
+- `bot.py` 現在更集中在 startup、command wiring 與核心流程
+- 在 `ENGINEERING_RULES.md` 補上「拆 helper 時要同輪完成 wiring / 清掉 dead duplicate」這條關鍵提醒
 
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
