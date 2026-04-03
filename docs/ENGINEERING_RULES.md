@@ -6,6 +6,7 @@ It exists so we can re-review against the same baseline later instead of relying
 ## 0. Critical Reminder For Future Codex
 - If you extract helpers into a new module, finish the wiring in the same round.
 - Replace old call sites and remove dead duplicate helpers before you stop.
+- When a helper already exists in `common.py` or a dedicated module, import it instead of cloning a new local copy.
 - Before pushing, always do all three:
   1. `py_compile` for touched modules
   2. restart the relevant service
