@@ -19,6 +19,86 @@ _EMOJI_INDEX = {
     10: "🔟",
 }
 
+_SECTION_HEADINGS = {
+    "🟠 作業",
+    "🔴 考試提醒",
+    "🔴 考試",
+    "🟢 行事曆",
+    "📎 檔案",
+    "📎 教材",
+    "📎 教材 / 檔案",
+    "📤 已繳檔案",
+    "📎 老師附件",
+    "課綱重點",
+    "成績摘要",
+    "課綱考試提醒",
+    "⚙️ 快速操作",
+    "🧭 提醒節奏",
+    "你會收到什麼",
+    "作業",
+    "行事曆",
+    "檔案",
+    "教材",
+}
+
+
+def _normalize_heading(text: str) -> str:
+    cleaned = re.sub(r"[*`_]+", "", str(text or "")).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def is_section_heading(text: str) -> bool:
+    return _normalize_heading(text) in _SECTION_HEADINGS
+
+
+def section_divider(label: str) -> str:
+    clean = _normalize_heading(label)
+    return f"── {clean} ──"
+
+
+def strong_section_divider(label: str) -> str:
+    clean = _normalize_heading(label)
+    return f"━━━━━━━━━━━━\n{clean}\n━━━━━━━━━━━━"
+
+
+def format_discord_text(text: str) -> str:
+    raw_lines = [line.rstrip() for line in str(text or "").splitlines()]
+    if not raw_lines:
+        return ""
+
+    formatted: list[str] = []
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            if formatted and formatted[-1] != "":
+                formatted.append("")
+            continue
+        if is_section_heading(stripped):
+            while formatted and formatted[-1] == "":
+                formatted.pop()
+            if formatted:
+                formatted.append("")
+            formatted.append(section_divider(stripped))
+            formatted.append("")
+            continue
+        formatted.append(stripped)
+
+    while formatted and formatted[-1] == "":
+        formatted.pop()
+
+    compacted: list[str] = []
+    previous_blank = False
+    for line in formatted:
+        if line == "":
+            if not previous_blank:
+                compacted.append("")
+            previous_blank = True
+            continue
+        compacted.append(line)
+        previous_blank = False
+    return "\n".join(compacted).strip()
+
 
 def display_index_emoji(idx: int) -> str:
     return _EMOJI_INDEX.get(idx, f"{idx}.")
@@ -97,6 +177,7 @@ def bubble_description(bubble: dict[str, Any]) -> str:
         cleaned.append(line)
         previous_blank = False
     text = "\n".join(cleaned).strip()
+    text = format_discord_text(text)
     return text[:4000] if text else "沒有更多內容。"
 
 
@@ -276,21 +357,21 @@ def build_timeline_selector_summary(
     candidates: list[tuple[discord.Embed, list[dict[str, str]]]],
     entries: list[tuple[str, str, dict[str, str]]],
 ) -> discord.Embed | None:
-    parsed_rows: list[tuple[int, dict[str, str]]] = []
-    for idx, ((embed, actions), _entry) in enumerate(zip(candidates, entries), start=1):
+    parsed_rows: list[dict[str, str]] = []
+    for embed, actions in candidates:
         action = next((action for action in actions if action.get("kind") in {"message", "uri"} and action.get("value")), None)
         if not action:
             return None
         parsed = _parse_timeline_selector_candidate(embed, action)
         if not parsed:
             return None
-        parsed_rows.append((idx, parsed))
+        parsed_rows.append(parsed)
 
     if not parsed_rows:
         return None
 
     sections: dict[str, list[str]] = {"homework": [], "exam": [], "calendar": []}
-    for idx, parsed in parsed_rows:
+    for parsed in parsed_rows:
         if parsed["event_type"] == "homework":
             prefix = "📝 作業"
         elif parsed["event_type"] == "exam":
@@ -301,31 +382,52 @@ def build_timeline_selector_summary(
         sections[parsed["event_type"]].append(
             "\n".join(
                 [
-                    f"{display_index_emoji(idx)} **{parsed['title']}**",
+                    f"__INDEX__ **{parsed['title']}**",
                     f"{prefix}｜{parsed['course']}{relative}",
                     f"🗓️ **{parsed['due_full']}**",
                 ]
             )
         )
 
-    summary = discord.Embed(
-        title="選擇作業詳情",
-        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
-        color=discord.Color.blurple(),
-    )
-    summary.add_field(
-        name="🟠 作業",
-        value="\n\n".join(sections["homework"]) if sections["homework"] else "🎉 目前沒有未完成作業",
-        inline=False,
-    )
-    summary.add_field(
-        name="🔴 考試",
-        value="\n\n".join(sections["exam"]) if sections["exam"] else "🎉 目前沒有近期考試",
-        inline=False,
+    ordered_section_keys = ["homework", "exam", "calendar"]
+    display_counter = 1
+
+    def _renumber(lines: list[str]) -> list[str]:
+        nonlocal display_counter
+        numbered: list[str] = []
+        for block in lines:
+            numbered.append(block.replace("__INDEX__", display_index_emoji(display_counter), 1))
+            display_counter += 1
+        return numbered
+
+    body_lines = ["請從下方下拉選單挑一個，我會直接幫你打開，不洗版。", ""]
+
+    body_lines.extend(
+        [
+            strong_section_divider("🟠 作業"),
+            "",
+            "\n\n".join(_renumber(sections["homework"])) if sections["homework"] else "🎉 目前沒有未完成作業",
+            "",
+            strong_section_divider("🔴 考試"),
+            "",
+            "\n\n".join(_renumber(sections["exam"])) if sections["exam"] else "🎉 目前沒有近期考試",
+        ]
     )
     if sections["calendar"]:
-        summary.add_field(name="🟢 行事曆", value="\n\n".join(sections["calendar"]), inline=False)
-    return summary
+        body_lines.extend(
+            [
+                "",
+                strong_section_divider("🟢 行事曆"),
+                "",
+                "\n\n".join(_renumber(sections["calendar"])),
+            ]
+        )
+
+    return discord.Embed(
+        title="選擇作業詳情",
+        description="\n".join(body_lines).strip(),
+        color=discord.Color.blurple(),
+    )
 
 
 def build_file_selector_summary(
@@ -352,18 +454,20 @@ def build_file_selector_summary(
         else:
             other_lines.append(line)
 
-    summary = discord.Embed(
+    sections: list[str] = ["請從下方下拉選單挑一個，我會直接幫你打開，不洗版。"]
+    if teacher_lines:
+        sections.extend(["", strong_section_divider("📎 老師附件"), "", "\n".join(teacher_lines)])
+    if submitted_lines:
+        sections.extend(["", strong_section_divider("📤 你的提交"), "", "\n".join(submitted_lines)])
+    if other_lines:
+        sections.extend(["", strong_section_divider("📎 檔案"), "", "\n".join(other_lines)])
+    if len(sections) == 1:
+        return None
+    return discord.Embed(
         title="選擇檔案",
-        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
+        description="\n".join(sections).strip(),
         color=discord.Color.blurple(),
     )
-    if teacher_lines:
-        summary.add_field(name="📎 老師附件", value="\n".join(teacher_lines), inline=False)
-    if submitted_lines:
-        summary.add_field(name="📤 你的提交", value="\n".join(submitted_lines), inline=False)
-    if other_lines:
-        summary.add_field(name="📁 其他檔案", value="\n".join(other_lines), inline=False)
-    return summary if summary.fields else None
 
 
 def build_grouped_selector_summary(
@@ -401,10 +505,16 @@ def build_grouped_selector_summary(
         else:
             lines.append(f"▶️ {clean_label}")
 
-    summary = discord.Embed(
+    return discord.Embed(
         title=title,
-        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
+        description="\n".join(
+            [
+                "請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
+                "",
+                strong_section_divider(section_name),
+                "",
+                "\n\n".join(lines),
+            ]
+        ).strip(),
         color=discord.Color.blurple(),
     )
-    summary.add_field(name=section_name, value="\n\n".join(lines), inline=False)
-    return summary

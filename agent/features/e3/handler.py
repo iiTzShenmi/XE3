@@ -167,6 +167,9 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
     if action_head == "課程" or verb in {"course", "courses"}:
         return _list_courses(logger, line_user_id)
 
+    if action.startswith("成績詳情") or (verb in {"grade", "grades"} and len(tokens) >= 2 and tokens[1].lower() in {"detail", "details"}):
+        return _grade_detail(action, tokens, logger, line_user_id)
+
     if action_head == "成績" or verb in {"grade", "grades"}:
         return _list_grades(logger, line_user_id)
 
@@ -525,27 +528,29 @@ def _list_grades(logger, line_user_id):
         return _discord_empty_state("目前還沒有新成績，先喘口氣吧。🎉", line_user_id, emoji="📊") if _is_discord_user_key(line_user_id) else "目前沒有可用成績資料。"
     grouped = _group_grade_items_by_course(grade_items)
     if _is_discord_user_key(line_user_id):
-        lines = ["📊 **成績總覽**", _format_cache_status_text(cache_status), ""]
+        lines = ["📊 **成績總覽**", "先選一門課，我再展開該課的成績明細。", _format_cache_status_text(cache_status), ""]
     else:
         lines = ["📊 E3 成績：", _format_cache_status_text(cache_status)]
     bubbles = []
     for idx, course_group in enumerate(grouped[:10], start=1):
         if _is_discord_user_key(line_user_id):
             lines.append(f"**{course_group['course_label']}**")
-            for item in course_group["items"][:3]:
+            lines.append(f"• 已登錄 `{len(course_group['items'])}` 筆成績")
+            preview = course_group["items"][:2]
+            for item in preview:
                 lines.append(f"• {item['item_name']} · **{item['score']}**")
-            remaining = len(course_group["items"]) - 3
+            remaining = len(course_group["items"]) - len(preview)
             if remaining > 0:
-                lines.append(f"• ...and `{remaining}` more")
+                lines.append(f"• 還有 `{remaining}` 筆")
             lines.append("")
         else:
             lines.append(f"{idx}. {course_group['course_label']}")
-            for item in course_group["items"][:3]:
+            for item in course_group["items"][:2]:
                 lines.append(f"   {item['item_name']}：{item['score']}")
-            remaining = len(course_group["items"]) - 3
+            remaining = len(course_group["items"]) - 2
             if remaining > 0:
                 lines.append(f"   ...另有 {remaining} 筆")
-        bubbles.append(_build_grade_bubble(course_group))
+        bubbles.append(_build_grade_bubble(course_group, idx))
 
     messages = [item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]
     if bubbles:
@@ -588,7 +593,7 @@ def _group_grade_items_by_course(items):
     return ordered
 
 
-def _build_grade_bubble(course_group):
+def _build_grade_bubble(course_group, index):
     preview_items = course_group["items"][:4]
     body_contents = [
         {"type": "text", "text": course_group["course_id"] or "未提供課號", "size": "sm", "color": "#475569"},
@@ -634,9 +639,17 @@ def _build_grade_bubble(course_group):
             }
         )
 
-    return {
+    return attach_message_meta({
         "type": "bubble",
         "size": "kilo",
+        "xe3_meta": {
+            "selector_kind": "grade_course",
+            "selector_summary_title": "選擇課程成績",
+            "selector_section": "📊 課程成績",
+            "item_title": course_group["course_name"],
+            "course_name": course_group["course_name"],
+            "course_id": course_group["course_id"],
+        },
         "header": {
             "type": "box",
             "layout": "vertical",
@@ -653,7 +666,164 @@ def _build_grade_bubble(course_group):
             "spacing": "sm",
             "contents": body_contents,
         },
-    }
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "height": "sm",
+                    "color": "#7C3AED",
+                    "action": {
+                        "type": "message",
+                        "label": "查看成績",
+                        "text": f"e3 成績詳情 {course_group['course_id'] or course_group['course_name']}",
+                        "xe3_meta": {
+                            "selector_kind": "grade_course_detail",
+                            "entry_kind": "grade_course",
+                            "group_label": "查看成績",
+                            "item_title": course_group["course_name"],
+                            "course_name": course_group["course_name"],
+                            "course_id": course_group["course_id"],
+                            "option_description": f"已登錄 {len(course_group['items'])} 筆成績",
+                        },
+                    },
+                },
+            ],
+        },
+    })
+
+
+def _grade_detail(action, tokens, logger, line_user_id):
+    target = _extract_course_target(action, tokens, "成績詳情", "detail")
+    if not target:
+        return f"請使用 {_discord_command_hint('e3 成績詳情 <課號或課名>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 成績詳情 <課號或課名>"
+
+    try:
+        data = fetch_courses(make_user_key(line_user_id))
+        cache_status = get_cache_status(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_grade_detail_failed error=%s", exc)
+        return (
+            f"⚠️ XE3 couldn't load that course's grade data.\nTry {_discord_command_hint('e3 relogin', line_user_id)}."
+            if _is_discord_user_key(line_user_id)
+            else "E3 成績資料讀取失敗，請先 `e3 relogin`。"
+        )
+
+    semester_tag = _current_semester_tag()
+    matched_group = None
+    for display_name, payload in _current_semester_courses(data, semester_tag=semester_tag):
+        course_id = str((payload or {}).get("_course_id") or "").strip()
+        course_name = _course_name_for_display(display_name)
+        searchable = f"{course_id} {course_name}"
+        if not _matches_course_keyword(searchable, target):
+            continue
+        items = [item for item in extract_grade_items({display_name: payload}) if _is_meaningful_grade(item.get("score"))]
+        if not items:
+            matched_group = {
+                "course_id": course_id,
+                "course_name": course_name,
+                "course_label": f"{course_id} {course_name}".strip(),
+                "items": [],
+            }
+        else:
+            matched_group = _group_grade_items_by_course(items)[0]
+        break
+
+    if matched_group is None:
+        return (
+            f"📊 我找不到和 **{target}** 對應的課程成績。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到「{target}」的課程成績。"
+        )
+
+    if not matched_group["items"]:
+        return _discord_empty_state(f"**{matched_group['course_name']}** 目前還沒有可顯示的成績。", line_user_id, emoji="📊") if _is_discord_user_key(line_user_id) else f"{matched_group['course_name']} 目前沒有可用成績資料。"
+
+    if _is_discord_user_key(line_user_id):
+        lines = [
+            "📊 **課程成績詳情**",
+            f"**{matched_group['course_label']}**",
+            _format_cache_status_text(cache_status),
+            "",
+        ]
+        for item in matched_group["items"]:
+            lines.append(f"• **{item['item_name']}**")
+            lines.append(f"  分數：**{item['score']}**")
+            lines.append("")
+    else:
+        lines = [f"📊 {matched_group['course_label']} 成績：", _format_cache_status_text(cache_status)]
+        for item in matched_group["items"]:
+            lines.append(f"- {item['item_name']}：{item['score']}")
+
+    flex = attach_message_meta(
+        {
+            "type": "flex",
+            "altText": "\n".join(lines),
+            "contents": {
+                "type": "bubble",
+                "xe3_meta": {
+                    "selector_kind": "grade_course_detail",
+                    "item_title": matched_group["course_name"],
+                    "course_name": matched_group["course_name"],
+                    "course_id": matched_group["course_id"],
+                },
+                "size": "mega",
+                "header": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#7C3AED",
+                    "paddingAll": "12px",
+                    "contents": [
+                        {"type": "text", "text": "課程成績詳情", "color": "#FFFFFF", "weight": "bold", "size": "md"},
+                    ],
+                },
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "contents": (
+                        [
+                            {"type": "text", "text": matched_group["course_name"], "weight": "bold", "wrap": True, "size": "lg"},
+                            {"type": "text", "text": matched_group["course_id"] or "未提供課號", "size": "sm", "color": "#475569"},
+                            {"type": "separator", "margin": "md"},
+                        ]
+                        + [
+                            {
+                                "type": "box",
+                                "layout": "baseline",
+                                "spacing": "sm",
+                                "contents": [
+                                    {"type": "text", "text": item["item_name"], "size": "sm", "wrap": True, "flex": 4, "color": "#0F172A"},
+                                    {"type": "text", "text": item["score"], "size": "sm", "wrap": True, "flex": 2, "align": "end", "weight": "bold", "color": "#1D4ED8"},
+                                ],
+                            }
+                            for item in matched_group["items"]
+                        ]
+                    ),
+                },
+                "footer": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "height": "sm",
+                            "color": "#7C3AED",
+                            "action": {"type": "message", "label": "回到成績列表", "text": "e3 grades"},
+                        },
+                    ],
+                },
+            },
+        }
+    )
+    messages = [item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]
+    messages.append(flex)
+    return _line_response("\n".join(lines).strip(), messages=messages or None)
 
 
 def _current_semester_courses(courses, semester_tag=None):

@@ -5,7 +5,7 @@ from typing import Any
 import discord
 
 from agent.features.e3.payloads import META_KEY, merge_meta, message_meta, payload_meta
-from agent.platforms.discord.rendering import bubble_description, bubble_header_lines, bubble_title, hex_to_color
+from agent.platforms.discord.rendering import bubble_description, bubble_header_lines, bubble_title, format_discord_text, hex_to_color
 
 
 def response_text(payload: Any) -> str:
@@ -34,18 +34,18 @@ def special_text_embed(text: str) -> discord.Embed | None:
     if normalized.startswith("⏰ E3 提醒") or normalized.startswith("⏰ E3 倒數提醒") or normalized.startswith("⏰ 提醒測試"):
         lines = [line.rstrip() for line in raw.splitlines()]
         title = lines[0].replace("**", "").strip() if lines else "⏰ XE3 提醒"
-        body = "\n".join(line for line in lines[1:] if line is not None).strip()
+        body = format_discord_text("\n".join(line for line in lines[1:] if line is not None).strip())
         return discord.Embed(title=title, description=body or "目前沒有提醒內容。", color=discord.Color.orange())
     if normalized.startswith("📊 成績更新"):
         lines = [line.rstrip() for line in raw.splitlines()]
         title = lines[0].replace("**", "").strip() if lines else "📊 成績更新"
-        body = "\n".join(line.replace("**", "") for line in lines[1:] if line is not None).strip()
+        body = format_discord_text("\n".join(line.replace("**", "") for line in lines[1:] if line is not None).strip())
         return discord.Embed(title=title, description=body or "有新的成績內容。", color=discord.Color.green())
     return None
 
 
 def chunk_text(text: str, limit: int = 1900) -> list[str]:
-    raw = str(text or "").strip()
+    raw = format_discord_text(str(text or "").strip())
     if not raw:
         return ["（空白回覆）"]
     if len(raw) <= limit:

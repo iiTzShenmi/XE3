@@ -26,6 +26,73 @@ ENGLISH_EXAM_PATTERNS = [
 ]
 
 
+def _event_payload_source(event):
+    try:
+        payload = json.loads(event.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    return str(payload.get("source") or "").strip().lower()
+
+
+def _event_due_date_key(event):
+    due_dt = _parse_dt(event.get("due_at"))
+    if not due_dt:
+        return ""
+    return due_dt.date().isoformat()
+
+
+def _exam_category(title):
+    text = _clean_event_text(title).lower()
+    if not text:
+        return ""
+    if "期中" in text or re.search(r"\bmid-?term\b", text):
+        return "midterm"
+    if "期末" in text or re.search(r"\bfinal(?: exam| evaluation)?\b", text):
+        return "final"
+    if "測驗" in text or re.search(r"\bquiz\b|\bsmall test\b", text):
+        return "quiz"
+    if "考" in text or re.search(r"\bexam\b", text):
+        return "exam"
+    return ""
+
+
+def _dedupe_cross_source_exam_events(events):
+    if not isinstance(events, list):
+        return events
+
+    grouped = {}
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("event_type") or "") != "exam":
+            continue
+        source = _event_payload_source(event)
+        if source not in {"course_outline_syllabus", "calendar_upcoming"}:
+            continue
+        course_id = str(event.get("course_id") or "").strip()
+        if not course_id:
+            continue
+        due_key = _event_due_date_key(event)
+        category = _exam_category(event.get("title") or "")
+        if not due_key or not category:
+            continue
+        grouped.setdefault((course_id, due_key, category), []).append((index, source, event))
+
+    drop_indexes = set()
+    for _, matches in grouped.items():
+        has_calendar = any(source == "calendar_upcoming" for _, source, _ in matches)
+        has_outline = any(source == "course_outline_syllabus" for _, source, _ in matches)
+        if not (has_calendar and has_outline):
+            continue
+        for index, source, _ in matches:
+            if source == "course_outline_syllabus":
+                drop_indexes.add(index)
+
+    if not drop_indexes:
+        return events
+    return [event for index, event in enumerate(events) if index not in drop_indexes]
+
+
 def _parse_dt(value):
     if value is None:
         return None
@@ -297,4 +364,4 @@ def extract_events_from_fetch_all(data, calendar_events=None):
                 }
             )
 
-    return events
+    return _dedupe_cross_source_exam_events(events)
