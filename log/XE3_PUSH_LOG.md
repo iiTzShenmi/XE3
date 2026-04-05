@@ -147,3 +147,25 @@
 ## Notes
 - HAR 與本地拆出的 JS 參考檔已加入 `.gitignore`，避免誤推敏感樣本。
 - 如果之後功能變更多，可以繼續把新 commit 追加到這份檔案尾端。
+
+### 15. Phase 2 公告 / Forum 與維運靜默刷新
+- 新增 `/e3 news`
+  - 支援近期公告 / forum discussion 的統一總覽
+  - summary 改成依課程分段，避免流水帳難以閱讀
+- 新增 `公告詳情` 流程
+  - 顯示課程、作者、時間、摘要與 `開啟 E3` 按鈕
+- 新增公告附件入口
+  - 公告附件沿用既有 Discord 直接下載 / proxy fallback 流程
+- 新增 `/e3 news` 篩選
+  - `course`
+  - `recent_days`（3 / 7 / 14）
+  - 文字指令也支援 `course` / `recent` 任意順序
+- 所有 dropdown 加入 `↩️ 上一頁`
+  - 可回到前一個結果頁，不用重新輸入指令
+- 強化檔名清理
+  - 對下載到 Discord 的檔名做 URL decode、非法字元替換與保留字防護，減少奇怪檔名造成的失敗
+- 新增 owner-only `/e3 refresh`
+  - 只允許 bot owner 使用
+  - 靜默刷新所有已儲存的 E3 帳號
+  - 只回覆 owner 一則摘要，不會對其他使用者推播垃圾訊息
+- 在 `ENGINEERING_RULES.md` 補上維護型指令規則：owner-only，且預設不得廣播操作輸出
