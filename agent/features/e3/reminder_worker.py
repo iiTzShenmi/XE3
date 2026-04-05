@@ -126,6 +126,31 @@ def process_periodic_syncs(now, push_fn, logger, target_predicate=None) -> None:
         maybe_periodic_sync(row, now, push_fn, logger)
 
 
+def refresh_all_saved_accounts(logger) -> dict[str, Any]:
+    rows = list(list_sync_targets())
+    summary: dict[str, Any] = {
+        "total": len(rows),
+        "ok": 0,
+        "failed": 0,
+        "grade_changes": 0,
+        "results": [],
+    }
+    for row in rows:
+        grade_changes, ok = sync_user_snapshot(row, logger)
+        result = {
+            "user_key": str(row["line_user_id"]),
+            "ok": bool(ok),
+            "grade_changes": len(grade_changes),
+        }
+        summary["results"].append(result)
+        if ok:
+            summary["ok"] += 1
+            summary["grade_changes"] += len(grade_changes)
+        else:
+            summary["failed"] += 1
+    return summary
+
+
 def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
     now = taipei_now()
     current_slot = now.strftime("%H:%M")

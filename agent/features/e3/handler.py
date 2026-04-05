@@ -71,6 +71,7 @@ from .secrets import decrypt_secret, encrypt_secret
 
 ASYNC_ACTIONS = {"login", "relogin", "重新登入"}
 _LAST_EVENT_INDEX = {}
+_LAST_NEWS_INDEX = {}
 EVENT_TYPE_ALIASES = {
     "作業": "homework",
     "homework": "homework",
@@ -124,6 +125,7 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
                 f"• {_discord_command_hint('e3 course', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 today', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 week', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 news', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 grades', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 files <課名關鍵字>', line_user_id)}\n"
                 "──────────\n"
@@ -144,13 +146,14 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
             "4) e3 課程 / e3 course\n"
             "5) e3 today / e3 今日\n"
             "6) e3 week / e3 本週\n"
-            "7) e3 近期 [作業/行事曆/考試]\n"
-            "8) e3 timeline / e3 行事曆 [作業/行事曆/考試]\n"
-            "9) e3 詳情 <編號>\n"
-            "10) e3 狀態\n"
-            "11) e3 grades / e3 成績\n"
-            "12) e3 files <課名關鍵字>\n"
-            "13) e3 remind show/on/off/schedule both|morning|evening\n"
+            "7) e3 news / e3 公告\n"
+            "8) e3 近期 [作業/行事曆/考試]\n"
+            "9) e3 timeline / e3 行事曆 [作業/行事曆/考試]\n"
+            "10) e3 詳情 <編號>\n"
+            "11) e3 狀態\n"
+            "12) e3 grades / e3 成績\n"
+            "13) e3 files <課名關鍵字>\n"
+            "14) e3 remind show/on/off/schedule both|morning|evening\n"
             "說明：課程指令會顯示目前學期（例如 114上 / 114下）"
         )
 
@@ -177,6 +180,12 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
 
     if action_head == "成績" or verb in {"grade", "grades"}:
         return _list_grades(logger, line_user_id)
+
+    if action.startswith("公告詳情") or (verb in {"news", "forum", "forums"} and len(tokens) >= 2 and tokens[1].lower() in {"detail", "details"}):
+        return _news_detail(action, tokens, logger, line_user_id)
+
+    if action_head == "公告" or verb in {"news", "forum", "forums"}:
+        return _list_news(tokens, logger, line_user_id)
 
     if action.startswith("檔案資料夾") or (verb in {"file", "files"} and len(tokens) >= 3 and tokens[1].lower() in {"folders", "folder"}):
         return _file_folders(action, tokens, logger, line_user_id)
@@ -834,6 +843,527 @@ def _grade_detail(action, tokens, logger, line_user_id):
     )
     messages = [item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]
     messages.append(flex)
+    return _line_response("\n".join(lines).strip(), messages=messages or None)
+
+
+def _normalize_news_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = text.replace("\u000b", " ").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _parse_news_sort_key(*values: str) -> datetime:
+    current_year = datetime.now(timezone(timedelta(hours=8))).year
+    patterns = [
+        re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日.*?(\d{1,2}):(\d{2})"),
+        re.compile(r"(\d{1,2})月\s*(\d{1,2})日,?\s*(\d{1,2}):(\d{2})"),
+    ]
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                groups = match.groups()
+                if len(groups) == 5:
+                    year, month, day, hour, minute = groups
+                else:
+                    month, day, hour, minute = groups
+                    year = str(current_year)
+                return datetime(int(year), int(month), int(day), int(hour), int(minute), tzinfo=timezone(timedelta(hours=8)))
+            except ValueError:
+                continue
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _store_last_news_index(line_user_id, items):
+    if not line_user_id:
+        return
+    _LAST_NEWS_INDEX[line_user_id] = {
+        idx: dict(item)
+        for idx, item in items
+    }
+
+
+def _extract_news_target(action, tokens):
+    if tokens and tokens[0] == "公告詳情":
+        return " ".join(tokens[1:]).strip()
+    if len(tokens) >= 3 and tokens[0].lower() in {"news", "forum", "forums"} and tokens[1].lower() in {"detail", "details"}:
+        return " ".join(tokens[2:]).strip()
+    match = re.match(r"^公告詳情\s*(.+)$", action.strip())
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _parse_news_filters(tokens):
+    course_keyword = ""
+    recent_days = None
+    rest = [str(token or "").strip() for token in tokens[1:] if str(token or "").strip()]
+    course_parts: list[str] = []
+    idx = 0
+    while idx < len(rest):
+        token = rest[idx].lower()
+        if token in {"recent", "近期"}:
+            recent_days = 7
+            if idx + 1 < len(rest):
+                try:
+                    parsed = int(rest[idx + 1])
+                except ValueError:
+                    parsed = None
+                if parsed and parsed > 0:
+                    recent_days = parsed
+                    idx += 1
+            idx += 1
+            continue
+        if token in {"course", "課程"}:
+            idx += 1
+            while idx < len(rest):
+                lookahead = rest[idx].lower()
+                if lookahead in {"recent", "近期"}:
+                    idx -= 1
+                    break
+                course_parts.append(rest[idx])
+                idx += 1
+            idx += 1
+            continue
+        course_parts.append(rest[idx])
+        idx += 1
+    course_keyword = " ".join(course_parts).strip()
+    return course_keyword, recent_days
+
+
+def _collect_news_items(courses):
+    semester_tag = _current_semester_tag()
+    items = []
+    seen = set()
+    for display_name, payload in _current_semester_courses(courses, semester_tag=semester_tag):
+        if not isinstance(payload, dict):
+            continue
+        course_id = str(payload.get("_course_id") or "").strip()
+        course_name = _course_name_for_display(display_name)
+
+        for entry in payload.get("news") or []:
+            if not isinstance(entry, dict):
+                continue
+            title = _normalize_news_text(entry.get("title") or "未命名公告")
+            content = _normalize_news_text(entry.get("content") or "")
+            excerpt = _shorten_title(content, 120)
+            key = (course_id, title.lower(), excerpt.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments = [item for item in (entry.get("attachments") or []) if isinstance(item, dict)]
+            items.append(
+                {
+                    "source_type": "news",
+                    "course_id": course_id,
+                    "course_name": course_name,
+                    "title": title,
+                    "author": _normalize_news_text(entry.get("author") or ""),
+                    "time_text": _normalize_news_text(entry.get("date") or ""),
+                    "content": content,
+                    "excerpt": excerpt,
+                    "attachments": attachments,
+                    "url": str(entry.get("url") or "").strip(),
+                    "sort_key": _parse_news_sort_key(entry.get("author"), entry.get("date")),
+                }
+            )
+
+        forums_payload = payload.get("forums") or {}
+        forums = forums_payload.get("forums") if isinstance(forums_payload, dict) else []
+        for forum in forums or []:
+            if not isinstance(forum, dict):
+                continue
+            forum_title = _normalize_news_text(forum.get("title") or "公告")
+            for discussion in forum.get("discussions") or []:
+                if not isinstance(discussion, dict):
+                    continue
+                posts = [post for post in (discussion.get("posts") or []) if isinstance(post, dict)]
+                first_post = posts[0] if posts else {}
+                title = _normalize_news_text(discussion.get("title") or forum_title or "未命名公告")
+                content = _normalize_news_text(first_post.get("content") or "")
+                excerpt = _shorten_title(content, 120)
+                key = (course_id, title.lower(), excerpt.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                attachments = [item for item in (first_post.get("attachments") or []) if isinstance(item, dict)]
+                items.append(
+                    {
+                        "source_type": "forum",
+                        "course_id": course_id,
+                        "course_name": course_name,
+                        "title": title,
+                        "author": _normalize_news_text(first_post.get("author") or ""),
+                        "time_text": _normalize_news_text(first_post.get("time") or ""),
+                        "content": content,
+                        "excerpt": excerpt,
+                        "attachments": attachments,
+                        "url": str(discussion.get("url") or forum.get("url") or "").strip(),
+                        "forum_title": forum_title,
+                        "sort_key": _parse_news_sort_key(first_post.get("time")),
+                    }
+                )
+
+    items.sort(
+        key=lambda item: (
+            item.get("sort_key") or datetime.min.replace(tzinfo=timezone.utc),
+            item.get("course_name") or "",
+            item.get("title") or "",
+        ),
+        reverse=True,
+    )
+    return items
+
+
+def _filter_news_items(items, course_keyword="", recent_days=None):
+    filtered = list(items)
+    if course_keyword:
+        filtered = [
+            item
+            for item in filtered
+            if _matches_course_keyword(f"{item.get('course_id') or ''} {item.get('course_name') or ''}", course_keyword)
+        ]
+    if recent_days:
+        now_local = datetime.now(timezone(timedelta(hours=8)))
+        cutoff = now_local - timedelta(days=recent_days)
+        filtered = [
+            item
+            for item in filtered
+            if isinstance(item.get("sort_key"), datetime) and item["sort_key"] >= cutoff
+        ]
+    return filtered
+
+
+def _news_command_with_filters(course_keyword="", recent_days=None):
+    parts = ["e3", "news"]
+    if recent_days:
+        parts.extend(["recent", str(recent_days)])
+    if course_keyword:
+        parts.extend(["course", course_keyword])
+    return " ".join(parts)
+
+
+def _build_news_attachment_entries(item, line_user_id, parent_command=""):
+    if not line_user_id:
+        return []
+    entries = []
+    for attachment in item.get("attachments") or []:
+        if not isinstance(attachment, dict):
+            continue
+        source_url = str(attachment.get("url") or "").strip()
+        title = _normalize_news_text(attachment.get("name") or "公告附件")
+        if not source_url:
+            continue
+        entries.append(
+            {
+                "kind": "老師附件",
+                "course_name": item.get("course_name") or item.get("title") or "公告附件",
+                "title": title,
+                "url": build_proxy_url(line_user_id, source_url, filename=title),
+                "accent": "#0F766E",
+                "parent_command": parent_command,
+            }
+        )
+    return entries
+
+
+def _build_news_bubble(item, index, *, back_command="e3 news"):
+    course_label = f"{item['course_id']} {item['course_name']}".strip()
+    source_label = "課程公告" if item.get("source_type") == "news" else "討論區"
+    time_label = item.get("time_text") or "未提供時間"
+    excerpt = item.get("excerpt") or "沒有更多摘要內容。"
+    attachment_count = len(item.get("attachments") or [])
+    attachment_text = f"｜附件 {attachment_count}" if attachment_count else ""
+    return attach_message_meta(
+        {
+            "type": "bubble",
+            "size": "kilo",
+            "xe3_meta": {
+                "selector_kind": "news_item",
+                "selector_summary_title": "選擇公告",
+                "selector_section": "📰 公告",
+                "selector_back_command": back_command,
+                "item_title": item["title"],
+                "course_name": item["course_name"],
+                "course_id": item["course_id"],
+                "option_description": f"{course_label}｜{time_label}"[:100],
+            },
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#0F766E",
+                "paddingAll": "12px",
+                "contents": [
+                    {"type": "text", "text": source_label, "color": "#CCFBF1", "size": "xs"},
+                    {"type": "text", "text": item["title"], "color": "#FFFFFF", "weight": "bold", "wrap": True},
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {"type": "text", "text": course_label, "size": "sm", "weight": "bold", "wrap": True, "color": "#0F172A"},
+                    {"type": "text", "text": f"🕒 {time_label}{attachment_text}", "size": "xs", "wrap": True, "color": "#475569"},
+                    {"type": "separator", "margin": "sm"},
+                    {"type": "text", "text": excerpt, "size": "sm", "wrap": True, "color": "#334155"},
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "height": "sm",
+                        "color": "#0F766E",
+                        "action": {
+                            "type": "message",
+                            "label": "查看公告",
+                            "text": f"e3 公告詳情 n{index}",
+                            "xe3_meta": {
+                                "selector_summary_title": "選擇公告",
+                                "selector_section": "📰 公告",
+                                "selector_back_command": back_command,
+                                "selector_kind": "news_detail",
+                                "entry_kind": "news_item",
+                            "group_label": "查看公告",
+                                "item_title": item["title"],
+                                "course_name": item["course_name"],
+                                "course_id": item["course_id"],
+                                "option_description": f"{course_label}｜{time_label}"[:100],
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+
+def _build_news_detail_flex(item):
+    course_label = f"{item['course_id']} {item['course_name']}".strip()
+    source_label = "課程公告" if item.get("source_type") == "news" else "討論區"
+    author = item.get("author") or "未提供作者"
+    time_text = item.get("time_text") or "未提供時間"
+    content = item.get("content") or "這則公告目前沒有可顯示的內文。"
+    attachments = item.get("attachments") or []
+    body_contents = [
+        {"type": "text", "text": item["title"], "weight": "bold", "wrap": True, "size": "lg", "color": "#0F172A"},
+        {"type": "text", "text": course_label, "size": "sm", "wrap": True, "color": "#334155"},
+        {"type": "text", "text": f"🗂️ 來源｜{source_label}", "size": "xs", "wrap": True, "color": "#475569"},
+        {"type": "text", "text": f"👤 發布者｜{author}", "size": "xs", "wrap": True, "color": "#475569"},
+        {"type": "text", "text": f"🕒 時間｜{time_text}", "size": "xs", "wrap": True, "color": "#475569"},
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "內容摘要", "weight": "bold", "size": "sm", "color": "#0F172A"},
+        {"type": "text", "text": _shorten_title(content, 900), "size": "sm", "wrap": True, "color": "#334155"},
+    ]
+    if attachments:
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "附件", "weight": "bold", "size": "sm", "color": "#0F172A"},
+            ]
+            + [
+                {"type": "text", "text": f"📎 {_normalize_news_text(attachment.get('name') or '未命名附件')}", "size": "sm", "wrap": True, "color": "#334155"}
+                for attachment in attachments[:5]
+            ]
+        )
+        if len(attachments) > 5:
+            body_contents.append({"type": "text", "text": f"還有 {len(attachments) - 5} 個附件會在下一步接上下載入口。", "size": "xs", "wrap": True, "color": "#64748B"})
+    footer_contents = [
+        {
+            "type": "button",
+            "style": "primary",
+            "height": "sm",
+            "color": "#0F766E",
+            "action": {"type": "message", "label": "回到公告列表", "text": "e3 news"},
+        }
+    ]
+    if item.get("url"):
+        footer_contents.append(
+            {
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {"type": "uri", "label": "開啟 E3", "uri": item["url"]},
+            }
+        )
+    return attach_message_meta(
+        {
+            "type": "flex",
+            "altText": f"📰 {item['title']}",
+            "contents": {
+                "type": "bubble",
+                "size": "mega",
+                "xe3_meta": {
+                    "selector_kind": "news_detail",
+                    "item_title": item["title"],
+                    "course_name": item["course_name"],
+                    "course_id": item["course_id"],
+                },
+                "header": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#0F766E",
+                    "paddingAll": "12px",
+                    "contents": [
+                        {"type": "text", "text": "公告詳情", "color": "#FFFFFF", "weight": "bold", "size": "md"},
+                    ],
+                },
+                "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body_contents},
+                "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_contents},
+            },
+        }
+    )
+
+
+def _list_news(tokens, logger, line_user_id):
+    _, err = _require_line_user(line_user_id)
+    if err:
+        return err
+
+    try:
+        data = fetch_courses(make_user_key(line_user_id))
+        cache_status = get_cache_status(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_list_news_failed error=%s", exc)
+        return (
+            f"⚠️ XE3 目前讀不到公告資料。\n先試試 {_discord_command_hint('e3 relogin', line_user_id)}。"
+            if _is_discord_user_key(line_user_id)
+            else "E3 公告資料讀取失敗，請先 `e3 relogin`。"
+        )
+
+    course_keyword, recent_days = _parse_news_filters(tokens)
+    items = _filter_news_items(_collect_news_items(data), course_keyword=course_keyword, recent_days=recent_days)
+    if not items:
+        filter_note = []
+        if course_keyword:
+            filter_note.append(f"課程：{course_keyword}")
+        if recent_days:
+            filter_note.append(f"最近 {recent_days} 天")
+        suffix = f"（{'｜'.join(filter_note)}）" if filter_note else ""
+        text = f"📰 目前還沒有可顯示的近期公告{suffix}。" if _is_discord_user_key(line_user_id) else f"目前沒有可顯示的近期公告{suffix}。"
+        flex = _build_text_summary_flex("近期公告", text, color="#0F766E", alt_text=text)
+        return _line_response(text, messages=[flex] if flex else None)
+
+    back_command = _news_command_with_filters(course_keyword=course_keyword, recent_days=recent_days)
+    visible = list(enumerate(items[:10], start=1))
+    _store_last_news_index(line_user_id, visible)
+
+    heading = "📰 **近期公告**"
+    if course_keyword:
+        heading += f"\n📚 課程篩選：**{course_keyword}**"
+    if recent_days:
+        heading += f"\n🕒 範圍：最近 **{recent_days}** 天"
+
+    if _is_discord_user_key(line_user_id):
+        lines = [
+            heading,
+            "請從下方下拉選單挑一則，我會直接幫你打開，不洗版。",
+            "",
+        ]
+        for idx, item in visible:
+            course_label = f"{item['course_id']} {item['course_name']}".strip()
+            lines.append(f"{idx}. **{item['title']}**")
+            lines.append(f"   {course_label}")
+            if item.get("time_text"):
+                lines.append(f"   {item['time_text']}")
+            lines.append("")
+    else:
+        lines = ["📰 近期公告：", *( [f"課程篩選：{course_keyword}"] if course_keyword else [] ), *( [f"範圍：最近 {recent_days} 天"] if recent_days else [] ), ""]
+        for idx, item in visible:
+            lines.append(f"{idx}. {item['title']}｜{item['course_name']}")
+            if item.get("time_text"):
+                lines.append(f"   {item['time_text']}")
+            lines.append("")
+    if len(items) > 10:
+        lines.append(f"另有 {len(items) - 10} 則公告，先用篩選縮小範圍會更好讀。")
+    text = "\n".join(lines).strip()
+
+    messages = [item for item in [_build_cache_status_flex(cache_status, "公告快取")] if item]
+    messages.append(
+        {
+                "type": "flex",
+                "altText": text,
+                "contents": {
+                    "type": "carousel",
+                    "contents": [_build_news_bubble(item, idx, back_command=back_command) for idx, item in visible],
+                },
+            }
+        )
+    return _line_response(text, messages=messages or None)
+
+
+def _news_detail(action, tokens, logger, line_user_id):
+    target = _extract_news_target(action, tokens)
+    if not target:
+        return f"請使用 {_discord_command_hint('e3 公告詳情 <編號>', line_user_id)}。" if _is_discord_user_key(line_user_id) else "用法：e3 公告詳情 <編號>"
+
+    item = None
+    if re.fullmatch(r"n\d+", target.lower()):
+        try:
+            index = int(target[1:])
+        except ValueError:
+            index = 0
+        item = (_LAST_NEWS_INDEX.get(line_user_id) or {}).get(index)
+    elif target.isdigit():
+        item = (_LAST_NEWS_INDEX.get(line_user_id) or {}).get(int(target))
+
+    if item is None:
+        try:
+            data = fetch_courses(make_user_key(line_user_id))
+        except Exception as exc:
+            logger.error("e3_news_detail_reload_failed error=%s", exc)
+            data = {}
+        items = _collect_news_items(data)
+        if re.fullmatch(r"n\d+", target.lower()):
+            idx = int(target[1:])
+            if 1 <= idx <= len(items):
+                item = items[idx - 1]
+
+    if item is None:
+        return (
+            f"📰 我找不到這則公告。\n先回到 {_discord_command_hint('e3 news', line_user_id)} 重新選一次。"
+            if _is_discord_user_key(line_user_id)
+            else "找不到這則公告，請先重新執行 `e3 news`。"
+        )
+
+    author = item.get("author") or "未提供作者"
+    time_text = item.get("time_text") or "未提供時間"
+    course_label = f"{item['course_id']} {item['course_name']}".strip()
+    content = item.get("content") or "這則公告目前沒有可顯示的內文。"
+    attachments = item.get("attachments") or []
+    lines = [
+        "📰 **公告詳情**",
+        f"**{item['title']}**",
+        course_label,
+        f"👤 發布者｜{author}",
+        f"🕒 時間｜{time_text}",
+        "",
+        "內容摘要",
+        _shorten_title(content, 500),
+    ]
+    if attachments:
+        lines.extend(["", "附件"] + [f"• {_normalize_news_text(attachment.get('name') or '未命名附件')}" for attachment in attachments[:5]])
+        if len(attachments) > 5:
+            lines.append(f"• 還有 {len(attachments) - 5} 個附件")
+    flex = _build_news_detail_flex(item)
+    attachment_entries = _build_news_attachment_entries(item, line_user_id, parent_command=f"e3 公告詳情 {target}")
+    attachment_flex = _build_file_download_flex(
+        attachment_entries,
+        f"📎 {item['title']} 附件",
+        item["title"],
+    ) if attachment_entries else None
+    messages = [item for item in [flex, attachment_flex] if item]
     return _line_response("\n".join(lines).strip(), messages=messages or None)
 
 

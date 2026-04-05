@@ -17,6 +17,7 @@ from .reminder_payloads import (
 from .reminder_worker import (
     build_test_reminder_payloads,
     process_due_reminders,
+    refresh_all_saved_accounts,
     start_reminder_worker,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "load_schedule",
     "morning_brief_lines",
     "process_due_reminders",
+    "refresh_all_saved_accounts",
     "start_reminder_worker",
     "taipei_now",
 ]

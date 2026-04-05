@@ -9,7 +9,7 @@ from discord.ext import commands
 from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
 from agent.features.e3 import handle_e3_command, run_e3_async_command
 from agent.features.e3.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
-from agent.features.e3.reminders import build_test_reminder_payloads, start_reminder_worker
+from agent.features.e3.reminders import build_test_reminder_payloads, refresh_all_saved_accounts, start_reminder_worker
 from agent.features.weather import handle_city_weather
 from agent.platforms.discord.command_helpers import autocomplete_course_files, build_help_text
 from agent.platforms.discord.file_delivery import download_discord_attachment
@@ -74,6 +74,37 @@ def _schedule_command_for_slots(slots: list[str]) -> str:
     if normalized == ["21:00"]:
         return "e3 remind schedule evening"
     return "e3 remind schedule both"
+
+
+def _format_refresh_all_summary(summary: dict[str, Any]) -> str:
+    total = int(summary.get("total", 0) or 0)
+    ok = int(summary.get("ok", 0) or 0)
+    failed = int(summary.get("failed", 0) or 0)
+    grade_changes = int(summary.get("grade_changes", 0) or 0)
+    ok_users = [str(row.get("user_key")) for row in summary.get("results", []) if row.get("ok")]
+    failed_users = [str(row.get("user_key")) for row in summary.get("results", []) if not row.get("ok")]
+    lines = [
+        "✅ `/e3 refresh` 已完成。",
+        "",
+        f"• 已掃描帳號：`{total}`",
+        f"• 成功同步：`{ok}`",
+        f"• 同步失敗：`{failed}`",
+        f"• 成績異動筆數：`{grade_changes}`",
+    ]
+    if ok_users:
+        lines.extend([
+            "",
+            "🟢 成功清單",
+            "\n".join(f"• `{user}`" for user in ok_users),
+        ])
+    if failed_users:
+        lines.extend([
+            "",
+            "🔴 失敗清單",
+            "\n".join(f"• `{user}`" for user in failed_users),
+        ])
+    lines.extend(["", "這次是靜默刷新，不會另外把結果推給其他使用者。"])
+    return "\n".join(lines)
 
 
 def _normalize_command_text(command_text: str) -> str:
@@ -353,6 +384,13 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, "relogin", interaction.user.id, bot=bot)
 
+    @e3_group.command(name="refresh", description="重新整理所有已儲存的 E3 帳號")
+    @_is_owner_check()
+    async def e3_refresh(interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        summary = await asyncio.to_thread(refresh_all_saved_accounts, logger)
+        await _send_text_chunks(interaction, _format_refresh_all_summary(summary), ephemeral=True)
+
     @e3_group.command(name="course", description="顯示目前課程")
     async def e3_course(interaction: discord.Interaction):
         await _remember_interaction_target(interaction)
@@ -370,6 +408,28 @@ def _create_bot() -> commands.Bot:
         await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, "week", interaction.user.id, bot=bot)
+
+    @e3_group.command(name="news", description="顯示近期公告與 forum 討論")
+    @app_commands.describe(course="只看某一門課", recent_days="只看最近幾天")
+    @app_commands.choices(recent_days=[
+        app_commands.Choice(name="最近 3 天", value=3),
+        app_commands.Choice(name="最近 7 天", value=7),
+        app_commands.Choice(name="最近 14 天", value=14),
+    ])
+    @app_commands.autocomplete(course=_autocomplete_course_files)
+    async def e3_news(
+        interaction: discord.Interaction,
+        course: str = "",
+        recent_days: app_commands.Choice[int] | None = None,
+    ):
+        await _remember_interaction_target(interaction)
+        await interaction.response.defer(thinking=True)
+        parts = ["news"]
+        if recent_days is not None:
+            parts.extend(["recent", str(recent_days.value)])
+        if course.strip():
+            parts.extend(["course", course.strip()])
+        await _execute_e3_payload(interaction, " ".join(parts), interaction.user.id, bot=bot)
 
     @e3_group.command(name="timeline", description="顯示近期作業與考試")
     @app_commands.describe(kind="可選：只看作業或只看考試")

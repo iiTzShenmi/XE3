@@ -7,7 +7,12 @@ from urllib.parse import urlparse
 import discord
 import requests
 
-from agent.features.e3.file_proxy import FileProxyError, prepare_proxy_download, prepare_user_download
+from agent.features.e3.file_proxy import (
+    FileProxyError,
+    prepare_proxy_download,
+    prepare_user_download,
+    sanitize_download_filename,
+)
 
 
 def extract_proxy_token(url: str, *, public_base_url_getter: Callable[[], str]) -> str | None:
@@ -49,7 +54,7 @@ def download_discord_attachment(
         return None, "目前無法從 E3 下載這個檔案。"
 
     response = payload["response"]
-    filename = payload.get("filename") or fallback_name or "download"
+    filename = sanitize_download_filename(payload.get("filename") or fallback_name or "download")
     try:
         data = response.content
     finally:

@@ -39,6 +39,7 @@ It exists so we can re-review against the same baseline later instead of relying
   - reminder/test notifications
   - fallback delivery cases
 - Keep responses clean, short, and readable.
+- Maintenance/admin commands must be owner-only and must not broadcast operational output to normal users unless that behavior is explicitly intended.
 
 ## 5. Exceptions Must Stay Actionable
 - Catch specific exception classes where possible.

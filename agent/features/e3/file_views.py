@@ -116,6 +116,7 @@ def _build_file_download_flex(entries, alt_text, course_name):
             continue
         role_label = _file_role_label(entry["kind"])
         role_emoji = _file_role_emoji(entry["kind"])
+        parent_command = str(entry.get("parent_command") or "").strip()
         bubbles.append(
             {
                 "type": "bubble",
@@ -129,6 +130,7 @@ def _build_file_download_flex(entries, alt_text, course_name):
                     "option_label": f"{role_emoji} {role_label}｜{entry['title']}",
                     "option_description": role_label,
                     "selector_summary_title": "選擇檔案",
+                    **({"parent_command": parent_command} if parent_command else {}),
                 },
                 "header": {
                     "type": "box",
@@ -168,6 +170,7 @@ def _build_file_download_flex(entries, alt_text, course_name):
                                     "file_role_label": role_label,
                                     "option_label": f"{role_emoji} {role_label}｜{entry['title']}",
                                     "option_description": role_label,
+                                    **({"parent_command": parent_command} if parent_command else {}),
                                 },
                             },
                         }

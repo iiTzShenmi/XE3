@@ -67,6 +67,7 @@ def build_help_text(prefix: str) -> str:
         "• /e3 course\n"
         "• /e3 today\n"
         "• /e3 week\n"
+        "• /e3 news\n"
         "• /e3 timeline\n"
         "• /e3 grades\n"
         "• /e3 files\n"

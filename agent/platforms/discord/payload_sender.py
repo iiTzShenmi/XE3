@@ -6,9 +6,11 @@ import discord
 
 from agent.platforms.discord.message_utils import extract_embed_items
 from agent.platforms.discord.rendering import (
+    action_meta,
     all_file_entries,
     build_file_selector_summary,
     build_grouped_selector_summary,
+    build_news_selector_summary,
     build_timeline_selector_summary,
     display_index_emoji,
     embed_option_description,
@@ -66,6 +68,66 @@ def extract_embeds_and_views(payload: Any) -> list[tuple[discord.Embed | None, l
         items.append((item.get("embed"), list(item.get("actions") or []), item.get("text")))
     return items
 
+
+def selector_back_command(entries: list[tuple[str, str, dict[str, str]]]) -> str | None:
+    if not entries:
+        return None
+    metas = [action_meta(action) for _, _, action in entries if isinstance(action, dict)]
+    first_meta = metas[0] if metas else {}
+    explicit = str(first_meta.get("selector_back_command") or "").strip()
+    if explicit:
+        return explicit
+
+    selector_kind = str(first_meta.get("selector_kind") or "").strip()
+    course_id = str(first_meta.get("course_id") or "").strip()
+    course_name = str(first_meta.get("course_name") or "").strip()
+    course_target = course_id or course_name
+
+    if selector_kind == "course_summary":
+        return "e3 course"
+    if selector_kind == "grade_course":
+        return "e3 grades"
+    if selector_kind == "timeline_event":
+        return "e3 timeline"
+    if selector_kind == "news_item":
+        return "e3 news"
+    if selector_kind == "file_folder" and course_target:
+        return f"e3 files {course_target}"
+    if selector_kind == "course_homework_detail" and course_target:
+        return f"e3 課程作業 {course_target}"
+    if selector_kind == "file":
+        explicit_parent = str(first_meta.get("parent_command") or "").strip()
+        if explicit_parent:
+            return explicit_parent
+        if course_target:
+            return f"e3 files {course_target}"
+    return None
+
+
+def with_back_entry(entries: list[tuple[str, str, dict[str, str]]]) -> list[tuple[str, str, dict[str, str]]]:
+    trimmed = list(entries[: MAX_SELECT_OPTIONS - 1])
+    back_command = selector_back_command(trimmed)
+    if not back_command:
+        return trimmed[:MAX_SELECT_OPTIONS]
+    trimmed.append(
+        (
+            "↩️ 上一頁",
+            "回到上一個結果頁面",
+            {
+                "kind": "message",
+                "label": "上一頁",
+                "value": back_command,
+                "xe3_meta": {
+                    "entry_kind": "navigation",
+                    "group_label": "上一頁",
+                    "option_label": "↩️ 上一頁",
+                    "option_description": "回到上一個結果頁面",
+                },
+            },
+        )
+    )
+    return trimmed
+
 async def edit_message_from_payload(
     message: discord.Message,
     payload: Any,
@@ -118,21 +180,25 @@ async def edit_message_from_payload(
 
     content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
     if should_use_selector:
-        summary = build_file_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], selector_entries[:MAX_SELECT_OPTIONS])
+        summary_entries = selector_entries[:MAX_SELECT_OPTIONS]
+        view_entries = with_back_entry(selector_entries)
+        summary = build_file_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = build_timeline_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], selector_entries[:MAX_SELECT_OPTIONS])
+            summary = build_news_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = build_grouped_selector_summary(selector_entries[:MAX_SELECT_OPTIONS])
+            summary = build_timeline_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
+        if summary is None:
+            summary = build_grouped_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
             summary = discord.Embed(
-                title=select_summary_title(selector_entries),
+                title=select_summary_title(summary_entries),
                 description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
                 color=discord.Color.blurple(),
             )
-            for idx, (label, desc, action) in enumerate(selector_entries[:MAX_SELECT_OPTIONS], start=1):
+            for idx, (label, desc, action) in enumerate(summary_entries[:MAX_SELECT_OPTIONS], start=1):
                 value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
                 summary.add_field(name=f"{display_index_emoji(idx)} {label[:100]}", value=value, inline=False)
-        await message.edit(content=content, embeds=[summary], view=CommandSelectView(callbacks, user_id, selector_entries))
+        await message.edit(content=content, embeds=[summary], view=CommandSelectView(callbacks, user_id, view_entries))
         return True
 
     view = build_view(callbacks, user_id, embeds[0], actions)
@@ -194,22 +260,26 @@ async def send_payload(
             entries.append((select_option_label(embed, action), embed_option_description(embed, action), action))
         if not entries:
             return
-        summary = build_file_selector_summary(chunk[:MAX_SELECT_OPTIONS], entries[:MAX_SELECT_OPTIONS])
+        summary_entries = entries[:MAX_SELECT_OPTIONS]
+        view_entries = with_back_entry(entries)
+        summary = build_file_selector_summary(chunk[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = build_timeline_selector_summary(chunk[:MAX_SELECT_OPTIONS], entries[:MAX_SELECT_OPTIONS])
+            summary = build_news_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
-            summary = build_grouped_selector_summary(entries[:MAX_SELECT_OPTIONS])
+            summary = build_timeline_selector_summary(chunk[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
+        if summary is None:
+            summary = build_grouped_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
         if summary is None:
             summary = discord.Embed(
-                title=select_summary_title(entries),
+                title=select_summary_title(summary_entries),
                 description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
                 color=discord.Color.blurple(),
             )
-            preview_entries = entries[:25]
+            preview_entries = summary_entries[:25]
             for idx, (label, desc, action) in enumerate(preview_entries, start=1):
                 value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
                 summary.add_field(name=f"{display_index_emoji(idx)} {label[:100]}", value=value, inline=False)
-        await _send_with(target, embeds=[summary], view=CommandSelectView(callbacks, user_id, entries))
+        await _send_with(target, embeds=[summary], view=CommandSelectView(callbacks, user_id, view_entries))
         sent_any = True
 
     selector_candidates: list[tuple[discord.Embed, list[dict[str, str]]]] = []

@@ -470,6 +470,52 @@ def build_file_selector_summary(
     )
 
 
+def build_news_selector_summary(
+    entries: list[tuple[str, str, dict[str, str]]],
+) -> discord.Embed | None:
+    if not entries:
+        return None
+    metas = [action_meta(action) for _, _, action in entries]
+    if not metas or not all(str(meta.get("entry_kind") or "").strip() == "news_item" for meta in metas):
+        return None
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for label, desc, action in entries:
+        meta = action_meta(action)
+        course_name = str(meta.get("course_name") or "").strip() or "未分類課程"
+        group = grouped.setdefault(course_name, [])
+        clean_label = str(label or "未命名公告").strip()
+        clean_desc = str(desc or "").strip()
+        time_only = clean_desc.split("｜")[-1].strip() if "｜" in clean_desc else clean_desc
+        group.append((clean_label, time_only))
+
+    sections = ["請從下方下拉選單挑一則，我會直接幫你打開，不洗版。"]
+    display_counter = 1
+    for course_name, lines in grouped.items():
+        rendered_lines: list[str] = []
+        for clean_label, clean_desc in lines:
+            prefix = display_index_emoji(display_counter)
+            display_counter += 1
+            if clean_desc:
+                rendered_lines.append(f"{prefix} **{clean_label}**\n　🕒 {clean_desc}")
+            else:
+                rendered_lines.append(f"{prefix} **{clean_label}**")
+        sections.extend(
+            [
+                "",
+                strong_section_divider(f"📚 {course_name}"),
+                "",
+                "\n\n".join(rendered_lines),
+            ]
+        )
+
+    return discord.Embed(
+        title="選擇公告",
+        description="\n".join(sections).strip(),
+        color=discord.Color.blurple(),
+    )
+
+
 def build_grouped_selector_summary(
     entries: list[tuple[str, str, dict[str, str]]],
 ) -> discord.Embed | None:

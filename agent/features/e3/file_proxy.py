@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.parse import unquote
 
 import requests
 
@@ -24,6 +25,11 @@ from .client import get_runtime_root, make_user_key
 _USED_NONCES = {}
 _NONCE_LOCK = threading.Lock()
 _ALLOWED_HOSTS = {"e3p.nycu.edu.tw"}
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
 
 
 class FileProxyError(Exception):
@@ -204,14 +210,50 @@ def _load_cookie_dict(line_user_id):
     return {str(k): str(v) for k, v in data.items() if v}
 
 
+def sanitize_download_filename(filename: str | None, fallback_name: str = "download") -> str:
+    raw = unquote(str(filename or "")).replace("\xa0", " ")
+    raw = raw.replace("\\", "/").split("/")[-1]
+    raw = "".join(ch for ch in raw if ord(ch) >= 32 and ch not in '\x7f')
+    raw = raw.strip().strip(". ")
+    if not raw:
+        raw = fallback_name
+
+    invalid_chars = '<>:"/\\|?*'
+    raw = "".join("_" if ch in invalid_chars else ch for ch in raw)
+    raw = " ".join(raw.split())
+
+    suffix = Path(raw).suffix[:20]
+    stem = Path(raw).stem if suffix else raw
+    stem = stem.strip().strip(". ")
+    if not stem:
+        stem = Path(fallback_name).stem or "download"
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        stem = f"file_{stem}"
+
+    max_stem_len = 120 - len(suffix)
+    if max_stem_len < 16:
+        max_stem_len = 16
+    stem = stem[:max_stem_len].rstrip(". ")
+    sanitized = f"{stem}{suffix}" if suffix else stem
+    sanitized = sanitized.strip().strip(". ")
+    return sanitized or fallback_name
+
+
 def _filename_from_response(source_url, response, fallback_name="download"):
     disposition = response.headers.get("Content-Disposition") or ""
     for part in disposition.split(";"):
         part = part.strip()
+        if part.lower().startswith("filename*="):
+            value = part.split("=", 1)[1].strip().strip('"')
+            if "''" in value:
+                value = value.split("''", 1)[1]
+            return sanitize_download_filename(value, fallback_name)
+    for part in disposition.split(";"):
+        part = part.strip()
         if part.lower().startswith("filename="):
-            return part.split("=", 1)[1].strip().strip('"')
+            return sanitize_download_filename(part.split("=", 1)[1].strip().strip('"'), fallback_name)
     path_name = Path(urlsplit(source_url).path).name
-    return path_name or fallback_name
+    return sanitize_download_filename(path_name or fallback_name, fallback_name)
 
 
 def prepare_proxy_download(token):
@@ -248,7 +290,7 @@ def prepare_proxy_download(token):
     if not mimetypes.guess_extension(content_type.split(";")[0].strip()) and filename == "download":
         guessed = Path(urlsplit(payload["url"]).path).name
         if guessed:
-            filename = guessed
+            filename = sanitize_download_filename(guessed, "download")
 
     return {
         "response": response,
