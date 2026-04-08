@@ -4,6 +4,8 @@ import json
 import re
 from datetime import datetime
 
+from ..utils.common import normalize_title_token
+
 
 DATETIME_PATTERNS = [
     "%Y-%m-%d %H:%M",
@@ -276,17 +278,60 @@ def _assignment_is_completed(item):
     return bool(submitted_files)
 
 
+def _build_assignment_completion_map(payload):
+    mapping = {}
+    if not isinstance(payload, dict):
+        return mapping
+
+    assignments = payload.get("assignments") or {}
+    if isinstance(assignments, dict):
+        items = assignments.get("assignments")
+    elif isinstance(assignments, list):
+        items = assignments
+    else:
+        items = None
+
+    if not isinstance(items, list):
+        return mapping
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = normalize_title_token(item.get("title") or item.get("name"))
+        if not title:
+            continue
+        mapping[title] = _assignment_is_completed(item)
+    return mapping
+
+
+def _title_matches_completed_assignment(title_token, completion_map):
+    if not title_token or not isinstance(completion_map, dict):
+        return False
+    if completion_map.get(title_token) is True:
+        return True
+    for assignment_title, is_completed in completion_map.items():
+        if not is_completed:
+            continue
+        if min(len(title_token), len(assignment_title)) < 6:
+            continue
+        if title_token in assignment_title or assignment_title in title_token:
+            return True
+    return False
+
+
 def extract_events_from_fetch_all(data, calendar_events=None):
     if not isinstance(data, dict):
         data = {}
 
     events = []
     seen = set()
+    assignment_completion_by_course = {}
     for course_name, payload in data.items():
         if not isinstance(payload, dict):
             continue
 
         course_id = payload.get("_course_id")
+        assignment_completion_by_course[str(course_id or "").strip()] = _build_assignment_completion_map(payload)
 
         timetable_payload = payload.get("timetable") or {}
         if isinstance(timetable_payload, dict):
@@ -348,6 +393,11 @@ def extract_events_from_fetch_all(data, calendar_events=None):
 
             course_id = str(item.get("course_id") or "").strip() or None
             course_name = str(item.get("course_name") or "").strip()
+            event_type = _infer_event_type(title, fallback="calendar")
+            if event_type == "homework":
+                completion_map = assignment_completion_by_course.get(course_id or "", {})
+                if _title_matches_completed_assignment(normalize_title_token(title), completion_map):
+                    continue
             event_uid = _make_event_uid("calendar", item.get("event_id"), course_id, title, due_dt.isoformat())
             if event_uid in seen:
                 continue
@@ -355,7 +405,7 @@ def extract_events_from_fetch_all(data, calendar_events=None):
             events.append(
                 {
                     "event_uid": event_uid,
-                    "event_type": _infer_event_type(title, fallback="calendar"),
+                    "event_type": event_type,
                     "course_id": course_id,
                     "course_name": course_name,
                     "title": title,

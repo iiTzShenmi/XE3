@@ -11,6 +11,10 @@ def matches_course_keyword(course_label: str, keyword: str) -> bool:
     return right in left
 
 
+def normalize_title_token(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+
 def assignment_items(payload: dict[str, Any] | None) -> list[Any]:
     assignments = (payload or {}).get("assignments") or {}
     if isinstance(assignments, dict):

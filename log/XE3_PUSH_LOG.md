@@ -228,3 +228,14 @@
 - 驗證：
   - `py_compile` 通過
   - `cloudflared-watchdog.service` 重啟後正常運作
+
+### 19. Reminder 排除已繳作業
+- 修正 12 小時倒數提醒與定時 digest 會把「已經提交的作業」也一起推送的問題
+- `services/events.py` 現在在抽取 `calendar_upcoming` 類型的 homework 事件時，會先對照目前作業完成狀態，避免把已繳作業寫進 `events_cache`
+- `reminder/worker.py` 再補一層發送前過濾：即使資料庫裡還留著舊事件，也會依 runtime 內最新作業狀態排除已繳 homework
+- `build_test_reminder_payloads()` 也套用同樣規則，避免測試提醒時看到已繳作業
+- `utils/common.py` 新增共用標題正規化 helper，讓 homework 標題比對更穩定
+- 驗證：
+  - `py_compile` 通過
+  - 以現有 runtime/DB 實測，已繳 homework 會在 reminder 過濾掉
+  - `discord-bot.service` 重啟後正常運作

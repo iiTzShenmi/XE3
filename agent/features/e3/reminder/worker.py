@@ -8,11 +8,12 @@ from typing import Any, Callable, Optional
 
 from agent.core.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
 
-from ..services.client import login_and_sync, make_user_key
+from ..services.client import fetch_courses, login_and_sync, make_user_key
 from ..data.db import (
     get_e3_account_by_user_id,
     get_events_due_between,
     get_grade_items,
+    get_line_user_id_by_user_id,
     list_reminder_targets,
     list_sync_targets,
     log_notification,
@@ -23,6 +24,7 @@ from ..data.db import (
     upsert_grade_item,
 )
 from ..services.events import extract_events_from_fetch_all
+from ..utils.common import assignment_items, is_assignment_completed, normalize_title_token
 from .payloads import (
     COUNTDOWN_HOURS,
     DEFAULT_LOOKAHEAD_HOURS,
@@ -39,6 +41,79 @@ from ..services.secrets import decrypt_secret
 _STARTED = False
 _LOCK = threading.Lock()
 _WORKER_LOCK_HANDLE: Optional[Any] = None
+
+
+def _row_value(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        value = row.get(key, default)
+    else:
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+    return default if value is None else value
+
+
+def _build_assignment_completion_lookup(user_key: str, logger) -> dict[tuple[str, str], bool]:
+    try:
+        courses = fetch_courses(make_user_key(user_key))
+    except Exception:
+        logger.exception("e3_assignment_completion_lookup_failed user=%s", user_key)
+        return {}
+
+    lookup: dict[tuple[str, str], bool] = {}
+    for payload in (courses or {}).values():
+        if not isinstance(payload, dict):
+            continue
+        course_id = str(payload.get("_course_id") or "").strip()
+        if not course_id:
+            continue
+        for item in assignment_items(payload):
+            if not isinstance(item, dict):
+                continue
+            title = normalize_title_token(item.get("title") or item.get("name"))
+            if not title:
+                continue
+            lookup[(course_id, title)] = is_assignment_completed(item)
+    return lookup
+
+
+def _titles_similar(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if min(len(left), len(right)) < 6:
+        return False
+    return left in right or right in left
+
+
+def _is_completed_homework_event(row: Any, completion_lookup: dict[tuple[str, str], bool]) -> bool:
+    if str(_row_value(row, "event_type", "")).strip() != "homework":
+        return False
+    if not completion_lookup:
+        return False
+
+    course_id = str(_row_value(row, "course_id", "")).strip()
+    title = normalize_title_token(_row_value(row, "title", ""))
+    if not course_id or not title:
+        return False
+
+    if completion_lookup.get((course_id, title)) is True:
+        return True
+
+    for (lookup_course_id, lookup_title), is_completed in completion_lookup.items():
+        if not is_completed or lookup_course_id != course_id:
+            continue
+        if _titles_similar(title, lookup_title):
+            return True
+    return False
+
+
+def _filter_actionable_events(rows: list[Any], completion_lookup: dict[tuple[str, str], bool]) -> list[Any]:
+    if not rows:
+        return []
+    return [row for row in rows if not _is_completed_homework_event(row, completion_lookup)]
 
 
 def sync_grade_items(user_id: int, courses: dict[str, Any]) -> list[dict[str, Any]]:
@@ -167,15 +242,18 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         if row["login_status"] != "ok":
             continue
 
+        completion_lookup = _build_assignment_completion_lookup(str(row["line_user_id"]), logger)
+
         for hours_left in COUNTDOWN_HOURS:
             window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)
             window_end = (now + timedelta(hours=hours_left, seconds=tolerance)).astimezone(timezone.utc)
-            countdown_rows = get_events_due_between(
+            countdown_rows = list(get_events_due_between(
                 row["user_id"],
                 window_start.isoformat(),
                 window_end.isoformat(),
                 limit=10,
-            )
+            ))
+            countdown_rows = _filter_actionable_events(countdown_rows, completion_lookup)
             for event_row in countdown_rows:
                 countdown_key = f"{event_row['event_uid']}|{hours_left}h"
                 if notification_sent(row["user_id"], "countdown_alert", countdown_key):
@@ -197,7 +275,8 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         if notification_sent(row["user_id"], "scheduled_digest", dedupe_key):
             continue
 
-        events = get_events_due_between(row["user_id"], start_iso, end_iso, limit=8)
+        events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8))
+        events = _filter_actionable_events(events, completion_lookup)
         if not events:
             payload = build_empty_digest_payload(current_slot, row["line_user_id"])
             ok = push_fn(row["line_user_id"], payload)
@@ -270,14 +349,20 @@ def build_test_reminder_payloads(user_id: int) -> list[str]:
     now = taipei_now()
     start_iso = now.astimezone(timezone.utc).isoformat()
     end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
-    events = get_events_due_between(user_id, start_iso, end_iso, limit=5)
+    user_key = get_line_user_id_by_user_id(user_id) or "discord:test"
+
+    class _NullLogger:
+        def exception(self, *args, **kwargs):
+            return None
+
+    completion_lookup = _build_assignment_completion_lookup(user_key, _NullLogger())
+    events = list(get_events_due_between(user_id, start_iso, end_iso, limit=5))
+    events = _filter_actionable_events(events, completion_lookup)
     if not events:
-        user_key = "discord:test"
         return [
             build_empty_digest_payload("09:00", user_key=user_key),
             build_empty_digest_payload("21:00", user_key=user_key),
         ]
-    user_key = "discord:test"
     return [
         build_digest_payload(events, "09:00", user_key=user_key) or "",
         build_digest_payload(events, "21:00", user_key=user_key) or "",
