@@ -937,6 +937,96 @@ def _format_grade_target_result(result, *, cache_status, line_user_id):
                 f"每項先估 **{float(assumed_weight_each):.2f}%**。"
             )
 
+    def _metric_row(label, value, color="#0F172A"):
+        return {
+            "type": "box",
+            "layout": "baseline",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": label,
+                    "size": "sm",
+                    "color": "#475569",
+                    "flex": 4,
+                    "wrap": True,
+                },
+                {
+                    "type": "text",
+                    "text": value,
+                    "size": "sm",
+                    "weight": "bold",
+                    "color": color,
+                    "flex": 4,
+                    "wrap": True,
+                    "align": "end",
+                },
+            ],
+        }
+
+    def _note_block(text, tone="info"):
+        color_map = {
+            "info": ("#EFF6FF", "#1D4ED8"),
+            "warn": ("#FFF7ED", "#C2410C"),
+            "good": ("#F0FDF4", "#15803D"),
+            "bad": ("#FEF2F2", "#B91C1C"),
+        }
+        bg, fg = color_map.get(tone, color_map["info"])
+        return {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": bg,
+            "cornerRadius": "12px",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": text,
+                    "size": "sm",
+                    "wrap": True,
+                    "color": fg,
+                }
+            ],
+        }
+
+    def _remaining_item_card(item):
+        item_name = _shorten_title(item.get("item_name"), max_len=36)
+        needed_score = float(item.get("needed_score") or 0.0)
+        range_max = float(item.get("range_max") or 0.0)
+        weight = float(item.get("weight") or 0.0)
+        return {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F8FAFC",
+            "cornerRadius": "12px",
+            "paddingAll": "12px",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"🗂️ {item_name}",
+                    "weight": "bold",
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#0F172A",
+                },
+                {
+                    "type": "text",
+                    "text": f"🎯 目標：{needed_score:.1f} / {range_max:.1f}",
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#334155",
+                },
+                {
+                    "type": "text",
+                    "text": f"⚖️ 配分：{weight:.1f}%",
+                    "size": "sm",
+                    "wrap": True,
+                    "color": "#475569",
+                },
+            ],
+        }
+
     lines = [
         f"📊 **{title}**",
         f"**{course_label or '未命名課程'}**",
@@ -977,16 +1067,107 @@ def _format_grade_target_result(result, *, cache_status, line_user_id):
                 weight = float(item.get("weight") or 0.0)
                 lines.append(f"• **{item_name}**")
                 lines.append(f"  目標：**{needed_score:.1f} / {range_max:.1f}** ｜配分 {weight:.1f}%")
+                lines.append("")
             remaining = len(per_item_targets) - min(len(per_item_targets), 6)
             if remaining > 0:
                 lines.append(f"  還有 {remaining} 個項目未展開。")
 
     lines.extend(["", _format_cache_status_text(cache_status)])
     text = "\n".join(lines)
-    messages = [
-        _build_text_summary_flex(title, text, color="#7C3AED", alt_text=text),
-        *[item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item],
+    body_contents = [
+        {
+            "type": "text",
+            "text": course_label or "未命名課程",
+            "weight": "bold",
+            "size": "lg",
+            "wrap": True,
+            "color": "#0F172A",
+        },
+        {"type": "separator", "margin": "md"},
+        _metric_row("🎯 目標總成績", f"{target_grade:.1f}"),
+        _metric_row("📌 已辨識配分", f"{total_weight:.1f}%"),
+        _metric_row("✅ 已完成配分", f"{completed_weight:.1f}%"),
+        _metric_row("🕓 剩餘配分", f"{remaining_weight:.1f}%"),
+        _metric_row("📈 目前已拿到加權", f"{earned_weighted:.2f} 分", color="#7C3AED"),
     ]
+    if known_weight_note:
+        body_contents.extend([{"type": "separator", "margin": "md"}, _note_block(known_weight_note, "warn")])
+    if assumption_note:
+        body_contents.extend([{"type": "separator", "margin": "md"}, _note_block(assumption_note, "info")])
+
+    if status == "already_reached":
+        body_contents.extend([{"type": "separator", "margin": "md"}, _note_block("🎉 依目前已知配分來看，你已經達到這個目標了。", "good")])
+    elif status == "impossible":
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                _note_block(
+                    f"🚨 依目前已知配分來看，後續平均需要 {float(required_average or 0.0):.1f} / 100。這代表只靠剩餘項目已經無法達標，除非目前配分資料還不完整。",
+                    "bad",
+                ),
+            ]
+        )
+    elif status == "complete":
+        body_contents.extend([{"type": "separator", "margin": "md"}, _note_block("📦 目前已經沒有剩餘配分項目可試算。", "info")])
+    else:
+        body_contents.extend(
+            [
+                {"type": "separator", "margin": "md"},
+                _note_block(f"🧮 接下來平均需要：{float(required_average or 0.0):.1f} / 100", "info"),
+            ]
+        )
+        per_item_targets = list(result.get("per_item_targets") or [])
+        if per_item_targets:
+            body_contents.extend(
+                [
+                    {"type": "separator", "margin": "md"},
+                    {"type": "text", "text": "📝 剩餘項目估算", "weight": "bold", "size": "md", "color": "#0F172A"},
+                ]
+            )
+            for item in per_item_targets[:6]:
+                body_contents.append(_remaining_item_card(item))
+            remaining = len(per_item_targets) - min(len(per_item_targets), 6)
+            if remaining > 0:
+                body_contents.append(
+                    {
+                        "type": "text",
+                        "text": f"還有 {remaining} 個項目未展開。",
+                        "size": "xs",
+                        "wrap": True,
+                        "color": "#64748B",
+                    }
+                )
+
+    flex = {
+        "type": "flex",
+        "altText": text,
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#7C3AED",
+                "paddingAll": "12px",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": title,
+                        "color": "#FFFFFF",
+                        "weight": "bold",
+                        "size": "lg",
+                    }
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": body_contents,
+            },
+        },
+    }
+    messages = [flex, *[item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]]
     return _line_response(text, messages=messages)
 
 
