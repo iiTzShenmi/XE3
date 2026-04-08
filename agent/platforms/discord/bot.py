@@ -449,6 +449,14 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, "grades", interaction.user.id, bot=bot)
 
+    @e3_group.command(name="passcalc", description="試算這門課還需要拿幾分")
+    @app_commands.describe(course="要試算的課程", target="目標總成績（0-100）")
+    @app_commands.autocomplete(course=_autocomplete_course_files)
+    async def e3_passcalc(interaction: discord.Interaction, course: str, target: float):
+        await _remember_interaction_target(interaction)
+        await interaction.response.defer(thinking=True)
+        await _execute_e3_payload(interaction, f"成績試算 {course} {target}", interaction.user.id, bot=bot)
+
     @e3_group.command(name="files", description="瀏覽某一門課的檔案")
     @app_commands.autocomplete(keyword=_autocomplete_course_files)
     async def e3_files(interaction: discord.Interaction, keyword: str):

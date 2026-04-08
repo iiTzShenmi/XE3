@@ -249,3 +249,25 @@
 - 驗證：
   - `py_compile` 通過
   - `discord-bot.service` 重啟後正常運作
+
+### 21. Selenium Cleanup 與成績試算
+- 調整 `scraper/get_course/get_user_data.py` 的 Selenium driver lifecycle：
+  - 不再使用固定 `--remote-debugging-port=9222`
+  - 改成在 `try` 內建立 driver
+  - `finally` 中先判斷 `driver is not None` 再 `quit()`
+  - 避免 driver 初始化或登入流程異常時殘留背景 Chrome process
+- 新增 `services/grade_calculator.py`
+  - 解析 E3 成績中的 `weight` / `range` / `score`
+  - 計算目標總成績所需的剩餘平均與各項目估算分數
+  - 若老師未提供足夠配分資料，會明確回覆「暫時無法可靠試算」
+- `handler.py` 新增：
+  - `e3 成績試算 <課號或課名> <目標分數>`
+  - `e3 passcalc <課號或課名> <目標分數>`
+- Discord slash command 新增：
+  - `/e3 passcalc`
+  - 支援課程 autocomplete 與目標分數輸入
+- help 文案同步更新
+- 驗證：
+  - `py_compile` 通過
+  - 本地 smoke test 驗證 `成績試算` / `passcalc` 指令可正常回應
+  - `discord-bot.service` 重啟後正常運作

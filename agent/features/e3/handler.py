@@ -65,6 +65,7 @@ from .data.db import (
     upsert_user,
 )
 from .services.events import extract_events_from_fetch_all
+from .services.grade_calculator import calculate_grade_target
 from .data.file_proxy import build_proxy_url
 from .services.secrets import decrypt_secret, encrypt_secret
 
@@ -127,6 +128,7 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
                 f"• {_discord_command_hint('e3 week', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 news', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 grades', line_user_id)}\n"
+                f"• {_discord_command_hint('e3 成績試算 <課號或課名> <目標分數>', line_user_id)}\n"
                 f"• {_discord_command_hint('e3 files <課名關鍵字>', line_user_id)}\n"
                 "──────────\n"
                 "🗓️ **Timeline**\n"
@@ -152,8 +154,9 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
             "10) e3 詳情 <編號>\n"
             "11) e3 狀態\n"
             "12) e3 grades / e3 成績\n"
-            "13) e3 files <課名關鍵字>\n"
-            "14) e3 remind show/on/off/schedule both|morning|evening\n"
+            "13) e3 成績試算 <課號或課名> <目標分數>\n"
+            "14) e3 files <課名關鍵字>\n"
+            "15) e3 remind show/on/off/schedule both|morning|evening\n"
             "說明：課程指令會顯示目前學期（例如 114上 / 114下）"
         )
 
@@ -177,6 +180,9 @@ def handle_e3_command(text: str, logger: Logger, line_user_id: Optional[str] = N
 
     if action.startswith("成績詳情") or (verb in {"grade", "grades"} and len(tokens) >= 2 and tokens[1].lower() in {"detail", "details"}):
         return _grade_detail(action, tokens, logger, line_user_id)
+
+    if action.startswith("成績試算") or action.startswith("目標成績") or verb in {"passcalc", "gradecalc", "target"}:
+        return _grade_target(action, tokens, logger, line_user_id)
 
     if action_head == "成績" or verb in {"grade", "grades"}:
         return _list_grades(logger, line_user_id)
@@ -844,6 +850,161 @@ def _grade_detail(action, tokens, logger, line_user_id):
     messages = [item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item]
     messages.append(flex)
     return _line_response("\n".join(lines).strip(), messages=messages or None)
+
+
+def _parse_grade_target_request(action, tokens):
+    if not tokens:
+        return "", None
+
+    raw_tokens = list(tokens)
+    if raw_tokens and raw_tokens[0] in {"成績試算", "目標成績"}:
+        raw_tokens = raw_tokens[1:]
+    elif raw_tokens and raw_tokens[0].lower() in {"passcalc", "gradecalc", "target"}:
+        raw_tokens = raw_tokens[1:]
+
+    if len(raw_tokens) < 2:
+        match = re.match(r"^(?:成績試算|目標成績)\s+(.+?)\s+(-?\d+(?:\.\d+)?)\s*$", action.strip())
+        if not match:
+            return "", None
+        course_target = match.group(1).strip()
+        try:
+            return course_target, float(match.group(2))
+        except ValueError:
+            return course_target, None
+
+    target_token = str(raw_tokens[-1] or "").strip()
+    course_target = " ".join(str(part or "").strip() for part in raw_tokens[:-1]).strip()
+    try:
+        target_grade = float(target_token)
+    except ValueError:
+        target_grade = None
+    return course_target, target_grade
+
+
+def _format_grade_target_result(result, *, cache_status, line_user_id):
+    course_label = f"{result.get('course_id') or ''} {result.get('course_name') or ''}".strip()
+    title = "目標成績試算"
+
+    if not result.get("ok"):
+        if result.get("reason") == "no_weight_data":
+            text = (
+                f"📊 **{title}**\n"
+                f"**{course_label or '這門課'}**\n\n"
+                "目前抓到的 E3 成績資料沒有足夠的配分資訊，XE3 暫時沒辦法可靠試算。\n"
+                "通常是老師只放了分數，還沒填權重或配分。"
+            )
+        else:
+            text = f"📊 **{title}**\n目前暫時無法完成試算。"
+        text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
+        messages = [
+            _build_text_summary_flex(title, text, color="#7C3AED", alt_text=text),
+            *[item for item in [_build_cache_status_flex(cache_status, '成績快取')] if item],
+        ]
+        return _line_response(text, messages=messages)
+
+    target_grade = float(result.get("target_grade") or 0.0)
+    total_weight = float(result.get("total_weight") or 0.0)
+    completed_weight = float(result.get("completed_weight") or 0.0)
+    remaining_weight = float(result.get("remaining_weight") or 0.0)
+    earned_weighted = float(result.get("earned_weighted") or 0.0)
+    required_average = result.get("required_average")
+    status = str(result.get("status") or "").strip()
+    known_weight_note = ""
+    if total_weight < 99.5:
+        known_weight_note = f"⚠️ 目前只辨識到 **{total_weight:.1f}%** 配分，以下結果屬於估算。"
+
+    lines = [
+        f"📊 **{title}**",
+        f"**{course_label or '未命名課程'}**",
+        "",
+        f"🎯 目標總成績：**{target_grade:.1f}**",
+        f"📌 已辨識配分：**{total_weight:.1f}%**",
+        f"✅ 已完成配分：**{completed_weight:.1f}%**",
+        f"🕓 剩餘配分：**{remaining_weight:.1f}%**",
+        f"📈 目前已拿到加權：**{earned_weighted:.2f} 分**",
+    ]
+
+    if known_weight_note:
+        lines.extend(["", known_weight_note])
+
+    if status == "already_reached":
+        lines.extend(["", "🎉 依目前已知配分來看，你已經達到這個目標了。"])
+    elif status == "impossible":
+        lines.extend(
+            [
+                "",
+                f"🚨 依目前已知配分來看，後續平均需要 **{float(required_average or 0.0):.1f} / 100**。",
+                "這代表只靠剩餘項目已經無法達標，除非目前配分資料還不完整。",
+            ]
+        )
+    elif status == "complete":
+        lines.extend(["", "📦 目前已經沒有剩餘配分項目可試算。"])
+    else:
+        lines.extend(["", f"🧮 接下來平均需要：**{float(required_average or 0.0):.1f} / 100**"])
+        per_item_targets = list(result.get("per_item_targets") or [])
+        if per_item_targets:
+            lines.extend(["", "━━━━━━━━━━━━", "📝 剩餘項目估算", "━━━━━━━━━━━━"])
+            for item in per_item_targets[:6]:
+                item_name = _shorten_title(item.get("item_name"), max_len=36)
+                needed_score = float(item.get("needed_score") or 0.0)
+                range_max = float(item.get("range_max") or 0.0)
+                weight = float(item.get("weight") or 0.0)
+                lines.append(f"• **{item_name}**")
+                lines.append(f"  目標：**{needed_score:.1f} / {range_max:.1f}** ｜配分 {weight:.1f}%")
+            remaining = len(per_item_targets) - min(len(per_item_targets), 6)
+            if remaining > 0:
+                lines.append(f"  還有 {remaining} 個項目未展開。")
+
+    lines.extend(["", _format_cache_status_text(cache_status)])
+    text = "\n".join(lines)
+    messages = [
+        _build_text_summary_flex(title, text, color="#7C3AED", alt_text=text),
+        *[item for item in [_build_cache_status_flex(cache_status, "成績快取")] if item],
+    ]
+    return _line_response(text, messages=messages)
+
+
+def _grade_target(action, tokens, logger, line_user_id):
+    target, target_grade = _parse_grade_target_request(action, tokens)
+    if not target or target_grade is None:
+        hint = _discord_command_hint("e3 成績試算 <課號或課名> <目標分數>", line_user_id)
+        return f"請使用 {hint}。" if _is_discord_user_key(line_user_id) else "用法：e3 成績試算 <課號或課名> <目標分數>"
+    if target_grade <= 0 or target_grade > 100:
+        return "目標分數請輸入 0 到 100 之間的數字。"
+
+    try:
+        data = fetch_courses(make_user_key(line_user_id))
+        cache_status = get_cache_status(make_user_key(line_user_id))
+    except Exception as exc:
+        logger.error("e3_grade_target_failed error=%s", exc)
+        return (
+            f"⚠️ XE3 暫時讀不到成績資料。\n先試試 {_discord_command_hint('e3 relogin', line_user_id)}。"
+            if _is_discord_user_key(line_user_id)
+            else "E3 成績資料讀取失敗，請先 `e3 relogin`。"
+        )
+
+    semester_tag = _current_semester_tag()
+    matched_payload = None
+    for display_name, payload in _current_semester_courses(data, semester_tag=semester_tag):
+        course_id = str((payload or {}).get("_course_id") or "").strip()
+        course_name = _course_name_for_display(display_name)
+        searchable = f"{course_id} {course_name}"
+        if _matches_course_keyword(searchable, target):
+            matched_payload = dict(payload or {})
+            matched_payload.setdefault("_course_id", course_id)
+            matched_payload.setdefault("_folder_name", display_name)
+            matched_payload.setdefault("course_name", course_name)
+            break
+
+    if matched_payload is None:
+        return (
+            f"📊 我找不到和 **{target}** 對應的課程。"
+            if _is_discord_user_key(line_user_id)
+            else f"找不到「{target}」對應的課程。"
+        )
+
+    result = calculate_grade_target(matched_payload, target_grade)
+    return _format_grade_target_result(result, cache_status=cache_status, line_user_id=line_user_id)
 
 
 def _normalize_news_text(value: Any) -> str:

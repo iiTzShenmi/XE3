@@ -27,16 +27,17 @@ def login_and_get_cookies(account, password):
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--remote-debugging-port=9222")
+    chrome_options.add_argument("--remote-debugging-port=0")
     if config.SELENIUM_HEADLESS:
         chrome_options.add_argument("--headless=new")
     else:
         chrome_options.add_argument("--start-maximized")
     _clear_cookie_file()
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.set_page_load_timeout(config.SELENIUM_PAGE_LOAD_TIMEOUT)
+    driver = None
 
     try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(config.SELENIUM_PAGE_LOAD_TIMEOUT)
         print("[*] Opening E3 login page...")
         driver.get(config.E3_LOGIN_URL)
 
@@ -68,7 +69,11 @@ def login_and_get_cookies(account, password):
         print(f"[!] Login failed: {e}")
         return {}
     finally:
-        driver.quit()
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def load_cookies():
