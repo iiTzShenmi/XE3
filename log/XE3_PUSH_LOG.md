@@ -271,3 +271,18 @@
   - `py_compile` 通過
   - 本地 smoke test 驗證 `成績試算` / `passcalc` 指令可正常回應
   - `discord-bot.service` 重啟後正常運作
+
+### 22. 清理非 Discord 舊帳號資料
+- `data/db.py` 的 `delete_user_data()` 補上完整刪除：
+  - 會一併刪除 `discord_delivery_targets`
+  - 最後也會刪除 `users` 主表列，避免留下孤兒帳號
+- 本機資料清理：
+  - 移除舊的 LINE-style 使用者資料與 runtime 工作目錄
+  - `/e3 refresh` 的掃描名單現在只剩 Discord 使用者
+- 備註：
+  - 這次屬於本機資料清理，實際刪掉的 user/runtime 不會反映在 Git 內
+
+### 23. 修正 `.gitignore` 誤傷 source module
+- 將 `.gitignore` 中過於寬鬆的 `data/` 規則改成只忽略 repo 根目錄的 `/data/`
+- 讓 `agent/features/e3/data/` 與 `agent/features/weather/data/` 這些 canonical source module 可以正常被 Git 追蹤
+- 避免出現「本機有新結構，但遠端 repo 少了實際模組檔」的風險
