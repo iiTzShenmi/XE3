@@ -89,6 +89,16 @@ def discord_bot_token():
     return os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
 
+def discord_notify_user_id():
+    value = os.getenv("DISCORD_NOTIFY_USER_ID", "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def discord_command_prefix():
     return os.getenv("DISCORD_COMMAND_PREFIX", "!").strip() or "!"
 

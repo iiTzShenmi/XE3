@@ -125,6 +125,7 @@ Some old top-level modules still exist as thin wrappers so the app can keep runn
    LINE_NOTIFY_USER_ID=...
    PUBLIC_BASE_URL=auto
    FILE_PROXY_SECRET=...
+   DISCORD_NOTIFY_USER_ID=910458731475660860
    E3_FILE_PROXY_TTL_SECONDS=300
    E3_FILE_PROXY_MAX_BYTES=26214400
    ```
@@ -186,7 +187,7 @@ cat /home/eason/xe3/data/cloudflared/current_url
 Important:
 
 - `PUBLIC_BASE_URL=auto` lets the app read the current tunnel URL from `data/cloudflared/current_url`
-- the watchdog sends LINE alerts when the tunnel goes down or recovers
+- the watchdog sends Discord DM alerts to `DISCORD_NOTIFY_USER_ID` when the tunnel goes down or recovers
 - quick tunnel URLs can change after restart
 
 If you want these user services to stay up even when you are not actively logged in, enable linger once:

@@ -5,14 +5,14 @@ import time
 import requests
 
 from agent.core.config import (
-    line_channel_access_token,
+    discord_bot_token,
+    discord_notify_user_id,
     public_base_url,
     tunnel_watchdog_state_file,
 )
 
 
 WATCH_INTERVAL_SECONDS = 60
-RECIPIENT_ENV_FALLBACK = "LINE_NOTIFY_USER_ID"
 
 
 def load_state():
@@ -29,27 +29,44 @@ def save_state(state):
     tunnel_watchdog_state_file().write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
-def line_recipient():
-    import os
+def _discord_headers() -> dict[str, str] | None:
+    token = discord_bot_token()
+    if not token:
+        return None
+    return {
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "XE3-Watchdog/1.0",
+    }
 
-    return os.getenv(RECIPIENT_ENV_FALLBACK, "").strip()
 
-
-def push_line_message(text):
-    token = line_channel_access_token()
-    recipient = line_recipient()
-    if not token or not recipient:
+def push_discord_dm(text):
+    headers = _discord_headers()
+    recipient = discord_notify_user_id()
+    if not headers or not recipient:
         return False
     try:
-        response = requests.post(
-            "https://api.line.me/v2/bot/message/push",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"to": recipient, "messages": [{"type": "text", "text": text}]},
+        channel_response = requests.post(
+            "https://discord.com/api/v10/users/@me/channels",
+            headers=headers,
+            json={"recipient_id": str(recipient)},
             timeout=10,
         )
-        if response.status_code == 429:
+        if channel_response.status_code == 429:
             return False
-        response.raise_for_status()
+        channel_response.raise_for_status()
+        channel_id = (channel_response.json() or {}).get("id")
+        if not channel_id:
+            return False
+        message_response = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers=headers,
+            json={"content": text[:1900]},
+            timeout=10,
+        )
+        if message_response.status_code == 429:
+            return False
+        message_response.raise_for_status()
         return True
     except requests.RequestException:
         return False
@@ -81,9 +98,9 @@ def main():
             save_state(state)
         elif previous != healthy:
             if healthy:
-                push_line_message(f"✅ Cloudflare tunnel 已恢復\n{detail}")
+                push_discord_dm(f"✅ Cloudflare tunnel 已恢復\n{detail}")
             else:
-                push_line_message(f"⚠️ Cloudflare tunnel 目前無法連線\n{detail}")
+                push_discord_dm(f"⚠️ Cloudflare tunnel 目前無法連線\n{detail}")
             state = {"healthy": healthy, "detail": detail}
             save_state(state)
 
