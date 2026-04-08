@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/server
-Environment=PYTHONPATH=%h/server
-EnvironmentFile=%h/server/.env
-ExecStart=%h/server/venv/bin/python %h/server/app.py
+WorkingDirectory=%h/xe3
+Environment=PYTHONPATH=%h/xe3
+EnvironmentFile=%h/xe3/.env
+ExecStart=%h/xe3/venv/bin/python %h/xe3/apps/web/main.py
 Restart=always
 RestartSec=5
 

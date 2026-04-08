@@ -9,3 +9,4 @@ scripts/**/__pycache__/
 agent/features/e3/*.har
 agent/features/e3/scraper/*.har
 agent/features/e3/scraper/course_timetable/
+agent/features/e3/references/

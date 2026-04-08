@@ -3,7 +3,7 @@ from typing import Any
 
 import discord
 
-from agent.features.e3.payloads import META_KEY
+from agent.features.e3.views.payloads import META_KEY
 
 
 _EMOJI_INDEX = {

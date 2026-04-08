@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import discord
 import requests
 
-from agent.features.e3.file_proxy import (
+from agent.features.e3.data.file_proxy import (
     FileProxyError,
     prepare_proxy_download,
     prepare_user_download,

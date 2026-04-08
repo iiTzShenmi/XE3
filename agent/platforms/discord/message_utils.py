@@ -4,7 +4,7 @@ from typing import Any
 
 import discord
 
-from agent.features.e3.payloads import META_KEY, merge_meta, message_meta, payload_meta
+from agent.features.e3.views.payloads import META_KEY, merge_meta, message_meta, payload_meta
 from agent.platforms.discord.rendering import bubble_description, bubble_header_lines, bubble_title, format_discord_text, hex_to_color
 
 

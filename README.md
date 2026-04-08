@@ -1,6 +1,8 @@
-# XE3 / HomeVault
+# XE3
 
-A LINE bot focused on E3 course access, timelines, reminders, and lightweight utility features.
+XE3 is the academic assistant project in this workspace. It focuses on E3 course access, timelines, reminders, Discord/LINE delivery, and lightweight utility features.
+
+This repository now keeps XE3 code clearly separated from HomeVault projects. XE3 lives in `~/xe3`, while HomeVault-related projects live under `~/homevault`.
 
 ## Features
 
@@ -13,22 +15,61 @@ A LINE bot focused on E3 course access, timelines, reminders, and lightweight ut
 ## Project Layout
 
 ```text
-app.py
+apps/
+  web/
+    main.py
+  discord/
+    main.py
+  line/
+    main.py
 agent/
-  config.py
+  core/
+    config.py
+    system_status.py
   platforms/
+    discord/
+      ...
     line/
       app.py
       background.py
       messaging.py
   features/
     e3/
-      client.py
-      db.py
-      events.py
-      file_proxy.py
+      service.py
       handler.py
+      common.py        # compatibility wrapper
+      data/
+        db.py
+        course_runtime.py
+        file_catalog.py
+        file_proxy.py
+      reminder/
+        api.py
+        payloads.py
+        worker.py
+      services/
+        client.py
+        events.py
+        secrets.py
+      utils/
+        common.py
+      views/
+        course_cards.py
+        file_views.py
+        timeline_views.py
+        payloads.py
+      scraper/
+        ...
+      references/
+        har/
+        js/
     weather/
+      service.py
+      data/
+        city_data.py
+      services/
+        geolocation.py
+        weather_api.py
 scripts/
   line_rich_menu.py
   cloudflared_tunnel.py
@@ -37,6 +78,27 @@ deploy/
   systemd/
 data/
 ```
+
+## Canonical Modules
+
+XE3 is currently in a compatibility period. The new structure above is the canonical one we should read and extend first.
+
+- `agent/core/`
+  - shared runtime config and system status helpers
+- `agent/features/e3/data/`
+  - database, runtime cache, file catalog, file proxy
+- `agent/features/e3/services/`
+  - E3 fetch, event extraction, secret handling
+- `agent/features/e3/reminder/`
+  - reminder scheduler, payload building, worker entrypoints
+- `agent/features/e3/views/`
+  - Flex / payload builders and presentation helpers
+- `agent/features/e3/utils/`
+  - shared E3 formatting and normalization helpers
+- `agent/features/weather/data/` and `agent/features/weather/services/`
+  - city lookup and API access
+
+Some old top-level modules still exist as thin wrappers so the app can keep running during refactors. New code should prefer the canonical paths above.
 
 ## Setup
 
@@ -53,7 +115,7 @@ data/
    pip install -r requirements.txt
    ```
 
-3. Configure [`.env`](/home/eason/server/.env):
+3. Configure [`.env`](/home/eason/xe3/.env):
 
    ```env
    PORT=5000
@@ -70,7 +132,7 @@ data/
 4. Run:
 
    ```bash
-   python3 app.py
+   python3 apps/web/main.py
    ```
 
 ## Common Commands
@@ -97,7 +159,7 @@ e3 remind off
 Create and bind the persistent rich menu with:
 
 ```bash
-/home/eason/server/venv/bin/python /home/eason/server/scripts/line_rich_menu.py
+/home/eason/xe3/venv/bin/python /home/eason/xe3/scripts/line_rich_menu.py
 ```
 
 ## Temporary Public Tunnel
@@ -118,7 +180,7 @@ systemctl --user status cloudflared-tunnel.service
 systemctl --user status cloudflared-watchdog.service
 journalctl --user -u cloudflared-tunnel.service -f
 journalctl --user -u cloudflared-watchdog.service -f
-cat /home/eason/server/data/cloudflared/current_url
+cat /home/eason/xe3/data/cloudflared/current_url
 ```
 
 Important:
@@ -150,7 +212,7 @@ loginctl show-user eason | grep Linger
 Discord support is scaffolded in the repo with a separate entrypoint:
 
 ```bash
-/home/eason/server/venv/bin/python /home/eason/server/discord_bot.py
+/home/eason/xe3/venv/bin/python /home/eason/xe3/apps/discord/main.py
 ```
 
 Environment variables:
@@ -194,7 +256,7 @@ Install and start:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp /home/eason/server/deploy/systemd/discord-bot.service ~/.config/systemd/user/
+cp /home/eason/xe3/deploy/systemd/discord-bot.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now discord-bot.service
 ```

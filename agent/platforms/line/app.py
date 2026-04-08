@@ -8,16 +8,16 @@ import time
 import requests
 from flask import Flask, Response, request
 
-from agent.config import (
+from agent.core.config import (
     auto_reload_enabled,
     cloudflared_url_file,
     line_notify_user_id,
     port,
     tunnel_watchdog_state_file,
 )
-from agent.features.weather import handle_city_weather, handle_location_weather
-from agent.features.e3 import handle_e3_command
-from agent.features.e3.file_proxy import FileProxyError, FileProxySessionExpired, prepare_proxy_download
+from agent.features.weather.service import handle_city_weather, handle_location_weather
+from agent.features.e3.service import handle_e3_command
+from agent.features.e3.data.file_proxy import FileProxyError, FileProxySessionExpired, prepare_proxy_download
 from agent.platforms.line.background import (
     build_processing_ack,
     is_background_e3_command,

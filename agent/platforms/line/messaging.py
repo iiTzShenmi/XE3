@@ -4,7 +4,7 @@ import hmac
 
 import requests
 
-from agent.config import line_channel_access_token, line_channel_secret
+from agent.core.config import line_channel_access_token, line_channel_secret
 
 
 LINE_TEXT_LIMIT = 5000

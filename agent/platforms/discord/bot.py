@@ -6,17 +6,17 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from agent.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
-from agent.features.e3 import handle_e3_command, run_e3_async_command
-from agent.features.e3.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
-from agent.features.e3.reminders import build_test_reminder_payloads, refresh_all_saved_accounts, start_reminder_worker
-from agent.features.weather import handle_city_weather
+from agent.core.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
+from agent.features.e3.service import handle_e3_command, run_e3_async_command
+from agent.features.e3.data.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
+from agent.features.e3.reminder.api import build_test_reminder_payloads, refresh_all_saved_accounts, start_reminder_worker
+from agent.features.weather.service import handle_city_weather
 from agent.platforms.discord.command_helpers import autocomplete_course_files, build_help_text
 from agent.platforms.discord.file_delivery import download_discord_attachment
 from agent.platforms.discord.message_utils import send_text_chunks as _send_text_chunks
 from agent.platforms.discord.payload_sender import edit_message_from_payload, send_payload
 from agent.platforms.discord.views import DiscordViewCallbacks, E3LoginModal
-from agent.system_status import build_system_report
+from agent.core.system_status import build_system_report
 
 
 logger = logging.getLogger(__name__)

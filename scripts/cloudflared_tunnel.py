@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent.config import cloudflared_log_file, cloudflared_url_file, port
+from agent.core.config import cloudflared_log_file, cloudflared_url_file, port
 
 
 URL_PATTERN = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)

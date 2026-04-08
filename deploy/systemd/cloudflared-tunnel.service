@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/server
-Environment=PYTHONPATH=%h/server
-ExecStart=%h/server/venv/bin/python %h/server/scripts/cloudflared_tunnel.py
+WorkingDirectory=%h/xe3
+Environment=PYTHONPATH=%h/xe3
+ExecStart=%h/xe3/venv/bin/python %h/xe3/scripts/cloudflared_tunnel.py
 Restart=always
 RestartSec=5
 

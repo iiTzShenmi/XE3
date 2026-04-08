@@ -4,7 +4,7 @@ import time
 
 import requests
 
-from agent.config import (
+from agent.core.config import (
     line_channel_access_token,
     public_base_url,
     tunnel_watchdog_state_file,

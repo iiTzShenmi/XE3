@@ -5,10 +5,10 @@ from datetime import datetime, timedelta, timezone
 from logging import Logger
 from typing import Any, Optional
 
-from .client import check_status, fetch_courses, fetch_file_links, fetch_timeline_snapshot, get_cache_status, login_and_sync, make_user_key
-from .client import clear_runtime_data
-from . import course_runtime, file_catalog
-from .common import (
+from .services.client import check_status, fetch_courses, fetch_file_links, fetch_timeline_snapshot, get_cache_status, login_and_sync, make_user_key
+from .services.client import clear_runtime_data
+from .data import course_runtime, file_catalog
+from .utils.common import (
     assignment_items as _assignment_items,
     course_name_for_display as _course_name_for_display,
     current_semester_tag as _current_semester_tag,
@@ -24,7 +24,7 @@ from .common import (
     shorten_course_name as _shorten_course_name,
     shorten_title as _shorten_title,
 )
-from .file_views import (
+from .views.file_views import (
     _build_file_course_bubble,
     _build_file_download_flex,
     _build_file_folder_bubble,
@@ -32,7 +32,7 @@ from .file_views import (
     _file_page_size,
     _payload_file_entries,
 )
-from .timeline_views import (
+from .views.timeline_views import (
     _build_detail_flex,
     _build_timeline_flex,
     _event_payload,
@@ -42,9 +42,9 @@ from .timeline_views import (
     _timeline_heading,
     _timeline_rows_sorted,
 )
-from .course_cards import build_course_detail_flex, build_course_summary_flex
-from .payloads import attach_message_meta, line_response
-from .db import (
+from .views.course_cards import build_course_detail_flex, build_course_summary_flex
+from .views.payloads import attach_message_meta, line_response
+from .data.db import (
     delete_user_data,
     ensure_reminder_prefs,
     get_event_by_uid,
@@ -64,9 +64,9 @@ from .db import (
     upsert_event,
     upsert_user,
 )
-from .events import extract_events_from_fetch_all
-from .file_proxy import build_proxy_url
-from .secrets import decrypt_secret, encrypt_secret
+from .services.events import extract_events_from_fetch_all
+from .data.file_proxy import build_proxy_url
+from .services.secrets import decrypt_secret, encrypt_secret
 
 
 ASYNC_ACTIONS = {"login", "relogin", "重新登入"}
