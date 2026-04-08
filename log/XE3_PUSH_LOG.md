@@ -239,3 +239,13 @@
   - `py_compile` 通過
   - 以現有 runtime/DB 實測，已繳 homework 會在 reminder 過濾掉
   - `discord-bot.service` 重啟後正常運作
+
+### 20. Reminder 發送前輕量同步
+- homework reminder 現在在真正送出前，會先檢查該使用者最近是否已同步
+- 若最近 10 分鐘內沒有成功同步，而且這次提醒候選中包含 homework，worker 會先做一次輕量 sync，再重新判斷事件是否仍需提醒
+- 這層 pre-sync 只在需要時觸發，不會每次 poll 都對所有使用者刷新，避免不必要負載
+- pre-sync 若失敗，不會把使用者的 `login_status` 汙染成 `error`，避免因短暫網路問題把整條提醒鏈停掉
+- `Test Reminder` 也會先做同樣的 pre-sync，再產生測試 payload
+- 驗證：
+  - `py_compile` 通過
+  - `discord-bot.service` 重啟後正常運作

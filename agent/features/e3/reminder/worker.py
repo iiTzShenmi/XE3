@@ -3,7 +3,7 @@ from __future__ import annotations
 import fcntl
 import threading
 import time
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from agent.core.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
@@ -41,6 +41,7 @@ from ..services.secrets import decrypt_secret
 _STARTED = False
 _LOCK = threading.Lock()
 _WORKER_LOCK_HANDLE: Optional[Any] = None
+PRE_REMINDER_SYNC_MINUTES = 10
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -116,6 +117,32 @@ def _filter_actionable_events(rows: list[Any], completion_lookup: dict[tuple[str
     return [row for row in rows if not _is_completed_homework_event(row, completion_lookup)]
 
 
+def _parse_iso_timestamp(value: Any):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _has_homework_events(rows: list[Any]) -> bool:
+    return any(str(_row_value(row, "event_type", "")).strip() == "homework" for row in rows or [])
+
+
+def _recently_synced(row: Any, now, minutes: int = PRE_REMINDER_SYNC_MINUTES) -> bool:
+    synced_at = _parse_iso_timestamp(_row_value(row, "account_updated_at"))
+    if synced_at is None:
+        return False
+    if getattr(synced_at, "tzinfo", None) is None:
+        synced_at = synced_at.replace(tzinfo=timezone.utc)
+    else:
+        synced_at = synced_at.astimezone(timezone.utc)
+    current = now.astimezone(timezone.utc)
+    return (current - synced_at) <= timedelta(minutes=minutes)
+
+
 def sync_grade_items(user_id: int, courses: dict[str, Any]) -> list[dict[str, Any]]:
     existing = {(row["course_id"], row["item_name"]): row["score"] for row in get_grade_items(user_id)}
     changes = []
@@ -130,7 +157,7 @@ def sync_grade_items(user_id: int, courses: dict[str, Any]) -> list[dict[str, An
     return changes
 
 
-def sync_user_snapshot(row: Any, logger) -> tuple[list[dict[str, Any]], bool]:
+def sync_user_snapshot(row: Any, logger, persist_failure: bool = True) -> tuple[list[dict[str, Any]], bool]:
     account_row = get_e3_account_by_user_id(row["user_id"])
     if not account_row or not account_row["encrypted_password"]:
         return [], False
@@ -166,7 +193,8 @@ def sync_user_snapshot(row: Any, logger) -> tuple[list[dict[str, Any]], bool]:
         return grade_changes, True
     except Exception as exc:
         logger.exception("e3_periodic_sync_failed user=%s", row["line_user_id"])
-        update_login_state(row["user_id"], "error", str(exc))
+        if persist_failure:
+            update_login_state(row["user_id"], "error", str(exc))
         return [], False
 
 
@@ -242,18 +270,61 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         if row["login_status"] != "ok":
             continue
 
-        completion_lookup = _build_assignment_completion_lookup(str(row["line_user_id"]), logger)
-
+        countdown_windows: dict[int, list[Any]] = {}
         for hours_left in COUNTDOWN_HOURS:
             window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)
             window_end = (now + timedelta(hours=hours_left, seconds=tolerance)).astimezone(timezone.utc)
-            countdown_rows = list(get_events_due_between(
-                row["user_id"],
-                window_start.isoformat(),
-                window_end.isoformat(),
-                limit=10,
-            ))
-            countdown_rows = _filter_actionable_events(countdown_rows, completion_lookup)
+            countdown_windows[hours_left] = list(
+                get_events_due_between(
+                    row["user_id"],
+                    window_start.isoformat(),
+                    window_end.isoformat(),
+                    limit=10,
+                )
+            )
+
+        schedule = load_schedule(row)
+        digest_key = f"{now.date().isoformat()} {current_slot}"
+        digest_enabled = current_slot in schedule and not notification_sent(row["user_id"], "scheduled_digest", digest_key)
+        digest_events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8)) if digest_enabled else []
+
+        needs_homework_guard = _has_homework_events(digest_events) or any(
+            _has_homework_events(rows) for rows in countdown_windows.values()
+        )
+        completion_lookup: dict[tuple[str, str], bool] = {}
+        if needs_homework_guard:
+            if not _recently_synced(row, now):
+                _, sync_ok = sync_user_snapshot(row, logger, persist_failure=False)
+                log_notification(
+                    row["user_id"],
+                    "pre_reminder_sync",
+                    "sent" if sync_ok else "failed",
+                    details=now.strftime("%Y-%m-%d %H:%M"),
+                )
+                if sync_ok:
+                    countdown_windows = {}
+                    for hours_left in COUNTDOWN_HOURS:
+                        window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)
+                        window_end = (now + timedelta(hours=hours_left, seconds=tolerance)).astimezone(timezone.utc)
+                        countdown_windows[hours_left] = list(
+                            get_events_due_between(
+                                row["user_id"],
+                                window_start.isoformat(),
+                                window_end.isoformat(),
+                                limit=10,
+                            )
+                        )
+                    if digest_enabled:
+                        digest_events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8))
+            completion_lookup = _build_assignment_completion_lookup(str(row["line_user_id"]), logger)
+            countdown_windows = {
+                hours_left: _filter_actionable_events(rows, completion_lookup)
+                for hours_left, rows in countdown_windows.items()
+            }
+            digest_events = _filter_actionable_events(digest_events, completion_lookup)
+
+        for hours_left in COUNTDOWN_HOURS:
+            countdown_rows = countdown_windows.get(hours_left) or []
             for event_row in countdown_rows:
                 countdown_key = f"{event_row['event_uid']}|{hours_left}h"
                 if notification_sent(row["user_id"], "countdown_alert", countdown_key):
@@ -267,7 +338,6 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
                     event_uid=event_row["event_uid"],
                 )
 
-        schedule = load_schedule(row)
         if current_slot not in schedule:
             continue
 
@@ -275,8 +345,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         if notification_sent(row["user_id"], "scheduled_digest", dedupe_key):
             continue
 
-        events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8))
-        events = _filter_actionable_events(events, completion_lookup)
+        events = digest_events
         if not events:
             payload = build_empty_digest_payload(current_slot, row["line_user_id"])
             ok = push_fn(row["line_user_id"], payload)
@@ -346,15 +415,18 @@ def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger, target_pr
 
 
 def build_test_reminder_payloads(user_id: int) -> list[str]:
-    now = taipei_now()
-    start_iso = now.astimezone(timezone.utc).isoformat()
-    end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
     user_key = get_line_user_id_by_user_id(user_id) or "discord:test"
 
     class _NullLogger:
         def exception(self, *args, **kwargs):
             return None
 
+    if user_key:
+        sync_user_snapshot({"user_id": user_id, "line_user_id": user_key}, _NullLogger(), persist_failure=False)
+
+    now = taipei_now()
+    start_iso = now.astimezone(timezone.utc).isoformat()
+    end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
     completion_lookup = _build_assignment_completion_lookup(user_key, _NullLogger())
     events = list(get_events_due_between(user_id, start_iso, end_iso, limit=5))
     events = _filter_actionable_events(events, completion_lookup)
