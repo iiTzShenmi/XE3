@@ -45,45 +45,93 @@ def _parse_range_max(value: Any) -> float | None:
     return max(numbers)
 
 
-def _weighted_items_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _grade_items_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     grades_payload = (payload or {}).get("grades") or {}
     items = grades_payload.get("grade_items") if isinstance(grades_payload, dict) else None
     if not isinstance(items, list):
         return []
 
-    weighted_items: list[dict[str, Any]] = []
+    parsed_items: list[dict[str, Any]] = []
     for row in items:
         if not isinstance(row, dict):
             continue
         if row.get("is_category") or row.get("is_calculated"):
             continue
-        weight = _parse_weight_percent(row.get("weight"))
         range_max = _parse_range_max(row.get("range"))
-        if weight is None or range_max is None or range_max <= 0:
+        if range_max is None or range_max <= 0:
             continue
         score = _parse_float(row.get("score"))
-        weighted_items.append(
+        weight = _parse_weight_percent(row.get("weight"))
+        parsed_items.append(
             {
                 "item_name": str(row.get("item_name") or "").strip() or "未命名項目",
                 "weight": weight,
                 "range_max": range_max,
                 "score": score,
+                "weight_source": "explicit" if weight is not None else "assumed",
             }
         )
-    return weighted_items
+    return parsed_items
+
+
+def _assign_missing_weights(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    explicit_items = [dict(item) for item in items if item.get("weight") is not None]
+    missing_items = [dict(item) for item in items if item.get("weight") is None]
+
+    explicit_weight_total = sum(float(item["weight"]) for item in explicit_items)
+    if not missing_items:
+        return explicit_items, {
+            "explicit_weight_total": explicit_weight_total,
+            "assumed_weight_count": 0,
+            "assumed_weight_each": None,
+            "assumption_mode": "explicit_only",
+        }
+
+    remaining_weight = 100.0 - explicit_weight_total
+    if explicit_weight_total < 0 or remaining_weight < 0:
+        return [], {
+            "explicit_weight_total": explicit_weight_total,
+            "assumed_weight_count": len(missing_items),
+            "assumed_weight_each": None,
+            "assumption_mode": "invalid_overweight",
+        }
+
+    assumed_each = remaining_weight / len(missing_items)
+    assigned_items = explicit_items
+    for item in missing_items:
+        item["weight"] = assumed_each
+        assigned_items.append(item)
+
+    assumption_mode = "all_equal" if explicit_weight_total == 0 else "remaining_equal"
+    return assigned_items, {
+        "explicit_weight_total": explicit_weight_total,
+        "assumed_weight_count": len(missing_items),
+        "assumed_weight_each": assumed_each,
+        "assumption_mode": assumption_mode,
+    }
 
 
 def calculate_grade_target(payload: dict[str, Any], target_grade: float) -> dict[str, Any]:
-    weighted_items = _weighted_items_from_payload(payload)
+    grade_items = _grade_items_from_payload(payload)
     course_id = str((payload or {}).get("_course_id") or "").strip()
     course_name = course_name_for_display((payload or {}).get("course_name") or (payload or {}).get("_folder_name") or "")
 
-    if not weighted_items:
+    if not grade_items:
         return {
             "ok": False,
             "reason": "no_weight_data",
             "course_id": course_id,
             "course_name": course_name,
+        }
+
+    weighted_items, weight_meta = _assign_missing_weights(grade_items)
+    if not weighted_items:
+        return {
+            "ok": False,
+            "reason": "invalid_weight_data",
+            "course_id": course_id,
+            "course_name": course_name,
+            **weight_meta,
         }
 
     total_weight = sum(float(item["weight"]) for item in weighted_items)
@@ -114,6 +162,7 @@ def calculate_grade_target(payload: dict[str, Any], target_grade: float) -> dict
             "required_average": None,
             "remaining_items": remaining_items,
             "status": "complete",
+            **weight_meta,
         }
 
     required_average = required_weighted / remaining_weight * 100.0
@@ -150,4 +199,5 @@ def calculate_grade_target(payload: dict[str, Any], target_grade: float) -> dict
         "per_item_targets": per_item_targets,
         "weighted_item_count": len(weighted_items),
         "status": status,
+        **weight_meta,
     }

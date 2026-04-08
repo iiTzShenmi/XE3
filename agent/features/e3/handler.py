@@ -893,6 +893,12 @@ def _format_grade_target_result(result, *, cache_status, line_user_id):
                 "目前抓到的 E3 成績資料沒有足夠的配分資訊，XE3 暫時沒辦法可靠試算。\n"
                 "通常是老師只放了分數，還沒填權重或配分。"
             )
+        elif result.get("reason") == "invalid_weight_data":
+            text = (
+                f"📊 **{title}**\n"
+                f"**{course_label or '這門課'}**\n\n"
+                "目前這門課的配分資料看起來不合理，已知配分總和超過 100%，XE3 先不幫你硬算，避免誤導。"
+            )
         else:
             text = f"📊 **{title}**\n目前暫時無法完成試算。"
         text = f"{text}\n\n{_format_cache_status_text(cache_status)}"
@@ -910,8 +916,26 @@ def _format_grade_target_result(result, *, cache_status, line_user_id):
     required_average = result.get("required_average")
     status = str(result.get("status") or "").strip()
     known_weight_note = ""
+    assumption_note = ""
     if total_weight < 99.5:
         known_weight_note = f"⚠️ 目前只辨識到 **{total_weight:.1f}%** 配分，以下結果屬於估算。"
+    assumed_weight_count = int(result.get("assumed_weight_count") or 0)
+    assumed_weight_each = result.get("assumed_weight_each")
+    explicit_weight_total = float(result.get("explicit_weight_total") or 0.0)
+    assumption_mode = str(result.get("assumption_mode") or "").strip()
+    if assumed_weight_count > 0 and assumed_weight_each is not None:
+        if assumption_mode == "all_equal":
+            assumption_note = (
+                f"🧩 這門課有 **{assumed_weight_count}** 個項目沒有標配分，"
+                f"XE3 先假設平均分攤：**100 ÷ {assumed_weight_count} = {float(assumed_weight_each):.2f}%**。"
+            )
+        elif assumption_mode == "remaining_equal":
+            remaining_pool = max(0.0, 100.0 - explicit_weight_total)
+            assumption_note = (
+                f"🧩 已知配分先保留 **{explicit_weight_total:.1f}%**，"
+                f"剩下 **{remaining_pool:.1f}%** 平均分給 **{assumed_weight_count}** 個未標配分項目，"
+                f"每項先估 **{float(assumed_weight_each):.2f}%**。"
+            )
 
     lines = [
         f"📊 **{title}**",
@@ -926,6 +950,8 @@ def _format_grade_target_result(result, *, cache_status, line_user_id):
 
     if known_weight_note:
         lines.extend(["", known_weight_note])
+    if assumption_note:
+        lines.extend(["", assumption_note])
 
     if status == "already_reached":
         lines.extend(["", "🎉 依目前已知配分來看，你已經達到這個目標了。"])
