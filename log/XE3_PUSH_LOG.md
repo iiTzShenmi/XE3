@@ -219,3 +219,12 @@
   - import smoke test 通過
   - `discord-bot.service` / `xe3-web.service` 重啟後正常運作
 - 額外修正：清掉仍佔用 5000 port 的舊 `/home/eason/server/app.py` 進程，恢復 `xe3-web.service`
+
+### 18. Tunnel Watchdog 改走 Discord DM
+- `scripts/tunnel_watchdog.py` 的自動狀態通知由 LINE push 改為 Discord DM
+- 新增 `DISCORD_NOTIFY_USER_ID` 設定，讓 watchdog 只私訊指定 Discord 使用者
+- 保留既有 watchdog 健康檢查與狀態檔機制，只替換通知出口
+- `README.md` 同步更新為 Discord DM 通知說明
+- 驗證：
+  - `py_compile` 通過
+  - `cloudflared-watchdog.service` 重啟後正常運作
