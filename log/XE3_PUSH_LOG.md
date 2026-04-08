@@ -169,3 +169,53 @@
   - 靜默刷新所有已儲存的 E3 帳號
   - 只回覆 owner 一則摘要，不會對其他使用者推播垃圾訊息
 - 在 `ENGINEERING_RULES.md` 補上維護型指令規則：owner-only，且預設不得廣播操作輸出
+
+### 16. XE3 Workspace Rename 與第二輪結構一致化
+- XE3 專案根目錄由 `~/server` 改名為 `~/xe3`
+- HomeVault 相關專案搬出 XE3：
+  - `~/homevault/IoT`
+  - `~/homevault/XiaoMiBot`
+- 暫時性 / prototype 工作區由 `~/temp` 改名為 `~/lab`
+- `lab/exmas` 更正為 `lab/exams`
+- XE3 新增 `apps/` 作為清楚的服務入口：
+  - `apps/web/main.py`
+  - `apps/discord/main.py`
+  - `apps/line/main.py`
+- XE3 新增 `agent/core/`：
+  - `config.py`
+  - `system_status.py`
+- Weather feature 收成一致結構：
+  - `service.py`
+  - `data/`
+  - `services/`
+- E3 feature 第二輪一致化：
+  - `data/`
+  - `views/`
+  - `services/`
+  - `reminder/`
+  - `scraper/`
+  - `references/`
+- 保留舊模組路徑的 thin wrapper，避免一次性搬移破壞既有 import
+- 更新 README 與 systemd template 路徑，讓 `~/xe3` 成為新的 canonical root
+
+### 17. Workspace 收尾與 Canonical Import 一致化
+- XE3 第二輪結構整理繼續往前推進：
+  - 新增 `agent/features/e3/utils/`，把共用 E3 helper 收到 `utils/common.py`
+  - `handler.py`、Discord 平台、LINE 平台、scripts、reminder、services 全面改用新的 canonical import 路徑
+- `README.md` 更新成目前真實結構：
+  - `data/`
+  - `services/`
+  - `reminder/`
+  - `views/`
+  - `utils/`
+  - 並明確標示哪些舊檔案只是 compatibility wrapper
+- 補上 workspace 說明文件（local only，不在 XE3 git repo 內）：
+  - `~/homevault/README.md`
+  - `~/homevault/XiaoMiBot/README.md`
+  - `~/lab/README.md`
+  - `~/lab/exams/README.md`
+- 驗證：
+  - `py_compile` 通過
+  - import smoke test 通過
+  - `discord-bot.service` / `xe3-web.service` 重啟後正常運作
+- 額外修正：清掉仍佔用 5000 port 的舊 `/home/eason/server/app.py` 進程，恢復 `xe3-web.service`
