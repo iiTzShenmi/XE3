@@ -6,6 +6,7 @@ from typing import Callable
 from discord import app_commands
 
 from agent.features.e3.services.client import fetch_courses, make_user_key
+from agent.features.e3.services.upload import E3UploadError, list_assignment_targets
 
 
 def cached_course_choices(discord_user_id: int, user_key_builder: Callable[[int], str], logger: logging.Logger) -> list[tuple[str, str]]:
@@ -57,6 +58,56 @@ async def autocomplete_course_files(
     return choices[:25]
 
 
+async def autocomplete_course_homework(
+    interaction,
+    current: str,
+    *,
+    user_key_builder: Callable[[int], str],
+    logger: logging.Logger,
+) -> list[app_commands.Choice[str]]:
+    current_lower = str(current or "").strip().lower()
+    try:
+        course = str(getattr(interaction.namespace, "course", "") or "").strip()
+    except Exception:
+        course = ""
+    if not course:
+        return []
+
+    try:
+        targets = list_assignment_targets(user_key_builder(interaction.user.id), course)
+    except E3UploadError:
+        return []
+    except Exception:
+        logger.exception("discord_homework_autocomplete_failed user=%s course=%s", interaction.user.id, course)
+        return []
+
+    choices: list[app_commands.Choice[str]] = []
+    seen_values: set[str] = set()
+    for target in targets:
+        haystack = f"{target.course_id} {target.course_name} {target.title} {target.cmid}".lower()
+        if current_lower and current_lower not in haystack:
+            continue
+        status = "已繳" if target.completed else "未繳"
+        due_text = format_due_for_choice(target.due_at)
+        name = f"{status}｜{target.title}"
+        if due_text:
+            name = f"{name}｜{due_text}"
+        value = target.value[:100]
+        if value in seen_values:
+            continue
+        seen_values.add(value)
+        choices.append(app_commands.Choice(name=name[:100], value=value))
+    return choices[:25]
+
+
+def format_due_for_choice(due_at: str) -> str:
+    text = str(due_at or "").strip()
+    if not text:
+        return ""
+    # Keep autocomplete labels compact; full due timestamps are shown in the normal E3 views.
+    return text.replace("\n", " ")[:36]
+
+
 def build_help_text(prefix: str) -> str:
     return (
         "🤖 XE3 Discord 助手\n"
@@ -73,6 +124,7 @@ def build_help_text(prefix: str) -> str:
         "• /e3 passcalc\n"
         "• /e3 files\n"
         "• /e3 remind\n"
+        "• /plot excel\n"
         "──────────\n"
         "🌦️ 工具\n"
         f"• {prefix}weather <城市>\n"

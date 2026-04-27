@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+import requests
+
 from agent.core.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
 
 from ..services.client import fetch_courses, login_and_sync, make_user_key
@@ -19,6 +21,7 @@ from ..data.db import (
     log_notification,
     mark_missing_events_inactive,
     notification_sent,
+    notification_succeeded,
     update_login_state,
     upsert_event,
     upsert_grade_item,
@@ -42,6 +45,23 @@ _STARTED = False
 _LOCK = threading.Lock()
 _WORKER_LOCK_HANDLE: Optional[Any] = None
 PRE_REMINDER_SYNC_MINUTES = 10
+TRANSIENT_SYNC_ERROR_MARKERS = (
+    "temporary failure in name resolution",
+    "nameresolutionerror",
+    "failed to resolve",
+    "nodename nor servname provided",
+    "name or service not known",
+    "no route to host",
+    "network is unreachable",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "connection timed out",
+    "read timed out",
+    "connect timeout",
+    "max retries exceeded",
+    "remote end closed connection",
+)
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -127,6 +147,46 @@ def _parse_iso_timestamp(value: Any):
         return None
 
 
+def _exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _looks_transient_error_text(value: Any) -> bool:
+    lowered = str(value or "").strip().lower()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in TRANSIENT_SYNC_ERROR_MARKERS)
+
+
+def _is_transient_sync_error(exc: BaseException) -> bool:
+    for item in _exception_chain(exc):
+        if isinstance(item, (requests.ConnectionError, requests.Timeout, TimeoutError, ConnectionError)):
+            return True
+        if _looks_transient_error_text(item):
+            return True
+    return False
+
+
+def _login_status_allows_cached_reminders(row: Any) -> bool:
+    status = str(_row_value(row, "login_status", "")).strip()
+    if status == "ok":
+        return True
+    return status == "error" and _looks_transient_error_text(_row_value(row, "last_error", ""))
+
+
+def _scheduled_digest_succeeded(user_id: int, dedupe_key: str) -> bool:
+    return notification_succeeded(user_id, "scheduled_digest", dedupe_key) or notification_succeeded(
+        user_id,
+        "scheduled_digest",
+        f"{dedupe_key}|empty",
+    )
+
+
 def _has_homework_events(rows: list[Any]) -> bool:
     return any(str(_row_value(row, "event_type", "")).strip() == "homework" for row in rows or [])
 
@@ -193,7 +253,7 @@ def sync_user_snapshot(row: Any, logger, persist_failure: bool = True) -> tuple[
         return grade_changes, True
     except Exception as exc:
         logger.exception("e3_periodic_sync_failed user=%s", row["line_user_id"])
-        if persist_failure:
+        if persist_failure and not _is_transient_sync_error(exc):
             update_login_state(row["user_id"], "error", str(exc))
         return [], False
 
@@ -214,7 +274,7 @@ def maybe_periodic_sync(row: Any, now, push_fn, logger) -> None:
 
     for change in grade_changes:
         change_key = f"{change['course_id']}|{change['item_name']}|{change['score']}"
-        if notification_sent(row["user_id"], "grade_posted", change_key):
+        if notification_succeeded(row["user_id"], "grade_posted", change_key):
             continue
         push_ok = push_fn(row["line_user_id"], format_grade_payload(change))
         log_notification(row["user_id"], "grade_posted", "sent" if push_ok else "failed", details=change_key)
@@ -224,7 +284,7 @@ def process_periodic_syncs(now, push_fn, logger, target_predicate=None) -> None:
     for row in list_sync_targets():
         if target_predicate and not target_predicate(str(row["line_user_id"])):
             continue
-        if row["login_status"] != "ok":
+        if not _login_status_allows_cached_reminders(row):
             continue
         maybe_periodic_sync(row, now, push_fn, logger)
 
@@ -267,7 +327,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
     for row in list_reminder_targets():
         if target_predicate and not target_predicate(str(row["line_user_id"])):
             continue
-        if row["login_status"] != "ok":
+        if not _login_status_allows_cached_reminders(row):
             continue
 
         countdown_windows: dict[int, list[Any]] = {}
@@ -327,7 +387,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
             countdown_rows = countdown_windows.get(hours_left) or []
             for event_row in countdown_rows:
                 countdown_key = f"{event_row['event_uid']}|{hours_left}h"
-                if notification_sent(row["user_id"], "countdown_alert", countdown_key):
+                if notification_succeeded(row["user_id"], "countdown_alert", countdown_key):
                     continue
                 ok = push_fn(row["line_user_id"], format_countdown_payload(event_row, hours_left, row["line_user_id"]))
                 log_notification(
@@ -342,7 +402,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
             continue
 
         dedupe_key = f"{now.date().isoformat()} {current_slot}"
-        if notification_sent(row["user_id"], "scheduled_digest", dedupe_key):
+        if _scheduled_digest_succeeded(row["user_id"], dedupe_key):
             continue
 
         events = digest_events

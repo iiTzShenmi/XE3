@@ -1,4 +1,5 @@
 import asyncio
+from io import BytesIO
 import logging
 from typing import Any
 
@@ -6,21 +7,32 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from agent.core.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, public_base_url
+from agent.core.config import discord_attachment_max_bytes, discord_bot_token, discord_command_prefix, discord_guild_id, discord_notify_user_id, public_base_url
 from agent.features.e3.service import handle_e3_command, run_e3_async_command
 from agent.features.e3.data.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
 from agent.features.e3.reminder.api import build_test_reminder_payloads, refresh_all_saved_accounts, start_reminder_worker
+from agent.features.e3.services.upload import E3UploadError, upload_assignment_submission
+from agent.features.plot.service import (
+    PlotPreviewError,
+    build_plot_template_csv,
+    default_plot_selection,
+    is_supported_plot_file,
+    parse_workbook_preview,
+    selected_sheet,
+)
 from agent.features.weather.service import handle_city_weather
-from agent.platforms.discord.command_helpers import autocomplete_course_files, build_help_text
+from agent.platforms.discord.command_helpers import autocomplete_course_files, autocomplete_course_homework, build_help_text
 from agent.platforms.discord.file_delivery import download_discord_attachment
 from agent.platforms.discord.message_utils import send_text_chunks as _send_text_chunks
 from agent.platforms.discord.payload_sender import edit_message_from_payload, send_payload
+from agent.platforms.discord.plot_views import PlotWorkbookConfigView
 from agent.platforms.discord.views import DiscordViewCallbacks, E3LoginModal
 from agent.core.system_status import build_system_report
 
 
 logger = logging.getLogger(__name__)
 E3_EXECUTION_SEMAPHORE = asyncio.Semaphore(2)
+MAX_PLOT_UPLOAD_BYTES = 8 * 1024 * 1024
 
 
 def _platform_user_key(user_id: int) -> str:
@@ -105,6 +117,12 @@ def _format_refresh_all_summary(summary: dict[str, Any]) -> str:
         ])
     lines.extend(["", "這次是靜默刷新，不會另外把結果推給其他使用者。"])
     return "\n".join(lines)
+
+
+def _plot_error_message(exc: Exception) -> str:
+    if isinstance(exc, PlotPreviewError):
+        return str(exc)
+    return "XE3 目前讀不懂這份檔案，先試試 `.xlsx`、`.xlsm` 或 `.csv`。"
 
 
 def _normalize_command_text(command_text: str) -> str:
@@ -307,6 +325,28 @@ async def _autocomplete_course_files(
     )
 
 
+async def _autocomplete_course_homework(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    return await autocomplete_course_homework(
+        interaction,
+        current,
+        user_key_builder=_platform_user_key,
+        logger=logger,
+    )
+
+
+async def _is_e3_upload_user(interaction: discord.Interaction) -> bool:
+    client = interaction.client
+    if hasattr(client, "is_owner") and await client.is_owner(interaction.user):
+        return True
+    allowed_user_id = discord_notify_user_id()
+    if allowed_user_id is not None:
+        return interaction.user.id == allowed_user_id
+    return False
+
+
 def _create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -464,6 +504,79 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, f"files {keyword}", interaction.user.id, bot=bot)
 
+    @e3_group.command(name="upload", description="上傳檔案到指定 E3 作業")
+    @app_commands.describe(
+        course="作業所屬課程，請從選單挑課號",
+        homework="要繳交的作業，請先選 course 再從選單挑作業",
+        file="要上傳到 E3 的檔案",
+        replace_existing="已有繳交檔案時，是否先刪除舊提交再上傳",
+    )
+    @app_commands.autocomplete(course=_autocomplete_course_files, homework=_autocomplete_course_homework)
+    async def e3_upload(
+        interaction: discord.Interaction,
+        course: str,
+        homework: str,
+        file: discord.Attachment,
+        replace_existing: bool = False,
+    ):
+        if not await _is_e3_upload_user(interaction):
+            await interaction.response.send_message("⚠️ 這個 E3 上傳功能目前只開放給管理者測試。", ephemeral=True)
+            return
+
+        await _remember_interaction_target(interaction)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        filename = str(file.filename or "").strip()
+        if not filename:
+            await interaction.followup.send("⚠️ Discord 附件沒有檔名，已取消上傳。", ephemeral=True)
+            return
+
+        max_bytes = discord_attachment_max_bytes()
+        if int(getattr(file, "size", 0) or 0) > max_bytes:
+            await interaction.followup.send(
+                f"⚠️ 這個檔案超過目前 Discord 上傳代理限制 `{max_bytes // (1024 * 1024)} MB`，已取消。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            blob = await file.read()
+            result = await asyncio.to_thread(
+                upload_assignment_submission,
+                _platform_user_key(interaction.user.id),
+                course,
+                homework,
+                filename,
+                blob,
+                content_type=getattr(file, "content_type", None),
+                replace_existing=replace_existing,
+            )
+        except E3UploadError as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            return
+        except discord.DiscordException:
+            logger.exception("discord_e3_upload_attachment_read_failed user=%s file=%s", interaction.user.id, filename)
+            await interaction.followup.send("⚠️ Discord 附件讀取失敗，請重新上傳一次。", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("discord_e3_upload_failed user=%s course=%s homework=%s file=%s", interaction.user.id, course, homework, filename)
+            await interaction.followup.send("⚠️ E3 上傳流程失敗，請先回 E3 網頁確認目前作業狀態。", ephemeral=True)
+            return
+
+        replaced_text = "（已先刪除舊提交）" if result.replaced_existing else ""
+        await interaction.followup.send(
+            "\n".join(
+                [
+                    "✅ E3 作業檔案已上傳並送出。",
+                    f"課程：`{result.course_id}` {result.course_name}",
+                    f"作業：{result.assignment_title}",
+                    f"檔案：`{result.filename}` {replaced_text}".strip(),
+                    f"目前頁面上可見已繳檔案：`{result.submitted_file_count}`",
+                ]
+            ),
+            ephemeral=True,
+        )
+
     @e3_group.command(name="remind", description="提醒設定")
     @app_commands.describe(action="show、on、off 或 test")
     async def e3_remind(interaction: discord.Interaction, action: str = "show"):
@@ -502,6 +615,55 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True, ephemeral=True)
         payload = await asyncio.to_thread(build_system_report)
         await _send_text_chunks(interaction, payload, ephemeral=True)
+
+    plot_group = app_commands.Group(name="plot", description="實驗資料圖表工具")
+
+    @plot_group.command(name="excel", description="上傳 Excel 或 CSV，先設定圖表欄位")
+    @app_commands.describe(file="Excel 或 CSV 檔案")
+    async def plot_excel(interaction: discord.Interaction, file: discord.Attachment):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        filename = str(file.filename or "").strip()
+        if not is_supported_plot_file(filename):
+            await interaction.followup.send(
+                "⚠️ 目前先支援 `.xlsx`、`.xlsm`、`.csv`。你先用這三種格式測流程就好。",
+                ephemeral=True,
+            )
+            return
+        if int(getattr(file, "size", 0) or 0) > MAX_PLOT_UPLOAD_BYTES:
+            await interaction.followup.send(
+                "⚠️ 這一版先讓 XE3 讀 `8 MB` 以內的資料檔，避免實驗資料太大把互動拖慢。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            blob = await file.read()
+            preview = await asyncio.to_thread(parse_workbook_preview, filename, blob)
+            state = default_plot_selection(preview)
+        except Exception as exc:
+            logger.exception("discord_plot_excel_parse_failed user=%s file=%s", interaction.user.id, filename)
+            await interaction.followup.send(f"⚠️ {_plot_error_message(exc)}", ephemeral=True)
+            return
+
+        from agent.features.plot.views import build_plot_setup_embed
+
+        embed = build_plot_setup_embed(preview, state)
+        view = PlotWorkbookConfigView(user_id=interaction.user.id, preview=preview, state=state)
+        sheet = selected_sheet(preview, state)
+        if not sheet.has_header:
+            template_file = discord.File(BytesIO(build_plot_template_csv()), filename="plot_template.csv")
+            await interaction.followup.send(
+                content="📎 我另外附了一份 `plot_template.csv`。如果你想整理成比較穩定的格式，可以照這份 template 重傳；如果現在只是先測流程，也可以直接繼續。",
+                embed=embed,
+                view=view,
+                file=template_file,
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    bot.tree.add_command(plot_group, guild=discord.Object(id=discord_guild_id()) if discord_guild_id() else None)
 
 
     @bot.tree.error

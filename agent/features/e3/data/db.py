@@ -531,6 +531,7 @@ def list_reminder_targets():
               users.id AS user_id,
               users.line_user_id AS line_user_id,
               e3_accounts.login_status AS login_status,
+              e3_accounts.last_error AS last_error,
               e3_accounts.updated_at AS account_updated_at,
               reminder_prefs.enabled AS enabled,
               reminder_prefs.timezone AS timezone,
@@ -550,7 +551,8 @@ def list_sync_targets():
             SELECT
               users.id AS user_id,
               users.line_user_id AS line_user_id,
-              e3_accounts.login_status AS login_status
+              e3_accounts.login_status AS login_status,
+              e3_accounts.last_error AS last_error
             FROM users
             JOIN e3_accounts ON e3_accounts.user_id = users.id
             WHERE e3_accounts.encrypted_password IS NOT NULL
@@ -565,6 +567,19 @@ def notification_sent(user_id: int, notification_type: str, details: str | None 
             """
             SELECT 1 FROM notification_log
             WHERE user_id=? AND notification_type=? AND details=?
+            LIMIT 1
+            """,
+            (user_id, notification_type, details),
+        ).fetchone()
+        return bool(row)
+
+
+def notification_succeeded(user_id: int, notification_type: str, details: str | None = None) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM notification_log
+            WHERE user_id=? AND notification_type=? AND details=? AND result='sent'
             LIMIT 1
             """,
             (user_id, notification_type, details),

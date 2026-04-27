@@ -2,16 +2,20 @@
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 from agent.core.config import cloudflared_log_file, cloudflared_url_file, port
 
 
 URL_PATTERN = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
+FATAL_MARKERS = ("Unauthorized: Tunnel not found",)
 
 
 def write_current_url(url):
     cloudflared_url_file().write_text(url.strip() + "\n", encoding="utf-8")
+
+
+def clear_current_url():
+    cloudflared_url_file().unlink(missing_ok=True)
 
 
 def append_log(line):
@@ -19,7 +23,17 @@ def append_log(line):
         handle.write(line.rstrip("\n") + "\n")
 
 
+def stop_process(process):
+    process.terminate()
+    try:
+        return process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.wait(timeout=10)
+
+
 def main():
+    clear_current_url()
     command = [
         "/usr/local/bin/cloudflared",
         "tunnel",
@@ -45,6 +59,10 @@ def main():
         match = URL_PATTERN.search(line)
         if match:
             write_current_url(match.group(0))
+        if any(marker in line for marker in FATAL_MARKERS):
+            append_log("cloudflared fatal tunnel state detected; exiting wrapper for systemd restart")
+            stop_process(process)
+            return 1
 
     return process.wait()
 
