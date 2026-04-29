@@ -11,7 +11,12 @@ from agent.core.config import discord_attachment_max_bytes, discord_bot_token, d
 from agent.features.e3.service import handle_e3_command, run_e3_async_command
 from agent.features.e3.data.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
 from agent.features.e3.reminder.api import build_test_reminder_payloads, refresh_all_saved_accounts, start_reminder_worker
-from agent.features.e3.services.upload import E3UploadError, upload_assignment_submission
+from agent.features.e3.services.upload import (
+    E3UploadError,
+    format_upload_queue_status,
+    queue_assignment_upload,
+    upload_assignment_submission,
+)
 from agent.features.plot.service import (
     PlotPreviewError,
     build_plot_template_csv,
@@ -510,6 +515,7 @@ def _create_bot() -> commands.Bot:
         homework="要繳交的作業，請先選 course 再從選單挑作業",
         file="要上傳到 E3 的檔案",
         replace_existing="已有繳交檔案時，是否先刪除舊提交再上傳",
+        queue_if_unavailable="作業尚未開放時，先保存檔案並由背景排程稍後嘗試",
     )
     @app_commands.autocomplete(course=_autocomplete_course_files, homework=_autocomplete_course_homework)
     async def e3_upload(
@@ -518,6 +524,7 @@ def _create_bot() -> commands.Bot:
         homework: str,
         file: discord.Attachment,
         replace_existing: bool = False,
+        queue_if_unavailable: bool = True,
     ):
         if not await _is_e3_upload_user(interaction):
             await interaction.response.send_message("⚠️ 這個 E3 上傳功能目前只開放給管理者測試。", ephemeral=True)
@@ -539,6 +546,7 @@ def _create_bot() -> commands.Bot:
             )
             return
 
+        blob = b""
         try:
             blob = await file.read()
             result = await asyncio.to_thread(
@@ -552,7 +560,46 @@ def _create_bot() -> commands.Bot:
                 replace_existing=replace_existing,
             )
         except E3UploadError as exc:
-            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            if exc.status == "not_available" and queue_if_unavailable and blob:
+                try:
+                    queued = await asyncio.to_thread(
+                        queue_assignment_upload,
+                        _platform_user_key(interaction.user.id),
+                        course,
+                        homework,
+                        filename,
+                        blob,
+                        content_type=getattr(file, "content_type", None),
+                        replace_existing=replace_existing,
+                    )
+                except E3UploadError as queue_exc:
+                    await interaction.followup.send(
+                        f"⚠️ E3 狀態：`{exc.status}`\n{exc}\n\n排程建立失敗：{queue_exc}",
+                        ephemeral=True,
+                    )
+                    return
+                except Exception:
+                    logger.exception("discord_e3_upload_queue_failed user=%s course=%s homework=%s file=%s", interaction.user.id, course, homework, filename)
+                    await interaction.followup.send(
+                        f"⚠️ E3 狀態：`{exc.status}`\n{exc}\n\n排程建立失敗，請稍後再試。",
+                        ephemeral=True,
+                    )
+                    return
+                await interaction.followup.send(
+                    "\n".join(
+                        [
+                            "📦 E3 目前尚未開放直接提交，已先建立延後上傳排程。",
+                            f"排程：`#{queued.queue_id}`",
+                            f"課程：`{queued.course_id}` {queued.course_name}",
+                            f"作業：{queued.assignment_title}",
+                            f"檔案：`{queued.filename}`",
+                            f"下次嘗試時間：`{queued.next_attempt_at}`",
+                        ]
+                    ),
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(f"⚠️ E3 狀態：`{exc.status}`\n{exc}", ephemeral=True)
             return
         except discord.DiscordException:
             logger.exception("discord_e3_upload_attachment_read_failed user=%s file=%s", interaction.user.id, filename)
@@ -576,6 +623,16 @@ def _create_bot() -> commands.Bot:
             ),
             ephemeral=True,
         )
+
+    @e3_group.command(name="uploadstatus", description="查看 E3 延後上傳排程狀態")
+    async def e3_uploadstatus(interaction: discord.Interaction):
+        if not await _is_e3_upload_user(interaction):
+            await interaction.response.send_message("⚠️ 這個 E3 上傳功能目前只開放給管理者測試。", ephemeral=True)
+            return
+        await _remember_interaction_target(interaction)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        status_text = await asyncio.to_thread(format_upload_queue_status, _platform_user_key(interaction.user.id))
+        await _send_text_chunks(interaction, status_text, ephemeral=True)
 
     @e3_group.command(name="remind", description="提醒設定")
     @app_commands.describe(action="show、on、off 或 test")

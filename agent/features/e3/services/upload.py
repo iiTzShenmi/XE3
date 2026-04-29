@@ -4,13 +4,24 @@ import json
 import mimetypes
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
+from uuid import uuid4
 
 import requests
 from bs4 import BeautifulSoup
 
+from ..data.db import (
+    create_e3_upload_queue_entry,
+    list_due_e3_uploads,
+    list_e3_uploads_for_user,
+    mark_e3_upload_attempt,
+    mark_e3_upload_failed,
+    mark_e3_upload_retry,
+    mark_e3_upload_sent,
+)
 from ..scraper import config
 from ..scraper.get_course.get_user_data import build_authenticated_session
 from ..utils.common import (
@@ -29,10 +40,16 @@ E3_REPOSITORY_AJAX_URL = f"{config.E3_BASE_URL}/repository/repository_ajax.php?a
 DEFAULT_UPLOAD_REPO_ID = "5"
 DEFAULT_MAX_BYTES = "1073741824"
 DEFAULT_AREA_MAX_BYTES = "-1"
+TAIPEI_TZ = timezone(timedelta(hours=8))
+MAX_QUEUED_UPLOAD_ATTEMPTS = 48
 
 
 class E3UploadError(Exception):
     """User-facing E3 upload failure."""
+
+    def __init__(self, message: str, *, status: str = "failed") -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -42,6 +59,7 @@ class AssignmentTarget:
     title: str
     cmid: str
     detail_url: str
+    start_at: str
     due_at: str
     category: str
     completed: bool
@@ -63,6 +81,17 @@ class UploadResult:
     replaced_existing: bool
 
 
+@dataclass(frozen=True)
+class QueuedUploadResult:
+    queue_id: int
+    course_id: str
+    course_name: str
+    assignment_title: str
+    cmid: str
+    filename: str
+    next_attempt_at: str
+
+
 def _runtime_cookie_file(line_user_id: str) -> Path:
     return get_runtime_root() / make_user_key(line_user_id) / "cookies.json"
 
@@ -70,13 +99,13 @@ def _runtime_cookie_file(line_user_id: str) -> Path:
 def _load_cookie_dict(line_user_id: str) -> dict[str, str]:
     cookie_file = _runtime_cookie_file(line_user_id)
     if not cookie_file.exists():
-        raise E3UploadError("找不到 E3 session，請先執行 `/e3 login` 或 `/e3 relogin`。")
+        raise E3UploadError("找不到 E3 session，請先執行 `/e3 login` 或 `/e3 relogin`。", status="no_session")
     try:
         data = json.loads(cookie_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise E3UploadError("E3 session 檔案讀取失敗，請先重新登入。") from exc
+        raise E3UploadError("E3 session 檔案讀取失敗，請先重新登入。", status="session_unreadable") from exc
     if not isinstance(data, dict):
-        raise E3UploadError("E3 session 格式異常，請先重新登入。")
+        raise E3UploadError("E3 session 格式異常，請先重新登入。", status="session_invalid")
     return {str(key): str(value) for key, value in data.items() if value}
 
 
@@ -102,6 +131,59 @@ def _assignment_cmid(url: str | None) -> str:
     parsed = urlparse(str(url or ""))
     values = parse_qs(parsed.query).get("id") or []
     return str(values[0]).strip() if values else ""
+
+
+def _parse_e3_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=TAIPEI_TZ)
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=TAIPEI_TZ)
+    return parsed.astimezone(TAIPEI_TZ)
+
+
+def _to_utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _target_not_yet_available(target: AssignmentTarget) -> bool:
+    if target.category == "upcoming":
+        return True
+    start_at = _parse_e3_datetime(target.start_at)
+    return bool(start_at and start_at > datetime.now(TAIPEI_TZ))
+
+
+def _target_overdue(target: AssignmentTarget) -> bool:
+    if target.category == "overdue":
+        return True
+    due_at = _parse_e3_datetime(target.due_at)
+    return bool(due_at and due_at <= datetime.now(TAIPEI_TZ))
+
+
+def _next_attempt_for_target(target: AssignmentTarget) -> str:
+    start_at = _parse_e3_datetime(target.start_at)
+    now = datetime.now(timezone.utc)
+    if start_at and start_at.astimezone(timezone.utc) > now:
+        return _to_utc_iso(start_at)
+    return _to_utc_iso(now + timedelta(hours=1))
+
+
+def _format_target_window(target: AssignmentTarget) -> str:
+    parts = []
+    if target.start_at:
+        parts.append(f"開放：{target.start_at}")
+    if target.due_at:
+        parts.append(f"截止：{target.due_at}")
+    return "，".join(parts)
 
 
 def _course_matches(course_id: str, course_name: str, keyword: str) -> bool:
@@ -140,6 +222,7 @@ def list_assignment_targets(line_user_id: str, course_keyword: str = "", *, incl
             if completed and not include_completed:
                 continue
             submitted_files = [entry for entry in (item.get("submitted_files") or []) if isinstance(entry, dict)]
+            start_at = str(item.get("start") or item.get("start_time") or item.get("available_from") or "").strip()
             due_at = str(item.get("due") or item.get("due_time") or item.get("due_date") or item.get("deadline") or "").strip()
             targets.append(
                 AssignmentTarget(
@@ -148,6 +231,7 @@ def list_assignment_targets(line_user_id: str, course_keyword: str = "", *, incl
                     title=title,
                     cmid=cmid,
                     detail_url=urljoin(config.E3_BASE_URL, detail_url),
+                    start_at=start_at,
                     due_at=due_at,
                     category=str(item.get("category") or "").strip(),
                     completed=completed,
@@ -162,10 +246,10 @@ def list_assignment_targets(line_user_id: str, course_keyword: str = "", *, incl
 def _resolve_course_id(line_user_id: str, course: str) -> str:
     matches = {(target.course_id, target.course_name) for target in list_assignment_targets(line_user_id, course)}
     if not matches:
-        raise E3UploadError(f"找不到符合 `{course}` 的課程作業，請先 `/e3 relogin` 更新快取。")
+        raise E3UploadError(f"找不到符合 `{course}` 的課程作業，請先 `/e3 relogin` 更新快取。", status="target_not_found")
     if len(matches) > 1:
         options = ", ".join(f"{course_id} {name}" for course_id, name in sorted(matches)[:5])
-        raise E3UploadError(f"`{course}` 對應到多門課，請從 autocomplete 選課號。候選：{options}")
+        raise E3UploadError(f"`{course}` 對應到多門課，請從 autocomplete 選課號。候選：{options}", status="ambiguous_course")
     return next(iter(matches))[0]
 
 
@@ -175,7 +259,7 @@ def resolve_assignment_target(line_user_id: str, course: str, assignment_ref: st
     if ":" in raw_ref:
         ref_course_id, raw_ref = raw_ref.split(":", 1)
         if ref_course_id and ref_course_id != course_id:
-            raise E3UploadError("選到的作業不屬於指定課程，已取消上傳。")
+            raise E3UploadError("選到的作業不屬於指定課程，已取消上傳。", status="course_assignment_mismatch")
 
     matches = []
     for target in list_assignment_targets(line_user_id, course_id):
@@ -185,9 +269,9 @@ def resolve_assignment_target(line_user_id: str, course: str, assignment_ref: st
             matches.append(target)
 
     if not matches:
-        raise E3UploadError("找不到這門課底下對應的作業，已取消上傳。")
+        raise E3UploadError("找不到這門課底下對應的作業，已取消上傳。", status="target_not_found")
     if len(matches) > 1:
-        raise E3UploadError("作業選擇不夠明確，請從 autocomplete 選一個作業。")
+        raise E3UploadError("作業選擇不夠明確，請從 autocomplete 選一個作業。", status="ambiguous_assignment")
     return matches[0]
 
 
@@ -275,9 +359,9 @@ def _parse_edit_context(html: str, expected_course_id: str, expected_cmid: str) 
     page_course_id = str(m_cfg.get("courseId") or "").strip()
     page_cmid = str(m_cfg.get("contextInstanceId") or fields.get("id") or "").strip()
     if page_course_id and page_course_id != str(expected_course_id):
-        raise E3UploadError("E3 編輯頁課程和你選的課程不一致，已取消上傳。")
+        raise E3UploadError("E3 編輯頁課程和你選的課程不一致，已取消上傳。", status="page_mismatch")
     if page_cmid and page_cmid != str(expected_cmid):
-        raise E3UploadError("E3 編輯頁作業和你選的作業不一致，已取消上傳。")
+        raise E3UploadError("E3 編輯頁作業和你選的作業不一致，已取消上傳。", status="page_mismatch")
 
     itemid = fields.get("files_filemanager") or _extract_number_value(html, "itemid")
     sesskey = fields.get("sesskey") or str(m_cfg.get("sesskey") or "")
@@ -297,7 +381,10 @@ def _parse_edit_context(html: str, expected_course_id: str, expected_cmid: str) 
     }
     missing = [key for key, value in required.items() if not str(value or "").strip()]
     if missing:
-        raise E3UploadError(f"E3 編輯頁缺少必要欄位：{', '.join(missing)}。請先重新登入後再試。")
+        raise E3UploadError(
+            f"E3 編輯頁缺少必要欄位：{', '.join(missing)}。請先重新登入後再試。",
+            status="missing_edit_fields",
+        )
 
     return {
         **fields,
@@ -341,7 +428,7 @@ def _remove_existing_submission(session: requests.Session, target: AssignmentTar
     response = session.get(confirm_url, headers={"Referer": target.detail_url}, allow_redirects=True)
     response.raise_for_status()
     if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。")
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
 
     soup = BeautifulSoup(response.text or "", "html.parser")
     m_cfg = _extract_m_cfg(response.text or "")
@@ -352,7 +439,7 @@ def _remove_existing_submission(session: requests.Session, target: AssignmentTar
         "sesskey": _input_value(soup, "sesskey", str(m_cfg.get("sesskey") or "")),
     }
     if not payload["userid"] or not payload["sesskey"]:
-        raise E3UploadError("無法取得刪除舊作業所需欄位，已取消。")
+        raise E3UploadError("無法取得刪除舊作業所需欄位，已取消。", status="missing_remove_fields")
 
     post_response = session.post(
         E3_ASSIGN_VIEW_URL,
@@ -362,25 +449,53 @@ def _remove_existing_submission(session: requests.Session, target: AssignmentTar
     )
     post_response.raise_for_status()
     if _needs_login(post_response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。")
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
 
 
 def _fetch_assignment_view(session: requests.Session, target: AssignmentTarget) -> str:
     response = session.get(target.detail_url, allow_redirects=True)
     response.raise_for_status()
     if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。")
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     return response.text or ""
 
 
 def _fetch_edit_context(session: requests.Session, target: AssignmentTarget) -> tuple[str, dict[str, str]]:
     edit_url = f"{E3_ASSIGN_VIEW_URL}?id={target.cmid}&action=editsubmission"
     response = session.get(edit_url, headers={"Referer": target.detail_url}, allow_redirects=True)
+    if response.status_code in {403, 404}:
+        _raise_edit_permission_error(response, target)
     response.raise_for_status()
     if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。")
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     html = response.text or ""
     return edit_url, _parse_edit_context(html, target.course_id, target.cmid)
+
+
+def _raise_edit_permission_error(response: requests.Response, target: AssignmentTarget) -> None:
+    if _needs_login(response):
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
+
+    window = _format_target_window(target)
+    suffix = f"（{window}）" if window else ""
+    if _target_not_yet_available(target):
+        raise E3UploadError(
+            f"E3 尚未開放這份作業的提交頁，已暫停直接上傳{suffix}。",
+            status="not_available",
+        )
+    if _target_overdue(target):
+        raise E3UploadError(
+            f"E3 拒絕進入提交頁，這份作業看起來已截止或不允許補交{suffix}。",
+            status="closed",
+        )
+
+    text = BeautifulSoup(response.text or "", "html.parser").get_text(" ", strip=True)
+    if "error/nopermission" in text.casefold() or "nopermission" in text.casefold():
+        raise E3UploadError(
+            f"E3 回覆沒有提交權限，可能是未開放、已截止、或老師關閉提交{suffix}。",
+            status="permission_denied",
+        )
+    raise E3UploadError(f"E3 提交頁無法開啟：HTTP {response.status_code}{suffix}。", status="edit_page_unavailable")
 
 
 def _upload_to_draft(
@@ -418,9 +533,9 @@ def _upload_to_draft(
     )
     response.raise_for_status()
     if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。")
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     if "error" in (response.text or "").casefold():
-        raise E3UploadError("E3 回報檔案上傳失敗，請確認檔案大小、格式或是否已存在同名檔案。")
+        raise E3UploadError("E3 回報檔案上傳失敗，請確認檔案大小、格式或是否已存在同名檔案。", status="upload_rejected")
 
 
 def _save_assignment_submission(session: requests.Session, edit_url: str, context: dict[str, str]) -> str:
@@ -444,8 +559,56 @@ def _save_assignment_submission(session: requests.Session, edit_url: str, contex
     )
     response.raise_for_status()
     if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。")
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     return response.text or ""
+
+
+def queue_assignment_upload(
+    line_user_id: str,
+    course: str,
+    assignment_ref: str,
+    filename: str,
+    content: bytes,
+    *,
+    content_type: str | None = None,
+    replace_existing: bool = False,
+) -> QueuedUploadResult:
+    if not content:
+        raise E3UploadError("Discord 附件是空的，無法建立排程。", status="invalid_file")
+
+    target = resolve_assignment_target(line_user_id, course, assignment_ref)
+    if _target_overdue(target):
+        raise E3UploadError("這份作業已截止或標記為逾期，XE3 不會建立延後上傳排程。", status="closed")
+
+    safe_filename = Path(filename or "upload").name or "upload"
+    token = uuid4().hex
+    queue_dir = get_runtime_root() / make_user_key(line_user_id) / "queued_uploads" / token
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    file_path = queue_dir / safe_filename
+    file_path.write_bytes(content)
+
+    next_attempt_at = _next_attempt_for_target(target)
+    queue_id = create_e3_upload_queue_entry(
+        line_user_id=line_user_id,
+        course_id=target.course_id,
+        course_name=target.course_name,
+        cmid=target.cmid,
+        assignment_title=target.title,
+        filename=safe_filename,
+        content_type=content_type or mimetypes.guess_type(safe_filename)[0] or "application/octet-stream",
+        file_path=str(file_path),
+        replace_existing=replace_existing,
+        next_attempt_at=next_attempt_at,
+    )
+    return QueuedUploadResult(
+        queue_id=queue_id,
+        course_id=target.course_id,
+        course_name=target.course_name,
+        assignment_title=target.title,
+        cmid=target.cmid,
+        filename=safe_filename,
+        next_attempt_at=next_attempt_at,
+    )
 
 
 def upload_assignment_submission(
@@ -459,7 +622,7 @@ def upload_assignment_submission(
     replace_existing: bool = False,
 ) -> UploadResult:
     if not content:
-        raise E3UploadError("Discord 附件是空的，已取消上傳。")
+        raise E3UploadError("Discord 附件是空的，已取消上傳。", status="invalid_file")
 
     target = resolve_assignment_target(line_user_id, course, assignment_ref)
     session = _authenticated_session(line_user_id)
@@ -467,7 +630,8 @@ def upload_assignment_submission(
     existing_count = _submitted_file_count(current_html)
     if existing_count and not replace_existing:
         raise E3UploadError(
-            f"這份作業目前已有 `{existing_count}` 個已繳檔案。為了避免覆蓋錯作業，請確認後把 `replace_existing` 設為 True。"
+            f"這份作業目前已有 `{existing_count}` 個已繳檔案。為了避免覆蓋錯作業，請確認後把 `replace_existing` 設為 True。",
+            status="existing_submission",
         )
     if existing_count and replace_existing:
         _remove_existing_submission(session, target)
@@ -479,9 +643,9 @@ def upload_assignment_submission(
     final_html = _save_assignment_submission(session, edit_url, context)
 
     if not _has_submitted_status(final_html):
-        raise E3UploadError("E3 沒有顯示已繳交狀態，請回 E3 網頁確認是否成功。")
+        raise E3UploadError("E3 沒有顯示已繳交狀態，請回 E3 網頁確認是否成功。", status="verification_failed")
     if not _page_contains_filename(final_html, safe_filename):
-        raise E3UploadError("E3 已回到作業頁，但頁面上找不到剛上傳的檔名，請回 E3 網頁確認。")
+        raise E3UploadError("E3 已回到作業頁，但頁面上找不到剛上傳的檔名，請回 E3 網頁確認。", status="verification_failed")
 
     return UploadResult(
         course_id=target.course_id,
@@ -492,3 +656,131 @@ def upload_assignment_submission(
         submitted_file_count=_submitted_file_count(final_html),
         replaced_existing=bool(existing_count and replace_existing),
     )
+
+
+def _row_value(row: Any, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _next_retry_iso() -> str:
+    return _to_utc_iso(datetime.now(timezone.utc) + timedelta(hours=1))
+
+
+def _remove_queued_file(file_path: str) -> None:
+    path = Path(str(file_path or ""))
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+    try:
+        path.parent.rmdir()
+    except OSError:
+        return
+
+
+def _queued_upload_success_payload(result: UploadResult, queue_id: int) -> str:
+    return "\n".join(
+        [
+            "✅ 排程 E3 作業檔案已上傳並送出。",
+            f"排程：`#{queue_id}`",
+            f"課程：`{result.course_id}` {result.course_name}",
+            f"作業：{result.assignment_title}",
+            f"檔案：`{result.filename}`",
+            f"目前頁面上可見已繳檔案：`{result.submitted_file_count}`",
+        ]
+    )
+
+
+def _queued_upload_failed_payload(row: Any, reason: str) -> str:
+    return "\n".join(
+        [
+            "⚠️ 排程 E3 上傳已停止。",
+            f"排程：`#{_row_value(row, 'id')}`",
+            f"課程：`{_row_value(row, 'course_id')}` {_row_value(row, 'course_name', '')}",
+            f"作業：{_row_value(row, 'assignment_title')}",
+            f"檔案：`{_row_value(row, 'filename')}`",
+            f"原因：{reason}",
+        ]
+    )
+
+
+def process_due_upload_queue(push_fn, logger, target_predicate=None, *, limit: int = 10) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for row in list_due_e3_uploads(now_iso, limit=limit):
+        user_key = str(_row_value(row, "line_user_id") or "")
+        if target_predicate and not target_predicate(user_key):
+            continue
+
+        queue_id = int(_row_value(row, "id", 0) or 0)
+        attempts = int(_row_value(row, "attempts", 0) or 0) + 1
+        mark_e3_upload_attempt(queue_id)
+
+        file_path = str(_row_value(row, "file_path") or "")
+        try:
+            content = Path(file_path).read_bytes()
+        except OSError:
+            reason = "找不到先前暫存的檔案，可能已被手動刪除。"
+            mark_e3_upload_failed(queue_id, reason)
+            push_fn(user_key, _queued_upload_failed_payload(row, reason))
+            continue
+
+        try:
+            result = upload_assignment_submission(
+                user_key,
+                str(_row_value(row, "course_id") or ""),
+                f"{_row_value(row, 'course_id')}:{_row_value(row, 'cmid')}",
+                str(_row_value(row, "filename") or "upload"),
+                content,
+                content_type=str(_row_value(row, "content_type") or "") or None,
+                replace_existing=bool(_row_value(row, "replace_existing", 0)),
+            )
+        except E3UploadError as exc:
+            if exc.status == "not_available" and attempts < MAX_QUEUED_UPLOAD_ATTEMPTS:
+                mark_e3_upload_retry(queue_id, str(exc), _next_retry_iso())
+                continue
+            mark_e3_upload_failed(queue_id, str(exc))
+            push_fn(user_key, _queued_upload_failed_payload(row, str(exc)))
+            continue
+        except Exception as exc:
+            logger.exception("e3_queued_upload_failed queue_id=%s user=%s", queue_id, user_key)
+            if attempts < MAX_QUEUED_UPLOAD_ATTEMPTS:
+                mark_e3_upload_retry(queue_id, str(exc), _next_retry_iso())
+                continue
+            reason = f"重試 `{attempts}` 次後仍失敗：{exc}"
+            mark_e3_upload_failed(queue_id, reason)
+            push_fn(user_key, _queued_upload_failed_payload(row, reason))
+            continue
+
+        mark_e3_upload_sent(queue_id)
+        _remove_queued_file(file_path)
+        push_fn(user_key, _queued_upload_success_payload(result, queue_id))
+
+
+def format_upload_queue_status(line_user_id: str) -> str:
+    rows = list_e3_uploads_for_user(line_user_id, limit=10)
+    if not rows:
+        return "目前沒有 E3 延後上傳紀錄。"
+
+    lines = ["📦 E3 延後上傳狀態"]
+    for row in rows:
+        status = str(_row_value(row, "status") or "queued")
+        attempts = int(_row_value(row, "attempts", 0) or 0)
+        next_attempt = str(_row_value(row, "next_attempt_at") or "")
+        error = str(_row_value(row, "last_error") or "").strip()
+        line = (
+            f"• `#{_row_value(row, 'id')}` {status}｜"
+            f"`{_row_value(row, 'course_id')}` {_row_value(row, 'assignment_title')}｜"
+            f"`{_row_value(row, 'filename')}`｜attempts `{attempts}`"
+        )
+        if status == "queued" and next_attempt:
+            line += f"｜next `{next_attempt}`"
+        if error:
+            line += f"\n  ↳ {error[:160]}"
+        lines.append(line)
+    return "\n".join(lines)

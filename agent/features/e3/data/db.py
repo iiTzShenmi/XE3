@@ -163,6 +163,30 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS e3_upload_queue (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              course_id TEXT NOT NULL,
+              course_name TEXT,
+              cmid TEXT NOT NULL,
+              assignment_title TEXT NOT NULL,
+              filename TEXT NOT NULL,
+              content_type TEXT,
+              file_path TEXT NOT NULL,
+              replace_existing INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'queued',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT NOT NULL,
+              last_error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              submitted_at TEXT,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
 
 
 def upsert_user(line_user_id: str) -> int:
@@ -273,6 +297,7 @@ def get_e3_account_by_user_id(user_id: int):
 def delete_user_data(user_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM discord_delivery_targets WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM e3_upload_queue WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM events_cache WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM grade_items_cache WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM reminder_prefs WHERE user_id=?", (user_id,))
@@ -602,4 +627,130 @@ def log_notification(
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (user_id, event_uid, notification_type, now, result, details),
+        )
+
+
+def create_e3_upload_queue_entry(
+    line_user_id: str,
+    course_id: str,
+    course_name: str,
+    cmid: str,
+    assignment_title: str,
+    filename: str,
+    content_type: str | None,
+    file_path: str,
+    replace_existing: bool,
+    next_attempt_at: str,
+) -> int:
+    user_id = upsert_user(line_user_id)
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO e3_upload_queue (
+              user_id, course_id, course_name, cmid, assignment_title, filename, content_type,
+              file_path, replace_existing, status, attempts, next_attempt_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+            """,
+            (
+                user_id,
+                course_id,
+                course_name,
+                cmid,
+                assignment_title,
+                filename,
+                content_type,
+                file_path,
+                1 if replace_existing else 0,
+                next_attempt_at,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_due_e3_uploads(now_iso: str, limit: int = 20):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT
+              e3_upload_queue.*,
+              users.line_user_id AS line_user_id
+            FROM e3_upload_queue
+            JOIN users ON users.id = e3_upload_queue.user_id
+            WHERE e3_upload_queue.status = 'queued'
+              AND e3_upload_queue.next_attempt_at <= ?
+            ORDER BY e3_upload_queue.next_attempt_at ASC, e3_upload_queue.id ASC
+            LIMIT ?
+            """,
+            (now_iso, limit),
+        ).fetchall()
+
+
+def list_e3_uploads_for_user(line_user_id: str, limit: int = 10):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT e3_upload_queue.*
+            FROM users
+            JOIN e3_upload_queue ON e3_upload_queue.user_id = users.id
+            WHERE users.line_user_id = ?
+            ORDER BY e3_upload_queue.created_at DESC, e3_upload_queue.id DESC
+            LIMIT ?
+            """,
+            (line_user_id, limit),
+        ).fetchall()
+
+
+def mark_e3_upload_attempt(queue_id: int) -> None:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE e3_upload_queue
+            SET attempts=attempts + 1, updated_at=?
+            WHERE id=?
+            """,
+            (now, queue_id),
+        )
+
+
+def mark_e3_upload_retry(queue_id: int, error: str, next_attempt_at: str) -> None:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE e3_upload_queue
+            SET status='queued', last_error=?, next_attempt_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (str(error or "")[:1000], next_attempt_at, now, queue_id),
+        )
+
+
+def mark_e3_upload_sent(queue_id: int) -> None:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE e3_upload_queue
+            SET status='sent', last_error=NULL, submitted_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (now, now, queue_id),
+        )
+
+
+def mark_e3_upload_failed(queue_id: int, error: str) -> None:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE e3_upload_queue
+            SET status='failed', last_error=?, updated_at=?
+            WHERE id=?
+            """,
+            (str(error or "")[:1000], now, queue_id),
         )

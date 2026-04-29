@@ -123,6 +123,8 @@ def build_help_text(prefix: str) -> str:
         "• /e3 grades\n"
         "• /e3 passcalc\n"
         "• /e3 files\n"
+        "• /e3 upload\n"
+        "• /e3 uploadstatus\n"
         "• /e3 remind\n"
         "• /plot excel\n"
         "──────────\n"

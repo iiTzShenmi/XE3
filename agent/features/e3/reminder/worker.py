@@ -11,6 +11,7 @@ import requests
 from agent.core.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
 
 from ..services.client import fetch_courses, login_and_sync, make_user_key
+from ..services.upload import process_due_upload_queue
 from ..data.db import (
     get_e3_account_by_user_id,
     get_events_due_between,
@@ -323,6 +324,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
     tolerance = max(interval_seconds * 2, 300)
 
     process_periodic_syncs(now, push_fn, logger, target_predicate=target_predicate)
+    process_due_upload_queue(push_fn, logger, target_predicate=target_predicate)
 
     for row in list_reminder_targets():
         if target_predicate and not target_predicate(str(row["line_user_id"])):
