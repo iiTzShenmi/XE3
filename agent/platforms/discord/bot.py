@@ -560,6 +560,15 @@ def _create_bot() -> commands.Bot:
                 replace_existing=replace_existing,
             )
         except E3UploadError as exc:
+            logger.warning(
+                "discord_e3_upload_user_error user=%s status=%s course=%s homework=%s file=%s error=%s",
+                interaction.user.id,
+                exc.status,
+                course,
+                homework,
+                filename,
+                exc,
+            )
             if exc.status == "not_available" and queue_if_unavailable and blob:
                 try:
                     queued = await asyncio.to_thread(

@@ -42,6 +42,24 @@ DEFAULT_MAX_BYTES = "1073741824"
 DEFAULT_AREA_MAX_BYTES = "-1"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 MAX_QUEUED_UPLOAD_ATTEMPTS = 48
+SUBMITTED_STATUS_MARKERS = (
+    "submitted for grading",
+    "submission status submitted for grading",
+    "submission has been made",
+    "已繳交",
+    "已繳作業",
+    "已提交",
+    "已送出",
+)
+NOT_SUBMITTED_STATUS_MARKERS = (
+    "not submitted",
+    "no attempt",
+    "no submissions have been made yet",
+    "未繳交",
+    "未提交",
+    "尚未提交",
+)
+SUBMISSION_STATUS_LABEL_MARKERS = ("submission status", "提交狀態", "繳交狀態")
 
 
 class E3UploadError(Exception):
@@ -408,8 +426,26 @@ def _submitted_file_count(html: str) -> int:
 
 def _has_submitted_status(html: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
+    if soup.select(".submissionstatussubmitted"):
+        return True
+
+    for row in soup.select("tr"):
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        label = cells[0].get_text(" ", strip=True).casefold()
+        value = cells[1].get_text(" ", strip=True).casefold()
+        if not any(marker in label for marker in SUBMISSION_STATUS_LABEL_MARKERS):
+            continue
+        if any(marker in value for marker in NOT_SUBMITTED_STATUS_MARKERS):
+            return False
+        if any(marker in value for marker in SUBMITTED_STATUS_MARKERS):
+            return True
+
     text = soup.get_text(" ", strip=True).casefold()
-    return "已繳交" in text or "submitted" in text
+    if any(marker in text for marker in NOT_SUBMITTED_STATUS_MARKERS):
+        return False
+    return any(marker in text for marker in SUBMITTED_STATUS_MARKERS)
 
 
 def _page_contains_filename(html: str, filename: str) -> bool:
@@ -640,7 +676,8 @@ def upload_assignment_submission(
     guessed_type = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     safe_filename = Path(filename or "upload").name or "upload"
     _upload_to_draft(session, edit_url, context, safe_filename, content, guessed_type)
-    final_html = _save_assignment_submission(session, edit_url, context)
+    _save_assignment_submission(session, edit_url, context)
+    final_html = _fetch_assignment_view(session, target)
 
     if not _has_submitted_status(final_html):
         raise E3UploadError("E3 沒有顯示已繳交狀態，請回 E3 網頁確認是否成功。", status="verification_failed")
