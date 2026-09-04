@@ -392,6 +392,7 @@ def _create_bot() -> commands.Bot:
         await _send_payload(ctx, payload, bot=bot, user_id=ctx.author.id)
 
     @bot.command(name="chksys")
+    @commands.is_owner()
     async def chksys(ctx: commands.Context):
         await _remember_context_target(ctx)
         async with ctx.typing():
@@ -407,6 +408,9 @@ def _create_bot() -> commands.Bot:
     @bot.event
     async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         if isinstance(error, commands.CommandNotFound):
+            return
+        if isinstance(error, commands.NotOwner):
+            await _send_text_chunks(ctx, "⚠️ 你沒有權限執行這個指令。")
             return
         logger.exception("discord_prefix_command_failed", exc_info=error)
         await _send_text_chunks(ctx, "⚠️ 執行指令時發生問題，請稍後再試。")

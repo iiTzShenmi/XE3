@@ -309,3 +309,17 @@
 - 下半部的「剩餘項目估算」改成獨立小卡段落：
   - 每個項目會單獨顯示名稱、目標分數、配分
   - 在 Discord 上比較像卡片列表，手機閱讀更舒服
+
+### 26. 新主機 `/chksys` 相容性與硬體資訊
+- 確認 XE3 搬移到新主機後，Discord Bot、Web、Cloudflare Tunnel 與 Watchdog 服務均正常運行
+- `/chksys` 新增硬體狀態：
+  - CPU 型號與邏輯執行緒數
+  - NVIDIA GPU 型號、VRAM、溫度與使用率
+- GPU 查詢設有 timeout 與無 GPU/驅動異常 fallback，避免硬體偵測拖垮整份系統報告
+- 系統狀態、負載、記憶體、磁碟與 uptime 文案統一為繁體中文
+- 舊的 prefix `chksys` 也補上 owner-only 權限，與 slash `/chksys` 一致
+- 驗證：
+  - `py_compile` 通過
+  - 本地 report smoke test 成功辨識 AMD Ryzen 7 9700X 與 NVIDIA GeForce RTX 5060 Ti
+  - prefix 與 slash command 均確認掛載 owner check
+  - `discord-bot.service` 重啟後完成 Gateway 連線與 slash command 同步
