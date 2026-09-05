@@ -123,7 +123,78 @@ def _disk_summary():
     used_gb = (usage.total - usage.free) / 1024 / 1024 / 1024
     total_gb = usage.total / 1024 / 1024 / 1024
     percent = ((usage.total - usage.free) / usage.total) * 100 if usage.total else 0
-    return f"磁碟：{used_gb:.1f}/{total_gb:.1f} GB（{percent:.0f}%）"
+    return f"系統分割區：{used_gb:.1f}/{total_gb:.1f} GiB（{percent:.0f}%）"
+
+
+def _physical_storage_summaries():
+    try:
+        result = subprocess.run(
+            ["lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,MODEL,TRAN,ROTA,MOUNTPOINTS"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ["實體磁碟：狀態查詢失敗"]
+
+    if result.returncode != 0:
+        return ["實體磁碟：狀態查詢失敗"]
+
+    try:
+        devices = json.loads(result.stdout).get("blockdevices", [])
+    except (AttributeError, json.JSONDecodeError):
+        return ["實體磁碟：狀態格式無法辨識"]
+
+    disks = [device for device in devices if device.get("type") == "disk"]
+    if not disks:
+        return ["實體磁碟：未偵測到裝置"]
+
+    total_bytes = sum(int(device.get("size") or 0) for device in disks)
+    categories = {}
+    unmounted = []
+    for device in disks:
+        size_bytes = int(device.get("size") or 0)
+        category = _storage_category(device)
+        categories[category] = categories.get(category, 0) + size_bytes
+        if not _device_has_mount(device):
+            name = str(device.get("name") or "未知裝置")
+            unmounted.append(f"{name} {_format_decimal_storage(size_bytes)}")
+
+    breakdown = " + ".join(
+        f"{category} {_format_decimal_storage(size_bytes)}"
+        for category, size_bytes in categories.items()
+        if size_bytes > 0
+    )
+    lines = [f"實體磁碟總容量：{_format_decimal_storage(total_bytes)}（{breakdown}）"]
+    if unmounted:
+        lines.append("未掛載磁碟：" + "、".join(unmounted))
+    return lines
+
+
+def _storage_category(device):
+    transport = str(device.get("tran") or "").strip().lower()
+    rotational = device.get("rota")
+    if transport == "nvme":
+        return "NVMe"
+    if rotational is False:
+        return "SSD"
+    if transport == "sata" or rotational is True:
+        return "SATA HDD"
+    return "其他"
+
+
+def _device_has_mount(device):
+    mountpoints = device.get("mountpoints") or []
+    if any(str(path or "").strip() for path in mountpoints):
+        return True
+    return any(_device_has_mount(child) for child in device.get("children") or [])
+
+
+def _format_decimal_storage(size_bytes):
+    if size_bytes >= 1_000_000_000_000:
+        return f"{size_bytes / 1_000_000_000_000:.2f} TB"
+    return f"{size_bytes / 1_000_000_000:.0f} GB"
 
 
 def _uptime_summary():
@@ -217,6 +288,8 @@ def build_system_report():
         }.get(service_name, "主要服務")
         service_lines.append(f"• {label}: {state}")
 
+    storage_lines = "\n".join(f"💾 **{line}**" for line in [_disk_summary(), *_physical_storage_summaries()])
+
     return (
         "🛠️ **系統檢查**\n"
         "──────────\n"
@@ -232,6 +305,6 @@ def build_system_report():
         "──────────\n"
         f"🧮 **{_load_summary()}**\n"
         f"🧠 **{_memory_summary()}**\n"
-        f"💾 **{_disk_summary()}**\n"
+        f"{storage_lines}\n"
         f"⏱️ **{_uptime_summary()}**"
     )

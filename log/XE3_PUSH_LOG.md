@@ -323,3 +323,16 @@
   - 本地 report smoke test 成功辨識 AMD Ryzen 7 9700X 與 NVIDIA GeForce RTX 5060 Ti
   - prefix 與 slash command 均確認掛載 owner check
   - `discord-bot.service` 重啟後完成 Gateway 連線與 slash command 同步
+
+### 27. `/chksys` 實體磁碟容量
+- 磁碟狀態不再只顯示 Linux 根分割區，新增實體 block device 容量盤點
+- 報告現在會分開顯示：
+  - 系統根分割區的使用量與容量
+  - NVMe、SSD、SATA HDD 的實體總容量
+  - 已偵測但尚未掛載的磁碟
+- 排除 loop、tmpfs、snap 等非實體儲存裝置，避免容量重複或誤計
+- 新主機驗證結果：
+  - 實體磁碟總容量約 4.51 TB
+  - NVMe 約 512 GB
+  - SATA HDD 共約 4.00 TB
+  - `sda`、`sdb` 目前尚未掛載，因此不列入 Linux 可用檔案系統空間
