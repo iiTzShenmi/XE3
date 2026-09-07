@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 
 from agent.core.config import e3_cache_ttl_minutes, e3_runtime_root, legacy_e3_runtime_root
+from agent.features.e3.utils.common import current_semester_tag, extract_semester_tag
 from ..scraper import config as scraper_config
 from ..scraper import db_manager as scraper_db_manager
 from ..scraper import utils as scraper_utils
@@ -46,7 +47,7 @@ def _runtime_paths_for_user(user_key: str) -> dict[str, str]:
     return {
         "BASE_DIR": str(workspace),
         "COOKIE_FILE": str(workspace / "cookies.json"),
-        "COURSES_FILE": str(workspace / "courses_114.json"),
+        "COURSES_FILE": str(workspace / "courses_current.json"),
         "E3_MY_HTML": str(workspace / "e3_my.html"),
         "LAST_RUN_FILE": str(workspace / "last_run.json"),
     }
@@ -95,11 +96,12 @@ def _read_courses_index(courses_file_path: str) -> dict[str, dict[str, str]]:
         return {}
 
     result = {}
+    semester_tag = current_semester_tag()
     for course_id, raw_name in raw.items():
         if not isinstance(raw_name, str):
             continue
         display_name = raw_name.strip()
-        if not display_name:
+        if not display_name or extract_semester_tag(display_name) != semester_tag:
             continue
         result[display_name] = {
             "_course_id": str(course_id).strip(),
@@ -111,6 +113,7 @@ def _read_courses_index(courses_file_path: str) -> dict[str, dict[str, str]]:
 def _read_all_courses_data(base_dir: str, courses_file_path: str | None = None) -> dict[str, dict[str, Any]]:
     base_path = Path(base_dir)
     all_data = {}
+    semester_tag = current_semester_tag()
     if courses_file_path:
         all_data.update(_read_courses_index(courses_file_path))
     if not base_path.exists():
@@ -155,6 +158,9 @@ def _read_all_courses_data(base_dir: str, courses_file_path: str | None = None) 
             course_data["_course_id"] = course_folder.name.split("_", 1)[0]
             display_name = course_folder.name.split("_", 1)[1]
 
+        if extract_semester_tag(display_name) != semester_tag:
+            continue
+
         base_payload = all_data.get(display_name, {})
         if not isinstance(base_payload, dict):
             base_payload = {}
@@ -172,6 +178,8 @@ def _read_home_page_preview(html_path: str) -> dict[str, Any]:
             "page_title": "",
             "course_count": 0,
             "sample_courses": [],
+            "all_course_count": 0,
+            "semester_tag": current_semester_tag(),
             "user_name": "",
             "user_email": "",
         }
@@ -184,11 +192,12 @@ def _read_home_page_preview(html_path: str) -> dict[str, Any]:
         page_title = re.sub(r"\s+", " ", title_match.group(1)).strip()
 
     course_names = []
-    for match in re.finditer(r'class="course-link"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
+    for match in re.finditer(r'class="course-link"[^>]*>(.*?)</a>', html_unescaped, flags=re.IGNORECASE | re.DOTALL):
         text = re.sub(r"<.*?>", "", match.group(1))
         text = re.sub(r"\s+", " ", text).strip()
         if text:
             course_names.append(text)
+    course_names = list(dict.fromkeys(course_names))
 
     user_name = ""
     login_name_match = re.search(
@@ -204,10 +213,15 @@ def _read_home_page_preview(html_path: str) -> dict[str, Any]:
     if email_match:
         user_email = unquote(email_match.group(1).strip())
 
+    semester_tag = current_semester_tag()
+    current_course_names = [name for name in course_names if extract_semester_tag(name) == semester_tag]
+
     return {
         "page_title": page_title,
-        "course_count": len(course_names),
-        "sample_courses": course_names[:5],
+        "course_count": len(current_course_names),
+        "sample_courses": current_course_names[:5],
+        "all_course_count": len(course_names),
+        "semester_tag": semester_tag,
         "user_name": user_name,
         "user_email": user_email,
     }
@@ -291,7 +305,7 @@ def _build_course_lookup(courses: dict[str, dict[str, Any]]) -> dict[str, str]:
 
 
 def check_status(user_key: str | None = None) -> dict[str, Any]:
-    e3_root = Path(__file__).resolve().parent / "scraper"
+    e3_root = Path(__file__).resolve().parent.parent / "scraper"
     runtime_root = get_runtime_root()
     status = {
         "e3_root": str(e3_root),
@@ -303,7 +317,7 @@ def check_status(user_key: str | None = None) -> dict[str, Any]:
         status["workspace"] = str(workspace)
         status["has_workspace"] = workspace.exists()
         status["has_cookie"] = (workspace / "cookies.json").exists()
-        status["has_courses"] = (workspace / "courses_114.json").exists()
+        status["has_courses"] = (workspace / "courses_current.json").exists()
         status["has_home_html"] = (workspace / "e3_my.html").exists()
         preview = _read_home_page_preview(workspace / "e3_my.html")
         status["user_name"] = preview.get("user_name") or ""

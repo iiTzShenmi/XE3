@@ -18,6 +18,7 @@ def extract_course():
 
     soup = BeautifulSoup(html, "html.parser")
     courses = {}
+    semester_filter = config.current_semester_filter()
 
     # find div
     for div in soup.find_all("div", class_="layer2_right_current_course_stu_link"):
@@ -31,14 +32,14 @@ def extract_course():
                 course_id = href.split("id=")[1].split("&")[0]  # Handle multiple params
                 
                 # Apply semester filter if configured
-                if config.SEMESTER_FILTER is None or config.SEMESTER_FILTER in text:
+                if semester_filter in text:
                     courses[course_id] = safe_name(text)
 
     # save as JSON
     try:
         with open(config.COURSES_FILE, "w", encoding="utf-8") as f:
             json.dump(courses, f, ensure_ascii=False, indent=2)
-        print(f"[+] Success, found {len(courses)} courses")
+        print(f"[+] Success, found {len(courses)} courses for {semester_filter}")
     except Exception as e:
         print(f"[!] Error saving courses file: {e}")
 

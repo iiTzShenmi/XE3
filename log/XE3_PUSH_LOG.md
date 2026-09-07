@@ -336,3 +336,16 @@
   - NVMe 約 512 GB
   - SATA HDD 共約 4.00 TB
   - `sda`、`sdb` 目前尚未掛載，因此不列入 Linux 可用檔案系統空間
+
+### 28. E3 學期自動切換
+- 修正爬蟲固定使用 `114下` 與 `courses_114.json` 的問題
+- 爬蟲現在依 Asia/Taipei 時間動態推導當前學期，並寫入 `courses_current.json`
+- 課程名稱解析同時支援 E3 原始的 `【115上】` 與清理後的 `115上` 格式
+- `/e3 course` 只會讀取當學期課程；同步完成但當學期為空時，不再錯誤要求使用者重新登入
+- 同步結果的「找到 N 門課」改為當學期過濾後的真實數量
+- 全帳號靜默刷新驗證：5/5 成功，`115上` 課程數分別為 3、10、9、7、7，無舊學期資料混入
+- 驗證：
+  - `py_compile` 通過
+  - semester helper unit tests 通過
+  - 5 個帳號的課程索引數量與 E3 dashboard 解析數量完全一致
+  - `discord-bot.service` 透過 `systemctl --user` 重啟後，Gateway、slash commands 與 reminder worker 均正常

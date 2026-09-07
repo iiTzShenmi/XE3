@@ -60,12 +60,12 @@ def current_semester_tag(now: datetime | None = None) -> str:
 
 
 def extract_semester_tag(display_name: str | None) -> str | None:
-    match = re.match(r"^(\d{2,3}[上下])", (display_name or "").strip())
+    match = re.match(r"^[\s【\[]*(\d{2,3}[上下])", (display_name or "").strip())
     return match.group(1) if match else None
 
 
 def strip_semester_prefix(display_name: str | None) -> str:
-    cleaned = re.sub(r"^\d{2,3}[上下]", "", (display_name or "").strip())
+    cleaned = re.sub(r"^[\s【\[]*\d{2,3}[上下][】\]]?", "", (display_name or "").strip())
     cleaned = cleaned.replace("_", " ")
     return re.sub(r"\s+", " ", cleaned).strip()
 

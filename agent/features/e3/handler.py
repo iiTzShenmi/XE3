@@ -365,24 +365,21 @@ def _list_courses(logger, line_user_id):
         )
 
     if not isinstance(data, dict) or not data:
+        semester_tag = _current_semester_tag()
+        if cache_status.get("exists"):
+            message = f"XE3 已完成同步，但 E3 目前沒有列出 **{semester_tag}** 的課程。這通常代表新學期課程尚未公布，不需要重新登入。"
+            return _discord_empty_state(message, line_user_id, emoji="📚") if _is_discord_user_key(line_user_id) else message
         return _discord_empty_state(
-            f"I can't see any course data yet. Start with {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}.",
+            f"目前還沒有同步資料，請先使用 {_discord_command_hint('e3 login <帳號> <密碼>', line_user_id)}。",
             line_user_id,
-        ) if _is_discord_user_key(line_user_id) else "目前沒有可用課程資料，請先 `e3 login <帳號> <密碼>`。"
+        ) if _is_discord_user_key(line_user_id) else "目前沒有同步資料，請先 `e3 login <帳號> <密碼>`。"
 
     semester_tag = _current_semester_tag()
     current_courses = _current_semester_courses(data, semester_tag=semester_tag)
 
     if not current_courses:
-        return (
-            _discord_empty_state(
-                f"我目前還找不到 **{semester_tag}** 的課程資料。\n試試 {_discord_command_hint('e3 relogin', line_user_id)} 重新整理。",
-                line_user_id,
-                emoji="📚",
-            )
-            if _is_discord_user_key(line_user_id)
-            else f"目前找不到 {semester_tag} 學期課程，請先 `e3 relogin` 重新同步。"
-        )
+        message = f"XE3 已完成同步，但 E3 目前沒有列出 **{semester_tag}** 的課程。這通常代表新學期課程尚未公布，不需要重新登入。"
+        return _discord_empty_state(message, line_user_id, emoji="📚") if _is_discord_user_key(line_user_id) else message
 
     file_links = file_snapshot.get("file_links") or {}
     if _is_discord_user_key(line_user_id):

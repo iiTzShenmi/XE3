@@ -25,6 +25,7 @@ It exists so we can re-review against the same baseline later instead of relying
 - Selector, dropdown, and summary behavior must be driven by structured `xe3_meta` payload metadata.
 - Do not infer behavior from human-facing embed text unless handling legacy payloads.
 - Text is for users. Metadata is for program logic.
+- Never hardcode an E3 semester in runtime paths or scraper filters. Derive the current semester from Taipei time, and only report a course count after applying that semester filter.
 
 ## 3. Keep Module Responsibilities Narrow
 - `agent/features/e3/handler.py` should mainly route commands and coordinate modules.

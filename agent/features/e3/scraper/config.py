@@ -4,12 +4,14 @@ Configuration file for E3 Course Manager
 import os
 from pathlib import Path
 
+from agent.features.e3.utils.common import current_semester_tag
+
 # Base directory for data storage
 BASE_DIR = os.path.join(os.path.dirname(__file__), "test_DB")
 
 # File paths (cross-platform compatible)
 COOKIE_FILE = os.path.join(BASE_DIR, "cookies.json")
-COURSES_FILE = os.path.join(BASE_DIR, "courses_114.json")
+COURSES_FILE = os.path.join(BASE_DIR, "courses_current.json")
 E3_MY_HTML = os.path.join(BASE_DIR, "e3_my.html")
 LAST_RUN_FILE = os.path.join(os.path.dirname(__file__), "last_run.json")
 
@@ -34,8 +36,12 @@ SELENIUM_PAGE_LOAD_TIMEOUT = 30
 # Requests configuration
 REQUEST_TIMEOUT = 15.0
 
-# Semester filter (can be configured)
-SEMESTER_FILTER = "114下"  # Set to None to fetch all semesters
+# Optional override for diagnostics. Normal operation always follows Taipei time.
+SEMESTER_FILTER = os.getenv("E3_SEMESTER_FILTER", "").strip() or None
+
+
+def current_semester_filter():
+    return SEMESTER_FILTER or current_semester_tag()
 
 # User-Agent
 USER_AGENT = (
