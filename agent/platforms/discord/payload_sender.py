@@ -4,7 +4,14 @@ from typing import Any, Awaitable, Callable
 
 import discord
 
-from agent.platforms.discord.message_utils import extract_embed_items
+from agent.platforms.discord.components_v2 import (
+    build_embed_layout,
+    build_reminder_layout,
+    build_select_layout,
+    build_text_layout,
+    validate_layout,
+)
+from agent.platforms.discord.message_utils import chunk_text, extract_embed_items
 from agent.platforms.discord.rendering import (
     action_meta,
     all_file_entries,
@@ -19,7 +26,7 @@ from agent.platforms.discord.rendering import (
     select_option_label,
     select_summary_title,
 )
-from agent.platforms.discord.views import CommandButtonView, CommandSelectView, DiscordViewCallbacks, ReminderToggleView
+from agent.platforms.discord.views import DiscordViewCallbacks
 
 MAX_SELECT_OPTIONS = 25
 SendTextChunksFn = Callable[[Any, str], Awaitable[None]]
@@ -128,6 +135,53 @@ def with_back_entry(entries: list[tuple[str, str, dict[str, str]]]) -> list[tupl
     )
     return trimmed
 
+
+def _selector_summary(
+    selector_candidates: list[tuple[discord.Embed, list[dict[str, str]]]],
+    entries: list[tuple[str, str, dict[str, str]]],
+) -> discord.Embed:
+    summary_entries = entries[:MAX_SELECT_OPTIONS]
+    summary = build_file_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], summary_entries)
+    if summary is None:
+        summary = build_news_selector_summary(summary_entries)
+    if summary is None:
+        summary = build_timeline_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], summary_entries)
+    if summary is None:
+        summary = build_grouped_selector_summary(summary_entries)
+    if summary is not None:
+        summary.colour = _selector_accent(summary_entries)
+        return summary
+
+    summary = discord.Embed(
+        title=select_summary_title(summary_entries),
+        description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
+        color=discord.Color.blurple(),
+    )
+    for idx, (label, desc, action) in enumerate(summary_entries, start=1):
+        value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
+        summary.add_field(name=f"{display_index_emoji(idx)} {label[:100]}", value=value, inline=False)
+    return summary
+
+
+def _selector_accent(entries: list[tuple[str, str, dict[str, str]]]) -> discord.Colour:
+    meta = action_meta(entries[0][2]) if entries else {}
+    selector_kind = str(meta.get("selector_kind") or "")
+    if selector_kind.startswith("grade"):
+        return discord.Colour.from_rgb(124, 58, 237)
+    if selector_kind in {"file", "file_folder"}:
+        return discord.Colour.from_rgb(37, 99, 235)
+    if selector_kind == "news_item":
+        return discord.Colour.from_rgb(2, 132, 199)
+    return discord.Colour.from_rgb(15, 118, 110)
+
+
+async def _edit_with_layout(message: discord.Message, layout: discord.ui.LayoutView) -> None:
+    validate_layout(layout)
+    # Discord requires every legacy field to be explicitly cleared when a message
+    # is first converted to Components v2. The v2 flag is irreversible afterward.
+    await message.edit(content=None, embeds=[], attachments=[], view=layout)
+
+
 async def edit_message_from_payload(
     message: discord.Message,
     payload: Any,
@@ -154,9 +208,6 @@ async def edit_message_from_payload(
         actions.extend(item_actions)
         selector_candidates.append((embed, item_actions))
 
-    if not embeds:
-        return False
-
     selector_entries: list[tuple[str, str, dict[str, str]]] = []
     if selector_candidates:
         for embed, item_actions in selector_candidates:
@@ -180,39 +231,32 @@ async def edit_message_from_payload(
 
     content = "\n\n".join(chunk for chunk in text_chunks if chunk) or None
     if should_use_selector:
-        summary_entries = selector_entries[:MAX_SELECT_OPTIONS]
         view_entries = with_back_entry(selector_entries)
-        summary = build_file_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = build_news_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = build_timeline_selector_summary(selector_candidates[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = build_grouped_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = discord.Embed(
-                title=select_summary_title(summary_entries),
-                description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
-                color=discord.Color.blurple(),
-            )
-            for idx, (label, desc, action) in enumerate(summary_entries[:MAX_SELECT_OPTIONS], start=1):
-                value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
-                summary.add_field(name=f"{display_index_emoji(idx)} {label[:100]}", value=value, inline=False)
-        await message.edit(content=content, embeds=[summary], view=CommandSelectView(callbacks, user_id, view_entries))
+        summary = _selector_summary(selector_candidates, selector_entries)
+        layout = build_select_layout(summary, callbacks=callbacks, user_id=user_id, entries=view_entries)
+        await _edit_with_layout(message, layout)
         return True
 
-    view = build_view(callbacks, user_id, embeds[0], actions)
-    kwargs = {"content": content, "embeds": embeds[:10]}
-    if view is not None:
-        kwargs["view"] = view
-    await message.edit(**kwargs)
-    return True
+    if embeds:
+        if content:
+            embeds[0].description = f"{content}\n\n{embeds[0].description or ''}".strip()
+        if is_reminder_actions(actions):
+            layout = build_reminder_layout(
+                embeds[0],
+                callbacks=callbacks,
+                user_id=user_id,
+                enabled=reminder_enabled_from_embed(embeds[0]),
+                schedule=reminder_schedule_from_embed(embeds[0]),
+            )
+        else:
+            layout = build_embed_layout(embeds[:6], callbacks=callbacks, user_id=user_id, actions=actions)
+        await _edit_with_layout(message, layout)
+        return True
 
-
-def build_view(callbacks: DiscordViewCallbacks, user_id: int, embed: discord.Embed | None, actions: list[dict[str, str]]) -> discord.ui.View | None:
-    if is_reminder_actions(actions):
-        return ReminderToggleView(callbacks, user_id, reminder_enabled_from_embed(embed), reminder_schedule_from_embed(embed))
-    return CommandButtonView(callbacks, user_id, actions[:5]) if actions else None
+    if content:
+        await _edit_with_layout(message, build_text_layout(content))
+        return True
+    return False
 
 
 async def send_payload(
@@ -229,24 +273,44 @@ async def send_payload(
     pending_embeds: list[discord.Embed] = []
     pending_actions: list[dict[str, str]] = []
 
-    def _send_with(target_obj, *, embeds=None, view=None, content=None):
-        kwargs = {"content": content, "embeds": embeds}
-        if view is not None:
-            kwargs["view"] = view
+    def _send_layout(target_obj, layout: discord.ui.LayoutView):
+        validate_layout(layout)
         if isinstance(target_obj, discord.Interaction):
             if not target_obj.response.is_done() and not sent_any:
-                return target_obj.response.send_message(ephemeral=ephemeral, **kwargs)
-            return target_obj.followup.send(ephemeral=ephemeral, **kwargs)
-        return target_obj.send(**kwargs)
+                return target_obj.response.send_message(view=layout, ephemeral=ephemeral)
+            return target_obj.followup.send(view=layout, ephemeral=ephemeral)
+        return target_obj.send(view=layout)
 
     async def flush_pending() -> None:
         nonlocal sent_any, pending_embeds, pending_actions
         if not pending_embeds:
             return
         first_embed = pending_embeds[0] if pending_embeds else None
-        view = build_view(callbacks, user_id, first_embed, pending_actions)
-        await _send_with(target, embeds=pending_embeds, view=view)
-        sent_any = True
+        if is_reminder_actions(pending_actions):
+            layout = build_reminder_layout(
+                first_embed,
+                callbacks=callbacks,
+                user_id=user_id,
+                enabled=reminder_enabled_from_embed(first_embed),
+                schedule=reminder_schedule_from_embed(first_embed),
+            )
+            await _send_layout(target, layout)
+            sent_any = True
+        else:
+            remaining = list(pending_embeds)
+            first_layout = True
+            while remaining:
+                layout = build_embed_layout(
+                    remaining,
+                    callbacks=callbacks,
+                    user_id=user_id,
+                    actions=pending_actions if first_layout else None,
+                )
+                consumed = max(1, len(layout.children))
+                await _send_layout(target, layout)
+                sent_any = True
+                remaining = remaining[consumed:]
+                first_layout = False
         pending_embeds = []
         pending_actions = []
 
@@ -260,26 +324,10 @@ async def send_payload(
             entries.append((select_option_label(embed, action), embed_option_description(embed, action), action))
         if not entries:
             return
-        summary_entries = entries[:MAX_SELECT_OPTIONS]
         view_entries = with_back_entry(entries)
-        summary = build_file_selector_summary(chunk[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = build_news_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = build_timeline_selector_summary(chunk[:MAX_SELECT_OPTIONS], summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = build_grouped_selector_summary(summary_entries[:MAX_SELECT_OPTIONS])
-        if summary is None:
-            summary = discord.Embed(
-                title=select_summary_title(summary_entries),
-                description="請從下方下拉選單挑一個，我會直接幫你打開，不洗版。",
-                color=discord.Color.blurple(),
-            )
-            preview_entries = summary_entries[:25]
-            for idx, (label, desc, action) in enumerate(preview_entries, start=1):
-                value = (desc[:1024] or "點選後開啟檔案") if is_file_entry((label, desc, action)) else (desc[:1024] or "點選後查看詳情")
-                summary.add_field(name=f"{display_index_emoji(idx)} {label[:100]}", value=value, inline=False)
-        await _send_with(target, embeds=[summary], view=CommandSelectView(callbacks, user_id, view_entries))
+        summary = _selector_summary(chunk, entries)
+        layout = build_select_layout(summary, callbacks=callbacks, user_id=user_id, entries=view_entries)
+        await _send_layout(target, layout)
         sent_any = True
 
     selector_candidates: list[tuple[discord.Embed, list[dict[str, str]]]] = []
@@ -315,8 +363,9 @@ async def send_payload(
     for embed, actions, text in items:
         if text:
             await flush_pending()
-            await send_text_chunks(target, text, ephemeral=ephemeral)
-            sent_any = True
+            for chunk in chunk_text(text):
+                await _send_layout(target, build_text_layout(chunk))
+                sent_any = True
             continue
         if embed is None:
             continue

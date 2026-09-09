@@ -379,3 +379,22 @@
   - 管理者帳號完整刷新：11 門課、25 個事件、88 個 endpoint、0 失敗、0 validation 警告
   - unit tests、`py_compile`、Discord command tree 與 status payload smoke tests 通過
   - `discord-bot.service` 重啟後 Gateway、slash command sync 與 reminder heartbeat 正常
+
+### 30. Discord Components v2 卡片介面
+- Discord 的結構化回覆改用獨立 `LayoutView` 路徑，不再把所有 LINE Flex 內容壓成單一 Embed description
+- 新版介面使用原生 `Container`、`TextDisplay`、`Separator` 與 `ActionRow`：
+  - 課程、時間軸、成績、公告與檔案選單都有實際卡片與區塊分隔
+  - 下拉選單依事件、課程、成績與檔案類型顯示 Emoji
+  - 下拉 placeholder 會直接說明目前正在選擇的內容
+  - 提醒設定保留開關、測試按鈕與時段選單
+- 純文字、空狀態與錯誤頁也可轉成 v2 卡片，避免互動訊息在換頁後嘗試退回舊 Embed
+- 嚴格處理 Components v2 不可逆限制：
+  - 同一請求不混用 `content` / `embeds` 與 `LayoutView`
+  - 舊訊息轉 v2 時明確清除 legacy 欄位
+  - 傳送前驗證 4,000 字與 40 元件限制
+- 每日提醒與倒數提醒文案統一為繁體中文，成績通知保留 Markdown 重點
+- 驗證：
+  - 新增 Components v2 單元測試，完整測試結果為 16 passed
+  - 真實 `/e3 timeline`、`course`、`grades`、`remind show` payload 均通過序列化與上限檢查
+  - `py_compile` 與 `git diff --check` 通過
+  - `discord-bot.service` 重啟後 Gateway、4 個 Slash command 與 reminder worker 均正常

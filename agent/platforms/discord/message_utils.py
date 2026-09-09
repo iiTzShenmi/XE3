@@ -39,7 +39,7 @@ def special_text_embed(text: str) -> discord.Embed | None:
     if normalized.startswith("📊 成績更新"):
         lines = [line.rstrip() for line in raw.splitlines()]
         title = lines[0].replace("**", "").strip() if lines else "📊 成績更新"
-        body = format_discord_text("\n".join(line.replace("**", "") for line in lines[1:] if line is not None).strip())
+        body = format_discord_text("\n".join(line for line in lines[1:] if line is not None).strip())
         return discord.Embed(title=title, description=body or "有新的成績內容。", color=discord.Color.green())
     return None
 

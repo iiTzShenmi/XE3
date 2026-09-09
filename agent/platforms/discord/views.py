@@ -96,9 +96,17 @@ class ReminderToggleView(discord.ui.View):
         self.add_item(ReminderScheduleSelect(callbacks, user_id, schedule or ["09:00", "21:00"]))
 
 
-class _MessageCommandButton(discord.ui.Button):
-    def __init__(self, callbacks: DiscordViewCallbacks, user_id: int, label: str, command_text: str):
-        super().__init__(label=label, style=discord.ButtonStyle.primary)
+class MessageCommandButton(discord.ui.Button):
+    def __init__(
+        self,
+        callbacks: DiscordViewCallbacks,
+        user_id: int,
+        label: str,
+        command_text: str,
+        *,
+        style: discord.ButtonStyle = discord.ButtonStyle.primary,
+    ):
+        super().__init__(label=label, style=style)
         self.callbacks = callbacks
         self.user_id = user_id
         self.command_text = command_text
@@ -119,19 +127,36 @@ class CommandButtonView(discord.ui.View):
             if kind == "uri":
                 self.add_item(discord.ui.Button(label=label[:80], url=action.get("value") or "https://discord.com"))
             elif kind == "message":
-                self.add_item(_MessageCommandButton(callbacks, user_id, label[:80], action.get("value") or ""))
+                self.add_item(MessageCommandButton(callbacks, user_id, label[:80], action.get("value") or ""))
 
 
-class _CommandSelect(discord.ui.Select):
-    def __init__(self, callbacks: DiscordViewCallbacks, user_id: int, entries: list[tuple[str, str, dict[str, str]]]):
+class CommandSelect(discord.ui.Select):
+    def __init__(
+        self,
+        callbacks: DiscordViewCallbacks,
+        user_id: int,
+        entries: list[tuple[str, str, dict[str, str]]],
+        *,
+        placeholder: str = "選擇一個項目",
+    ):
         self.entries = entries[:MAX_SELECT_OPTIONS]
         self.callbacks = callbacks
         self.user_id = user_id
-        options = [
-            discord.SelectOption(label=label[:100], description=(desc[:100] if desc else None), value=str(idx))
-            for idx, (label, desc, _) in enumerate(self.entries)
-        ]
-        super().__init__(placeholder="選擇一個項目", min_values=1, max_values=1, options=options)
+        options = []
+        for idx, (label, desc, action) in enumerate(self.entries):
+            emoji = _select_option_emoji(action)
+            clean_label = str(label or "項目").strip()
+            if emoji and clean_label.startswith(emoji):
+                clean_label = clean_label[len(emoji) :].strip(" ｜")
+            options.append(
+                discord.SelectOption(
+                    label=clean_label[:100],
+                    description=(desc[:100] if desc else None),
+                    emoji=emoji,
+                    value=str(idx),
+                )
+            )
+        super().__init__(placeholder=placeholder[:150], min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -153,7 +178,35 @@ class _CommandSelect(discord.ui.Select):
 class CommandSelectView(discord.ui.View):
     def __init__(self, callbacks: DiscordViewCallbacks, user_id: int, entries: list[tuple[str, str, dict[str, str]]], timeout: float = 600):
         super().__init__(timeout=timeout)
-        self.add_item(_CommandSelect(callbacks, user_id, entries))
+        self.add_item(CommandSelect(callbacks, user_id, entries))
+
+
+def _select_option_emoji(action: dict[str, str]) -> str | None:
+    meta = action.get("xe3_meta") if isinstance(action.get("xe3_meta"), dict) else {}
+    if str(meta.get("entry_kind") or "") == "navigation":
+        return "↩️"
+    event_type = str(meta.get("event_type") or "")
+    if event_type == "exam":
+        return "⚠️"
+    if event_type == "homework":
+        return "📝"
+    if event_type == "calendar":
+        return "🗓️"
+    role = str(meta.get("file_role_label") or "")
+    if role == "已繳檔案":
+        return "📤"
+    if role:
+        return "📎"
+    selector_kind = str(meta.get("selector_kind") or "")
+    if selector_kind.startswith("grade"):
+        return "📊"
+    if selector_kind.startswith("course"):
+        return "📚"
+    if selector_kind == "news_item":
+        return "📰"
+    if selector_kind in {"file", "file_folder"}:
+        return "📎"
+    return None
 
 
 class E3LoginModal(discord.ui.Modal, title="E3 登入"):

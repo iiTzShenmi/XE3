@@ -43,6 +43,13 @@ It exists so we can re-review against the same baseline later instead of relying
 - Keep responses clean, short, and readable.
 - Maintenance/admin commands must be owner-only and must not broadcast operational output to normal users unless that behavior is explicitly intended.
 
+## 4.1 Components v2 Safety
+- Components v2 messages must use a `discord.ui.LayoutView` and must not include legacy `content` or `embeds` in the same send/edit request.
+- When converting an existing message to Components v2, explicitly clear `content`, `embeds`, and `attachments` in that edit.
+- The Components v2 message flag is irreversible. Every later page, error, empty state, and back-navigation edit for that message must also render through the v2 path.
+- Keep the legacy Embed sender only as a separate path for artifacts that intentionally use it, such as a new file-delivery message. Never use it to edit an existing v2 message.
+- Validate the 4,000-character and 40-component limits before sending a `LayoutView`.
+
 ## 5. Exceptions Must Stay Actionable
 - Catch specific exception classes where possible.
 - If a broad catch is still necessary, it must log context with `logger.exception(...)`.

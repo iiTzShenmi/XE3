@@ -138,26 +138,26 @@ def morning_brief_lines(rows: list[Any]) -> list[str]:
         if dt.astimezone(timezone(timedelta(hours=8))).date() == today:
             today_rows.append(row)
 
-    lines = ["Good morning. Here's your E3 briefing for today."]
+    lines = ["早安，XE3 已經幫你整理好今天的行程。"]
     weather_line = briefing_weather_line()
     if weather_line:
         lines.append(weather_line)
     summary_bits = []
     if counts["homework"]:
-        summary_bits.append(f"{counts['homework']} assignment(s)")
+        summary_bits.append(f"{counts['homework']} 項作業")
     if counts["exam"]:
-        summary_bits.append(f"{counts['exam']} exam(s)")
+        summary_bits.append(f"{counts['exam']} 場考試")
     if counts["calendar"]:
-        summary_bits.append(f"{counts['calendar']} calendar item(s)")
+        summary_bits.append(f"{counts['calendar']} 項行事曆事件")
     if summary_bits:
-        lines.append("In the next 36 hours: " + ", ".join(summary_bits) + ".")
+        lines.append("未來 36 小時：" + "、".join(summary_bits) + "。")
     if today_rows:
-        lines.append(f"Due today: {len(today_rows)} item(s).")
+        lines.append(f"今天共有 {len(today_rows)} 項事件截止。")
         first_row = min(today_rows, key=lambda row: str(row_value(row, "due_at", "") or ""))
         course_name = course_name_for_display(row_value(first_row, "course_name") or row_value(first_row, "course_id") or "-")
-        lines.append(f"Next up: {format_due_label(row_value(first_row, 'due_at'))} {course_name} - {row_value(first_row, 'title', '-')}")
+        lines.append(f"最近一項：{format_due_label(row_value(first_row, 'due_at'))}｜{course_name}｜{row_value(first_row, 'title', '-')}")
     else:
-        lines.append("Nothing is due today so far.")
+        lines.append("今天目前沒有截止事件。")
     return lines
 
 
@@ -175,7 +175,7 @@ def format_digest(rows: list[Any], slot_text: str, user_key: str | None = None) 
         if is_discord_target(user_key):
             lines.append(f"{label} **{course_name}**")
             lines.append(f"• {row_value(row, 'title', '-')}")
-            lines.append(f"• Due {due_label}")
+            lines.append(f"• 截止：{due_label}")
         else:
             lines.append(f"{idx}. {due_label} {label} {course_name}")
             lines.append(f"   {row_value(row, 'title', '-')}")
@@ -196,7 +196,7 @@ def build_empty_digest_payload(slot_text: str, user_key: str | None = None) -> s
         lines = [f"⏰ **E3 提醒 {slot_text}**"]
         if slot_text == "09:00":
             weather_line = briefing_weather_line()
-            lines.append("Good morning. XE3 先幫你看過了，接下來 36 小時內沒有新的截止事件。")
+            lines.append("早安，XE3 先幫你看過了，接下來 36 小時內沒有新的截止事件。")
             if weather_line:
                 lines.append(weather_line)
             lines.append("")
@@ -215,10 +215,10 @@ def format_countdown_payload(row: Any, hours_left: int, user_key: str | None = N
     due_label = discord_due_label(row_value(row, "due_at"), user_key)
     if is_discord_target(user_key):
         return (
-            f"⚠️ **Deadline creeping up: {hours_left}h left**\n"
+            f"⚠️ **截止倒數：還剩 {hours_left} 小時**\n"
             f"{label} **{course_name}**\n"
             f"• {row_value(row, 'title', '-')}\n"
-            f"• Due {due_label}"
+            f"• 截止：{due_label}"
         )
     return f"⏰ E3 倒數提醒（{hours_left} 小時）\n{due_label} {label} {course_name}\n{row_value(row, 'title', '-')}"
 
