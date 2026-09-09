@@ -1,9 +1,11 @@
 import html as html_lib
+import fcntl
 import json
 import os
 import re
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,8 @@ from ..scraper import db_manager as scraper_db_manager
 from ..scraper import utils as scraper_utils
 from ..scraper.get_course import extract_course as scraper_extract_course
 from ..scraper.get_course import get_user_data as scraper_get_user_data
+from .monitoring import read_reminder_worker_status, read_sync_status, utc_now_iso, write_sync_status
+from .validation import read_validation_report, validate_workspace
 
 
 _E3_SYNC_LOCK = threading.Lock()
@@ -86,8 +90,23 @@ def _load_json(path: os.PathLike[str] | str) -> Any:
     file_path = Path(path)
     if not file_path.exists():
         return None
-    with file_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with file_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+@contextmanager
+def _user_sync_lock(workspace: str | Path) -> Iterator[None]:
+    lock_path = Path(workspace) / ".sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _read_courses_index(courses_file_path: str) -> dict[str, dict[str, str]]:
@@ -116,6 +135,12 @@ def _read_all_courses_data(base_dir: str, courses_file_path: str | None = None) 
     semester_tag = current_semester_tag()
     if courses_file_path:
         all_data.update(_read_courses_index(courses_file_path))
+    indexed_names_by_id = {
+        str(payload.get("_course_id") or "").strip(): display_name
+        for display_name, payload in all_data.items()
+        if isinstance(payload, dict) and str(payload.get("_course_id") or "").strip()
+    }
+    has_current_index = bool(indexed_names_by_id)
     if not base_path.exists():
         return all_data
 
@@ -125,39 +150,45 @@ def _read_all_courses_data(base_dir: str, courses_file_path: str | None = None) 
 
         course_data = {}
         news_data = _load_json(course_folder / "news.json")
-        if news_data:
+        if isinstance(news_data, list):
             course_data["news"] = news_data
 
         forums_data = _load_json(course_folder / "forums.json")
-        if forums_data:
+        if isinstance(forums_data, dict):
             course_data["forums"] = forums_data
 
         assignments_data = _load_json(course_folder / "homework" / "assignments.json")
-        if assignments_data:
+        if isinstance(assignments_data, list):
             course_data["assignments"] = assignments_data
 
         grades_data = _load_json(course_folder / "grades.json")
-        if grades_data:
+        if isinstance(grades_data, dict):
             course_data["grades"] = grades_data
 
         outline_data = _load_json(course_folder / "course_outline.json")
-        if outline_data:
+        if isinstance(outline_data, dict):
             course_data["course_outline"] = outline_data
 
         timetable_data = _load_json(course_folder / "timetable.json")
-        if timetable_data:
+        if isinstance(timetable_data, dict):
             course_data["timetable"] = timetable_data
 
         homework_page_data = _load_json(course_folder / "homework_page.json")
-        if homework_page_data:
+        if isinstance(homework_page_data, dict):
             course_data["homework_page"] = homework_page_data
 
         display_name = course_folder.name
         course_data["_folder_name"] = course_folder.name
+        course_id = ""
         if "_" in course_folder.name:
-            course_data["_course_id"] = course_folder.name.split("_", 1)[0]
+            course_id = course_folder.name.split("_", 1)[0]
+            course_data["_course_id"] = course_id
             display_name = course_folder.name.split("_", 1)[1]
 
+        if has_current_index and course_id not in indexed_names_by_id:
+            continue
+        if course_id in indexed_names_by_id:
+            display_name = indexed_names_by_id[course_id]
         if extract_semester_tag(display_name) != semester_tag:
             continue
 
@@ -322,6 +353,13 @@ def check_status(user_key: str | None = None) -> dict[str, Any]:
         preview = _read_home_page_preview(workspace / "e3_my.html")
         status["user_name"] = preview.get("user_name") or ""
         status["user_email"] = preview.get("user_email") or ""
+        status["course_count"] = len(_read_courses_index(workspace / "courses_current.json"))
+        status["semester_tag"] = preview.get("semester_tag") or current_semester_tag()
+        status["cache"] = get_cache_status(user_key)
+        status["sync"] = read_sync_status(workspace)
+        status["validation"] = read_validation_report(workspace)
+        status["last_run"] = _load_json(workspace / "last_run.json") or {}
+    status["reminder_worker"] = read_reminder_worker_status()
     return status
 
 
@@ -400,15 +438,79 @@ def login_and_sync(
     user_key: str,
     update_data: bool = False,
     update_links: bool = False,
+    force_full: bool = False,
 ) -> dict[str, Any]:
-    with _E3_SYNC_LOCK:
-        with _patched_e3_runtime(user_key) as paths:
-            scraper_get_user_data.get_user_data(account, password, update_data=update_data, update_links=update_links)
+    paths = _runtime_paths_for_user(user_key)
+    started_at = utc_now_iso()
+    started = time.monotonic()
+    mode = "full" if force_full else "incremental"
+    write_sync_status(paths["BASE_DIR"], {"state": "queued", "started_at": started_at, "mode": mode})
+    try:
+        with _user_sync_lock(paths["BASE_DIR"]):
+            write_sync_status(
+                paths["BASE_DIR"],
+                {"state": "running", "started_at": started_at, "mode": mode, "pid": os.getpid()},
+            )
+            with _E3_SYNC_LOCK:
+                with _patched_e3_runtime(user_key):
+                    scraped_courses = scraper_get_user_data.get_user_data(
+                        account,
+                        password,
+                        update_data=update_data,
+                        update_links=update_links,
+                        force_full=force_full,
+                    )
+                    if scraped_courses is None:
+                        raise RuntimeError("E3 authentication or dashboard fetch failed")
+
+            stored_course_index = _load_json(paths["COURSES_FILE"])
+            if stored_course_index != scraped_courses:
+                raise RuntimeError("E3 course index was not persisted correctly")
+
+            validation = validate_workspace(paths["BASE_DIR"], quarantine_invalid=True)
+            fatal_issues = [
+                issue
+                for issue in validation.get("issues", [])
+                if issue.get("file") == "courses_current.json"
+            ]
+            if fatal_issues:
+                raise RuntimeError(f"E3 course index validation failed: {fatal_issues[0].get('message')}")
+
             courses = _read_all_courses_data(paths["BASE_DIR"], paths["COURSES_FILE"])
             course_lookup = _build_course_lookup(courses)
+            duration = round(time.monotonic() - started, 3)
+            last_run = _load_json(paths["LAST_RUN_FILE"]) or {}
+            endpoint_failures = int(last_run.get("failed", 0) or 0)
+            sync_status = {
+                "state": "partial" if endpoint_failures else "success",
+                "started_at": started_at,
+                "finished_at": utc_now_iso(),
+                "duration_seconds": duration,
+                "mode": mode,
+                "course_count": len(courses),
+                "validation_issue_count": int(validation.get("issue_count", 0) or 0),
+                "endpoint_failure_count": endpoint_failures,
+                "last_run": last_run,
+            }
+            write_sync_status(paths["BASE_DIR"], sync_status)
             return {
                 "courses": courses,
                 "calendar_events": _read_home_calendar_events(paths["E3_MY_HTML"], course_lookup),
                 "home_preview": _read_home_page_preview(paths["E3_MY_HTML"]),
                 "workspace": paths["BASE_DIR"],
+                "validation": validation,
+                "sync_status": sync_status,
             }
+    except Exception as exc:
+        write_sync_status(
+            paths["BASE_DIR"],
+            {
+                "state": "failed",
+                "started_at": started_at,
+                "finished_at": utc_now_iso(),
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "mode": mode,
+                "error": str(exc)[:500],
+            },
+        )
+        raise

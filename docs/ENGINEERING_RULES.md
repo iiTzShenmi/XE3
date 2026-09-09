@@ -26,6 +26,7 @@ It exists so we can re-review against the same baseline later instead of relying
 - Do not infer behavior from human-facing embed text unless handling legacy payloads.
 - Text is for users. Metadata is for program logic.
 - Never hardcode an E3 semester in runtime paths or scraper filters. Derive the current semester from Taipei time, and only report a course count after applying that semester filter.
+- Treat `courses_current.json` as the authoritative enrollment index. Same-semester runtime folders that are no longer indexed must not reappear in user responses.
 
 ## 3. Keep Module Responsibilities Narrow
 - `agent/features/e3/handler.py` should mainly route commands and coordinate modules.
@@ -46,6 +47,13 @@ It exists so we can re-review against the same baseline later instead of relying
 - Catch specific exception classes where possible.
 - If a broad catch is still necessary, it must log context with `logger.exception(...)`.
 - Do not silently swallow parser/runtime failures that would hide schema drift.
+- Authentication or dashboard-fetch failure must never fall back to stale cache and report a successful sync.
+
+## 5.1 Runtime Data Safety
+- Write scraper JSON through an atomic temporary-file replacement.
+- Validate fetched sections before exposing them to commands or reminders.
+- Quarantine malformed section files; fail the whole sync when the current course index is invalid.
+- A partial endpoint failure may retain the last valid section, but `/e3 status` must report the sync as partial.
 
 ## 6. Refactors Must Be Incremental
 - Split large files in stages.
@@ -61,6 +69,12 @@ It exists so we can re-review against the same baseline later instead of relying
 - User-facing copy should favor Traditional Chinese unless a strong reason exists otherwise.
 - Keep output concise, readable, and mobile-friendly.
 - Use separators/whitespace intentionally; avoid long unbroken blocks.
+- Keep `/chksys` limited to machine/OS health. XE3 account, scraper, cache, validation, and reminder-worker diagnostics belong in `/e3 status`.
+
+## 7.1 Sync Concurrency
+- The legacy scraper mutates module-level runtime paths. Never run multiple accounts concurrently in threads within one process.
+- Use bounded spawn processes for cross-account concurrency and a cross-process per-user file lock to prevent duplicate syncs for the same account.
+- Keep the default worker count conservative (`2`) to avoid overloading E3 even when the host has more CPU capacity.
 
 ## 8. Review Checklist For Future Changes
 Before considering a refactor complete, verify:

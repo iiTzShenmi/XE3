@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import fcntl
+import logging
+import multiprocessing
+import os
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 import requests
 
-from agent.core.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, reminder_worker_lock_file
+from agent.core.config import e3_reminder_poll_seconds, e3_sync_interval_minutes, e3_sync_max_workers, reminder_worker_lock_file
 
-from ..services.client import fetch_courses, login_and_sync, make_user_key
+from ..services.client import fetch_courses, get_runtime_root, login_and_sync, make_user_key
 from ..services.upload import process_due_upload_queue
 from ..data.db import (
     get_e3_account_by_user_id,
@@ -41,6 +45,7 @@ from .payloads import (
     taipei_now,
 )
 from ..services.secrets import decrypt_secret
+from ..services.monitoring import read_sync_status, utc_now_iso, write_reminder_worker_status
 
 _STARTED = False
 _LOCK = threading.Lock()
@@ -259,12 +264,77 @@ def sync_user_snapshot(row: Any, logger, persist_failure: bool = True) -> tuple[
         return [], False
 
 
+def _sync_row_in_process(row: dict[str, Any]) -> dict[str, Any]:
+    logger = logging.getLogger("xe3.sync.child")
+    started = time.monotonic()
+    grade_changes, ok = sync_user_snapshot(row, logger)
+    status = read_sync_status(get_runtime_root() / make_user_key(str(row.get("line_user_id") or "")))
+    return {
+        "user_id": int(row["user_id"]),
+        "user_key": str(row["line_user_id"]),
+        "ok": bool(ok),
+        "grade_changes": grade_changes,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "course_count": int(status.get("course_count", 0) or 0),
+        "validation_issue_count": int(status.get("validation_issue_count", 0) or 0),
+        "endpoint_failure_count": int(status.get("endpoint_failure_count", 0) or 0),
+        "error": str(status.get("error") or "")[:300],
+    }
+
+
+def _sync_rows_bounded(rows: list[Any], logger) -> list[dict[str, Any]]:
+    row_dicts = [dict(row) for row in rows]
+    if not row_dicts:
+        return []
+    workers = min(e3_sync_max_workers(), len(row_dicts))
+    if workers == 1:
+        return [_sync_row_in_process(row) for row in row_dicts]
+
+    results_by_user: dict[int, dict[str, Any]] = {}
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+        future_rows = {executor.submit(_sync_row_in_process, row): row for row in row_dicts}
+        for future in as_completed(future_rows):
+            row = future_rows[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.exception("e3_parallel_sync_worker_failed user=%s", row.get("line_user_id"))
+                result = {
+                    "user_id": int(row["user_id"]),
+                    "user_key": str(row["line_user_id"]),
+                    "ok": False,
+                    "grade_changes": [],
+                    "duration_seconds": 0.0,
+                    "course_count": 0,
+                    "validation_issue_count": 0,
+                    "endpoint_failure_count": 0,
+                    "error": str(exc)[:300],
+                }
+            results_by_user[result["user_id"]] = result
+    return [results_by_user[int(row["user_id"])] for row in row_dicts]
+
+
+def _push_grade_changes(result: dict[str, Any], push_fn, logger) -> None:
+    user_id = int(result["user_id"])
+    user_key = str(result["user_key"])
+    for change in result.get("grade_changes") or []:
+        change_key = f"{change['course_id']}|{change['item_name']}|{change['score']}"
+        if notification_succeeded(user_id, "grade_posted", change_key):
+            continue
+        push_ok = push_fn(user_key, format_grade_payload(change))
+        log_notification(user_id, "grade_posted", "sent" if push_ok else "failed", details=change_key)
+        if not push_ok:
+            logger.error("e3_grade_push_failed user=%s item=%s", user_key, change.get("item_name"))
+
+
 def maybe_periodic_sync(row: Any, now, push_fn, logger) -> None:
     interval_minutes = e3_sync_interval_minutes()
-    if interval_minutes <= 0 or now.minute % interval_minutes != 0:
+    if interval_minutes <= 0 or _recently_synced(row, now, minutes=interval_minutes):
         return
 
-    dedupe_key = now.strftime("%Y-%m-%d %H:%M")
+    bucket = int(now.timestamp() // (interval_minutes * 60))
+    dedupe_key = f"{interval_minutes}m:{bucket}"
     if notification_sent(row["user_id"], "periodic_sync", dedupe_key):
         return
 
@@ -282,12 +352,32 @@ def maybe_periodic_sync(row: Any, now, push_fn, logger) -> None:
 
 
 def process_periodic_syncs(now, push_fn, logger, target_predicate=None) -> None:
+    interval_minutes = e3_sync_interval_minutes()
+    if interval_minutes <= 0:
+        return
+    bucket = int(now.timestamp() // (interval_minutes * 60))
+    dedupe_key = f"{interval_minutes}m:{bucket}"
+    due_rows = []
     for row in list_sync_targets():
         if target_predicate and not target_predicate(str(row["line_user_id"])):
             continue
         if not _login_status_allows_cached_reminders(row):
             continue
-        maybe_periodic_sync(row, now, push_fn, logger)
+        if _recently_synced(row, now, minutes=interval_minutes):
+            continue
+        if notification_sent(row["user_id"], "periodic_sync", dedupe_key):
+            continue
+        due_rows.append(row)
+
+    for result in _sync_rows_bounded(due_rows, logger):
+        log_notification(
+            result["user_id"],
+            "periodic_sync",
+            "sent" if result["ok"] else "failed",
+            details=dedupe_key,
+        )
+        if result["ok"]:
+            _push_grade_changes(result, push_fn, logger)
 
 
 def refresh_all_saved_accounts(logger) -> dict[str, Any]:
@@ -299,12 +389,18 @@ def refresh_all_saved_accounts(logger) -> dict[str, Any]:
         "grade_changes": 0,
         "results": [],
     }
-    for row in rows:
-        grade_changes, ok = sync_user_snapshot(row, logger)
+    for sync_result in _sync_rows_bounded(rows, logger):
+        grade_changes = sync_result.get("grade_changes") or []
+        ok = bool(sync_result.get("ok"))
         result = {
-            "user_key": str(row["line_user_id"]),
-            "ok": bool(ok),
+            "user_key": sync_result["user_key"],
+            "ok": ok,
             "grade_changes": len(grade_changes),
+            "duration_seconds": sync_result.get("duration_seconds", 0.0),
+            "course_count": sync_result.get("course_count", 0),
+            "validation_issue_count": sync_result.get("validation_issue_count", 0),
+            "endpoint_failure_count": sync_result.get("endpoint_failure_count", 0),
+            "error": sync_result.get("error", ""),
         }
         summary["results"].append(result)
         if ok:
@@ -434,11 +530,45 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
 
 
 def worker_loop(push_fn: Callable[[str, Any], bool], logger, interval_seconds: int, target_predicate=None) -> None:
+    last_success_at = ""
     while True:
+        started_at = utc_now_iso()
+        write_reminder_worker_status(
+            {
+                "state": "running",
+                "pid": os.getpid(),
+                "thread": threading.current_thread().name,
+                "interval_seconds": interval_seconds,
+                "last_tick_at": started_at,
+                "last_success_at": last_success_at,
+            }
+        )
         try:
             process_due_reminders(push_fn, logger, target_predicate=target_predicate)
-        except Exception:
+            last_success_at = utc_now_iso()
+            write_reminder_worker_status(
+                {
+                    "state": "idle",
+                    "pid": os.getpid(),
+                    "thread": threading.current_thread().name,
+                    "interval_seconds": interval_seconds,
+                    "last_tick_at": started_at,
+                    "last_success_at": last_success_at,
+                }
+            )
+        except Exception as exc:
             logger.exception("e3_reminder_loop_failed")
+            write_reminder_worker_status(
+                {
+                    "state": "degraded",
+                    "pid": os.getpid(),
+                    "thread": threading.current_thread().name,
+                    "interval_seconds": interval_seconds,
+                    "last_tick_at": started_at,
+                    "last_success_at": last_success_at,
+                    "last_error": str(exc)[:500],
+                }
+            )
         time.sleep(interval_seconds)
 
 
@@ -466,6 +596,15 @@ def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger, target_pr
         _STARTED = True
 
     interval_seconds = e3_reminder_poll_seconds()
+    write_reminder_worker_status(
+        {
+            "state": "starting",
+            "pid": os.getpid(),
+            "thread": "e3-reminder-worker",
+            "interval_seconds": interval_seconds,
+            "started_at": utc_now_iso(),
+        }
+    )
     worker = threading.Thread(
         target=worker_loop,
         args=(push_fn, logger, interval_seconds, target_predicate),

@@ -13,6 +13,8 @@ from .utils.common import (
     course_name_for_display as _course_name_for_display,
     current_semester_tag as _current_semester_tag,
     discord_bold as _discord_bold,
+    discord_full_due_tag as _discord_full_due_tag,
+    discord_relative_due_tag as _discord_relative_due_tag,
     extract_semester_tag as _extract_semester_tag,
     format_due_at_for_display as _format_due_at_for_display,
     format_due_at_full as _format_due_at_full,
@@ -273,23 +275,17 @@ def _queue_async(action, line_user_id):
 
 
 def _check_e3_status(line_user_id):
-    user_key = make_user_key(line_user_id) if line_user_id else None
-    runtime_status = check_status(user_key=user_key)
+    user_key = line_user_id
+    runtime_key = make_user_key(line_user_id) if line_user_id else None
+    runtime_status = check_status(user_key=runtime_key)
     if not runtime_status["available"]:
-        return (
-            f"⚠️ **XE3 status: unavailable**\n{_discord_separator(user_key)}\n"
-            f"XE3 can't find the E3 runtime at `{runtime_status['e3_root']}`."
-            if _is_discord_user_key(user_key)
-            else f"⚠️ E3 狀態：不可用\n找不到 E3 專案：{runtime_status['e3_root']}"
-        )
-
+        return f"⚠️ **XE3 服務不可用**\n{_discord_separator(user_key)}\n找不到 E3 爬蟲模組。"
     if not line_user_id:
-        return "⚠️ E3 狀態：需要 LINE 使用者身分"
+        return "⚠️ E3 狀態：缺少使用者身分。"
 
     user_id, err = _require_line_user(line_user_id)
     if err:
         return err
-
     account_row = get_e3_account_by_user_id(user_id)
     if not account_row:
         return "⚠️ E3 狀態：未綁定帳號\n請先輸入 `e3 login <帳號> <密碼>`。"
@@ -300,49 +296,105 @@ def _check_e3_status(line_user_id):
     has_courses = bool(runtime_status.get("has_courses"))
     has_home_html = bool(runtime_status.get("has_home_html"))
     user_name = runtime_status.get("user_name") or ""
-    user_email = runtime_status.get("user_email") or ""
     last_error = account_row["last_error"] or ""
     reminder_prefs = get_reminder_prefs(user_id)
     reminder_enabled = bool(reminder_prefs["enabled"]) if reminder_prefs else False
     reminder_schedule = _load_reminder_schedule(reminder_prefs)
+    cache_status = runtime_status.get("cache") or {}
+    sync_status = runtime_status.get("sync") or {}
+    validation = runtime_status.get("validation") or {}
+    last_run = sync_status.get("last_run") or runtime_status.get("last_run") or {}
+    worker_status = runtime_status.get("reminder_worker") or {}
 
     if login_status == "ok" and has_password and (has_cookie or has_home_html or has_courses):
-        headline = "🟢 E3 狀態：已登入"
+        headline = "🟢 已登入"
     elif login_status == "error":
-        headline = "⚠️ E3 狀態：登入異常"
+        headline = "🔴 登入異常"
     else:
-        headline = "🟡 E3 狀態：已綁定，尚未就緒"
+        headline = "🟡 已綁定，尚未就緒"
 
     if _is_discord_user_key(user_key):
+        sync_state = str(sync_status.get("state") or "尚無紀錄")
+        sync_state_label = {
+            "success": "🟢 成功",
+            "partial": "🟠 部分成功",
+            "running": "🟡 同步中",
+            "queued": "🟡 等待中",
+            "failed": "🔴 失敗",
+        }.get(sync_state, f"⚪ {sync_state}")
+        sync_time = sync_status.get("finished_at") or sync_status.get("started_at")
+        sync_time_text = (
+            f"{_discord_full_due_tag(sync_time, user_key)} ·{_discord_relative_due_tag(sync_time, user_key)}"
+            if sync_time
+            else "尚無紀錄"
+        )
+        cache_age = cache_status.get("age_minutes")
+        cache_text = f"{int(cache_age)} 分鐘前" if cache_age is not None else "尚未建立"
+        validation_count = int(validation.get("issue_count", sync_status.get("validation_issue_count", 0)) or 0)
+        validation_text = "🟢 通過" if validation_count == 0 else f"🟠 {validation_count} 個警告"
+        worker_state = str(worker_status.get("state") or "unknown")
+        worker_last = worker_status.get("last_success_at") or worker_status.get("last_tick_at")
+        worker_heartbeat_fresh = False
+        if worker_last:
+            try:
+                worker_dt = datetime.fromisoformat(str(worker_last).replace("Z", "+00:00"))
+                if worker_dt.tzinfo is None:
+                    worker_dt = worker_dt.replace(tzinfo=timezone.utc)
+                worker_max_age = max(180, int(worker_status.get("interval_seconds", 60) or 60) * 3)
+                worker_heartbeat_fresh = (datetime.now(timezone.utc) - worker_dt.astimezone(timezone.utc)).total_seconds() <= worker_max_age
+            except ValueError:
+                worker_heartbeat_fresh = False
+        worker_text = {
+            "idle": "🟢 正常",
+            "running": "🟡 執行中",
+            "starting": "🟡 啟動中",
+            "degraded": "🔴 異常",
+        }.get(worker_state, "⚪ 尚無回報")
+        if worker_last and not worker_heartbeat_fresh:
+            worker_text = "🔴 Heartbeat 過期"
+        endpoint_updated = int(last_run.get("updated", 0) or 0)
+        endpoint_skipped = int(last_run.get("skipped", 0) or 0)
+        endpoint_failed = int(last_run.get("failed", 0) or 0)
         lines = [
-            f"{headline}",
+            "🩺 **XE3 服務狀態**",
             _discord_separator(user_key),
-            f"👤 **Account:** `{account_row['e3_account']}`",
-            f"🪪 **Name:** {_discord_bold(user_name or 'Not available yet', user_key)}",
-            f"📧 **Email:** {user_email or 'Not available yet'}",
-            f"🔐 **Password:** {'saved' if has_password else 'not saved'}",
-            f"🍪 **Session cookie:** {'ready' if has_cookie else 'missing'}",
-            f"📚 **Course cache:** {'ready' if has_courses else 'missing'}",
-            f"⏰ **Reminders:** {'on' if reminder_enabled else 'off'}",
-            f"🕘 **Schedule:** {', '.join(reminder_schedule) if reminder_schedule else 'not set'}",
+            "🔐 **帳號**",
+            f"• 狀態：{headline}",
+            f"• 姓名：{_discord_bold(user_name or '尚未取得', user_key)}",
+            f"• E3 帳號：`{account_row['e3_account']}`",
+            "",
+            "📦 **資料同步**",
+            f"• 學期：**{runtime_status.get('semester_tag') or _current_semester_tag()}** · 課程 **{int(runtime_status.get('course_count', 0) or 0)}** 門",
+            f"• 最後同步：{sync_state_label} · {sync_time_text}",
+            f"• 模式：{'完整刷新' if sync_status.get('mode') == 'full' else '增量同步'} · 耗時 `{float(sync_status.get('duration_seconds', 0) or 0):.1f}s`",
+            f"• Endpoint：更新 `{endpoint_updated}` · 略過 `{endpoint_skipped}` · 失敗 `{endpoint_failed}`",
+            f"• 快取：{cache_text} · 資料驗證：{validation_text}",
+            "",
+            "⚙️ **背景服務**",
+            f"• Reminder worker：{worker_text}",
+            f"• 最後 heartbeat：{_discord_full_due_tag(worker_last, user_key) if worker_last else '尚無紀錄'}",
+            f"• 輪詢間隔：`{int(worker_status.get('interval_seconds', 0) or 0)}` 秒",
+            "",
+            "⏰ **提醒設定**",
+            f"• 狀態：{'🟢 開啟' if reminder_enabled else '⚪ 關閉'}",
+            f"• 時段：{', '.join(reminder_schedule) if reminder_schedule else '未設定'}",
         ]
     else:
-        lines = [headline]
-        lines.append(f"帳號：{account_row['e3_account']}")
-        lines.append(f"姓名：{user_name or '尚未取得'}")
-        lines.append(f"Email：{user_email or '尚未取得'}")
-        lines.append(f"密碼：{'已儲存' if has_password else '未儲存'}")
-        lines.append(f"Cookie：{'可用' if has_cookie else '未找到'}")
-        lines.append(f"課程快取：{'可用' if has_courses else '未找到'}")
-        lines.append(f"提醒：{'開啟' if reminder_enabled else '關閉'}")
-        lines.append(f"提醒時段：{', '.join(reminder_schedule) if reminder_schedule else '未設定'}")
+        lines = [
+            "🩺 XE3 服務狀態",
+            f"帳號狀態：{headline}",
+            f"姓名：{user_name or '尚未取得'}",
+            f"課程：{int(runtime_status.get('course_count', 0) or 0)} 門",
+            f"提醒：{'開啟' if reminder_enabled else '關閉'}",
+        ]
+
     if last_error:
-        lines.append(f"⚠️ **Last error:** {last_error}" if _is_discord_user_key(user_key) else f"最近錯誤：{last_error}")
+        lines.append(f"\n⚠️ **最近錯誤**\n> {str(last_error)[:300]}" if _is_discord_user_key(user_key) else f"最近錯誤：{last_error}")
     if not (has_password and (has_cookie or has_home_html or has_courses)):
         lines.append(
-            f"💡 Try {_discord_command_hint('e3 relogin', user_key)} or sign in again with {_discord_command_hint('e3 login <帳號> <密碼>', user_key)}."
+            f"\n💡 建議使用 {_discord_command_hint('e3 relogin', user_key)} 重新同步。"
             if _is_discord_user_key(user_key)
-            else "建議：輸入 `e3 relogin` 或重新 `e3 login <帳號> <密碼>`。"
+            else "建議：輸入 `e3 relogin` 重新同步。"
         )
     return "\n".join(lines)
 
@@ -2086,13 +2138,13 @@ def _format_home_preview(preview):
     user_name = preview.get("user_name") or ""
     user_email = preview.get("user_email") or ""
     if user_name:
-        lines.append(f"👤 **Name:** {_discord_bold(user_name, user_key)}" if _is_discord_user_key(user_key) else f"👤 姓名：{user_name}")
+        lines.append(f"👤 **姓名：** {_discord_bold(user_name, user_key)}" if _is_discord_user_key(user_key) else f"👤 姓名：{user_name}")
     if user_email:
         lines.append(f"📧 **Email:** {user_email}" if _is_discord_user_key(user_key) else f"📧 Email：{user_email}")
     if not lines:
         if _is_discord_user_key(user_key):
-            lines.append("👤 **Name:** Not available yet")
-            lines.append("📧 **Email:** Not available yet")
+            lines.append("👤 **姓名：** 尚未取得")
+            lines.append("📧 **Email：** 尚未取得")
         else:
             lines.append("👤 姓名：未取得")
             lines.append("📧 Email：未取得")
@@ -3309,7 +3361,14 @@ def _login(action, logger, line_user_id):
     password = tokens[2].strip()
 
     try:
-        result = login_and_sync(account, password, make_user_key(line_user_id), update_data=True, update_links=True)
+        result = login_and_sync(
+            account,
+            password,
+            make_user_key(line_user_id),
+            update_data=True,
+            update_links=True,
+            force_full=True,
+        )
         courses = result["courses"]
         calendar_events = result.get("calendar_events") or []
         preview = result["home_preview"]
@@ -3321,10 +3380,10 @@ def _login(action, logger, line_user_id):
         upsert_e3_account(user_id, account, encrypt_secret(password), status="ok", error=None)
         if _is_discord_user_key(line_user_id):
             reply = (
-                "✅ **You're in. XE3 is synced and ready.**\n"
+                "✅ **E3 登入成功，資料已同步。**\n"
                 f"{_discord_separator(line_user_id)}\n"
-                f"📚 Synced **{len(courses)}** course(s)\n"
-                f"🗓️ Tracked **{len(events)}** timeline event(s)\n"
+                f"📚 課程：**{len(courses)}** 門\n"
+                f"🗓️ 時間軸事件：**{len(events)}** 筆\n"
                 f"{_format_home_preview(preview)}"
             )
         else:
@@ -3359,7 +3418,14 @@ def _relogin(logger, line_user_id):
 
     try:
         password = decrypt_secret(encrypted_password)
-        result = login_and_sync(account, password, make_user_key(line_user_id), update_data=True, update_links=True)
+        result = login_and_sync(
+            account,
+            password,
+            make_user_key(line_user_id),
+            update_data=True,
+            update_links=True,
+            force_full=True,
+        )
         courses = result["courses"]
         calendar_events = result.get("calendar_events") or []
         preview = result["home_preview"]
@@ -3371,10 +3437,10 @@ def _relogin(logger, line_user_id):
         update_login_state(user_id, "ok", None)
         if _is_discord_user_key(line_user_id):
             reply = (
-                "✅ **All caught up. XE3 refreshed your E3 data.**\n"
+                "✅ **E3 資料已完整刷新。**\n"
                 f"{_discord_separator(line_user_id)}\n"
-                f"📚 Synced **{len(courses)}** course(s)\n"
-                f"🗓️ Tracked **{len(events)}** timeline event(s)\n"
+                f"📚 課程：**{len(courses)}** 門\n"
+                f"🗓️ 時間軸事件：**{len(events)}** 筆\n"
                 f"{_format_home_preview(preview)}"
             )
         else:

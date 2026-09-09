@@ -98,8 +98,8 @@ def _format_refresh_all_summary(summary: dict[str, Any]) -> str:
     ok = int(summary.get("ok", 0) or 0)
     failed = int(summary.get("failed", 0) or 0)
     grade_changes = int(summary.get("grade_changes", 0) or 0)
-    ok_users = [str(row.get("user_key")) for row in summary.get("results", []) if row.get("ok")]
-    failed_users = [str(row.get("user_key")) for row in summary.get("results", []) if not row.get("ok")]
+    ok_users = [row for row in summary.get("results", []) if row.get("ok")]
+    failed_users = [row for row in summary.get("results", []) if not row.get("ok")]
     lines = [
         "✅ `/e3 refresh` 已完成。",
         "",
@@ -112,13 +112,21 @@ def _format_refresh_all_summary(summary: dict[str, Any]) -> str:
         lines.extend([
             "",
             "🟢 成功清單",
-            "\n".join(f"• `{user}`" for user in ok_users),
+            "\n".join(
+                f"• `{row.get('user_key')}` · {int(row.get('course_count', 0) or 0)} 門課 · {float(row.get('duration_seconds', 0) or 0):.1f}s"
+                + (f" · ⚠️ {int(row.get('validation_issue_count', 0) or 0)}" if row.get("validation_issue_count") else "")
+                + (f" · endpoint 失敗 {int(row.get('endpoint_failure_count', 0) or 0)}" if row.get("endpoint_failure_count") else "")
+                for row in ok_users
+            ),
         ])
     if failed_users:
         lines.extend([
             "",
             "🔴 失敗清單",
-            "\n".join(f"• `{user}`" for user in failed_users),
+            "\n".join(
+                f"• `{row.get('user_key')}`" + (f" · {str(row.get('error'))[:120]}" if row.get("error") else "")
+                for row in failed_users
+            ),
         ])
     lines.extend(["", "這次是靜默刷新，不會另外把結果推給其他使用者。"])
     return "\n".join(lines)
@@ -439,6 +447,17 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True, ephemeral=True)
         summary = await asyncio.to_thread(refresh_all_saved_accounts, logger)
         await _send_text_chunks(interaction, _format_refresh_all_summary(summary), ephemeral=True)
+
+    @e3_group.command(name="status", description="查看個人 E3 同步與背景服務狀態")
+    async def e3_status(interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        payload = await asyncio.to_thread(
+            handle_e3_command,
+            "e3 status",
+            logger,
+            _platform_user_key(interaction.user.id),
+        )
+        await _send_payload(interaction, payload, bot=bot, user_id=interaction.user.id, ephemeral=True)
 
     @e3_group.command(name="course", description="顯示目前課程")
     async def e3_course(interaction: discord.Interaction):

@@ -172,7 +172,7 @@ def fetch_assignments(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch assignments page for {course_name}: {e}")
-        return
+        return False
     
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -321,8 +321,9 @@ def fetch_assignments(course_id, course_name, session, cookies):
     assignments = sorted(list(unique.values()), key = lambda assignments : assignments["title"])
     #print(assignments)
     #print(assignments)
+    save_json(assignments_file, assignments)
     if assignments:
-        save_json(assignments_file, assignments)
         print(f"[+] Saved {len(assignments)} assignments for {course_name}")
     else:
         print(f"[-] No assignments to save for {course_name}")
+    return True

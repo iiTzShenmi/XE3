@@ -19,13 +19,13 @@ def fetch_homework(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch homework page for {course_name}: {e}")
-        return
+        return False
     
     soup = BeautifulSoup(resp.text, "html.parser")
     main_content = soup.find("section", id="region-main")
     if not main_content:
         print(f"[-] No homework content found for {course_name}")
-        return
+        return False
     
     homeworks = []
     
@@ -87,5 +87,11 @@ def fetch_homework(course_id, course_name, session, cookies):
         })
         print(f"[+] Saved {len(homeworks)} homeworks for {course_name}")
     else:
+        save_json(homework_file, {
+            "course_id": course_id,
+            "course_name": course_name,
+            "homeworks": [],
+            "total_homeworks": 0,
+        })
         print(f"[-] No homeworks found for {course_name}")
-
+    return True

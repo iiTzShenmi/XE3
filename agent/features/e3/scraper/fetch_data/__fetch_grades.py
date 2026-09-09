@@ -39,14 +39,23 @@ def fetch_grades(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch grades page for {course_name}: {e}")
-        return
+        return False
 
     soup = BeautifulSoup(resp.text, "html.parser")
     main_content = soup.find("section", id="region-main") or soup
     grades_table = main_content.find("table", class_="generaltable") or main_content.find("table")
     if not grades_table:
         print(f"[-] No grades table found for {course_name}")
-        return
+        save_json(grades_file, {
+            "course_id": str(course_id),
+            "course_name": str(course_name),
+            "source_url": url,
+            "columns": [],
+            "summary": {"total_items": 0, "scored_items": 0, "category_count": 0, "calculated_count": 0},
+            "grade_items": [],
+            "grades": {},
+        })
+        return True
 
     header_cells = grades_table.select("thead th")
     column_names = [_clean_text(cell.get_text(" ", strip=True)) for cell in header_cells]
@@ -119,8 +128,9 @@ def fetch_grades(course_id, course_name, session, cookies):
         "grades": legacy_grades,
     }
 
+    save_json(grades_file, payload)
     if grade_items:
-        save_json(grades_file, payload)
         print(f"[+] Updated {len(grade_items)} grade rows for {course_name}")
     else:
         print(f"[-] No grades found for {course_name}")
+    return True

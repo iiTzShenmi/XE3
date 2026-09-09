@@ -83,7 +83,7 @@ def fetch_forums(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch course page for forums {course_name}: {e}")
-        return
+        return False
 
     soup = BeautifulSoup(resp.text, "html.parser")
     forum_links = []
@@ -138,3 +138,4 @@ def fetch_forums(course_id, course_name, session, cookies):
         },
     )
     print(f"[+] Saved {len(forums)} forums for {course_name}")
+    return True

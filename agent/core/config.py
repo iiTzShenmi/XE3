@@ -163,6 +163,10 @@ def e3_sync_interval_minutes():
     return max(15, _get_int("E3_SYNC_INTERVAL_MINUTES", 60))
 
 
+def e3_sync_max_workers():
+    return min(4, max(1, _get_int("E3_SYNC_MAX_WORKERS", 2)))
+
+
 def e3_cache_ttl_minutes():
     return max(1, _get_int("E3_CACHE_TTL_MINUTES", 15))
 

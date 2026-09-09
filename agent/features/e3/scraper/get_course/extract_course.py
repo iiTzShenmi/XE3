@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
-import json, os
-from ..utils import safe_name
+import os
+from ..utils import safe_name, save_json
 from .. import config
 
 def extract_course():
@@ -37,8 +37,7 @@ def extract_course():
 
     # save as JSON
     try:
-        with open(config.COURSES_FILE, "w", encoding="utf-8") as f:
-            json.dump(courses, f, ensure_ascii=False, indent=2)
+        save_json(config.COURSES_FILE, courses)
         print(f"[+] Success, found {len(courses)} courses for {semester_filter}")
     except Exception as e:
         print(f"[!] Error saving courses file: {e}")

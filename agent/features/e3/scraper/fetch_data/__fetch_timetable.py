@@ -109,13 +109,13 @@ def fetch_timetable(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch timetable page for {course_name}: {e}")
-        return
+        return False
     
     soup = BeautifulSoup(resp.text, "html.parser")
     main_content = soup.find("section", id="region-main")
     if not main_content:
         print(f"[-] No timetable content found for {course_name}")
-        return
+        return False
     
     iframe = main_content.find("iframe")
     iframe_src = iframe.get("src", "") if iframe else ""
@@ -277,3 +277,4 @@ def fetch_timetable(course_id, course_name, session, cookies):
         "exam_candidates": exam_candidates,
     })
     print(f"[+] Saved timetable data for {course_name}")
+    return True

@@ -18,7 +18,7 @@ def fetch_news(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch news page for {course_name}: {e}")
-        return
+        return False
     
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -88,8 +88,9 @@ def fetch_news(course_id, course_name, session, cookies):
         })
         updated = True
 
+    save_json(news_file, news_data)
     if updated and news_data:
-        save_json(news_file, news_data)
         print(f"[+] Saved {len(news_data)} news items for {course_name}")
     elif not news_data:
         print(f"[-] No news found for {course_name}")
+    return True

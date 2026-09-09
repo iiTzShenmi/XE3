@@ -8,6 +8,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from .extract_course import extract_course
 from .. import config
+from ..http import build_session
+from ..utils import save_json
 
 COOKIE_FILE = config.COOKIE_FILE
 
@@ -100,21 +102,7 @@ def _cookie_dict_from_session(session):
 
 
 def build_authenticated_session(cookies=None):
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": config.USER_AGENT,
-        "Referer": config.E3_BASE_URL + "/",
-    })
-    if cookies:
-        session.cookies.update(cookies)
-    original_request = session.request
-
-    def request_with_timeout(method, url, **kwargs):
-        kwargs.setdefault("timeout", config.REQUEST_TIMEOUT)
-        return original_request(method, url, **kwargs)
-
-    session.request = request_with_timeout
-    return session
+    return build_session(cookies, referer=config.E3_BASE_URL + "/")
 
 
 def _needs_relogin(resp):
@@ -181,7 +169,7 @@ def ensure_authenticated_session(account, password):
     return session, cookies
 
 
-def get_user_data(account, password, update_data=True, update_links=False):
+def get_user_data(account, password, update_data=True, update_links=False, force_full=False):
     """
     Fetch dashboard page and extract course list.
     Returns: dict {course_id: course_name} or {}
@@ -193,19 +181,36 @@ def get_user_data(account, password, update_data=True, update_links=False):
     session, cookies = ensure_authenticated_session(account, password)
     if session:
         courses = extract_course()
+        reports = []
         if update_data:
             try:
                 from ..update_all import __update_course_data
-                __update_course_data(session=session, cookies=cookies)
+                reports.append(__update_course_data(session=session, cookies=cookies, force=force_full))
             except Exception as e:
                 print(f"[!] Warning: Could not update course data: {e}")
+                reports.append({"status": "partial", "endpoints": [{"name": "course_data", "status": "failed", "error": str(e)[:300]}]})
 
         if update_links:
             try:
                 from ..update_all import __update_file_links
-                __update_file_links(session=session, cookies=cookies)
+                reports.append(__update_file_links(session=session, cookies=cookies, force=force_full))
             except Exception as e:
                 print(f"[!] Warning: Could not update file links: {e}")
+                reports.append({"status": "partial", "endpoints": [{"name": "file_links", "status": "failed", "error": str(e)[:300]}]})
+
+        reports = [report for report in reports if isinstance(report, dict)]
+        if reports:
+            endpoints = [item for report in reports for item in report.get("endpoints", [])]
+            save_json(config.LAST_RUN_FILE, {
+                "status": "success" if all(report.get("status") == "success" for report in reports) else "partial",
+                "type": "full" if update_links else "data",
+                "started_at": reports[0].get("started_at"),
+                "finished_at": reports[-1].get("finished_at"),
+                "updated": sum(1 for item in endpoints if item.get("status") == "updated"),
+                "skipped": sum(1 for item in endpoints if item.get("status") == "skipped"),
+                "failed": sum(1 for item in endpoints if item.get("status") == "failed"),
+                "endpoints": endpoints,
+            })
 
         return courses
-    return {}
+    return None

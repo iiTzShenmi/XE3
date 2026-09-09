@@ -148,13 +148,13 @@ def fetch_course_outline(course_id, course_name, session, cookies):
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch course outline page for {course_name}: {e}")
-        return
+        return False
     
     soup = BeautifulSoup(resp.text, "html.parser")
     main_content = soup.find("section", id="region-main")
     if not main_content:
         print(f"[-] No course outline content found for {course_name}")
-        return
+        return False
     
     activities = []
     exam_candidates = []
@@ -210,3 +210,4 @@ def fetch_course_outline(course_id, course_name, session, cookies):
         print(f"[+] Saved {len(activities)} activities for {course_name}")
     else:
         print(f"[-] No activities found for {course_name}")
+    return True

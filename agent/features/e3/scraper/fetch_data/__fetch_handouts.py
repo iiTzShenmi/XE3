@@ -26,7 +26,7 @@ def fetch_handouts(course_id, course_name, session, cookies, save_links_only=Tru
         resp.raise_for_status()
     except Exception as e:
         print(f"[!] Failed to fetch handouts page for {course_name}: {e}")
-        return
+        return False
     
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -71,3 +71,4 @@ def fetch_handouts(course_id, course_name, session, cookies, save_links_only=Tru
                     db_manager.mark_file_downloaded(course_id, "handout", filepath)
     
     print(f"[+] Handouts links updated for {course_name}")
+    return True

@@ -225,6 +225,14 @@ DISCORD_COMMAND_PREFIX=!
 DISCORD_GUILD_ID=
 # optional, for !chksys / system report naming
 APP_SERVICE_NAME=discord-bot.service
+
+# E3 background sync tuning
+E3_SYNC_INTERVAL_MINUTES=60
+E3_SYNC_MAX_WORKERS=2
+E3_DYNAMIC_SYNC_INTERVAL_MINUTES=60
+E3_STATIC_SYNC_INTERVAL_MINUTES=1440
+E3_REQUEST_RETRIES=2
+E3_REQUEST_BACKOFF_SECONDS=0.5
 ```
 
 Current Discord commands:
@@ -237,6 +245,7 @@ Current Discord commands:
 !e3 help
 !e3 login <account> <password>
 !e3 relogin
+!e3 status
 !e3 course
 !e3 timeline
 !e3 grades
@@ -244,6 +253,15 @@ Current Discord commands:
 ```
 
 The Discord bot currently reuses the existing E3 and weather core logic and sends the text fallback for responses.
+
+`/chksys` only reports machine and operating-system health. Use `/e3 status` for the current account cache, parser validation, endpoint sync metrics, and reminder-worker heartbeat.
+
+To run a silent end-to-end sync check for every saved account without sending user notifications:
+
+```bash
+cd /home/eason/xe3
+./venv/bin/python scripts/check_e3_sync.py
+```
 
 ### Discord Service
 

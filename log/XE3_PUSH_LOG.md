@@ -349,3 +349,33 @@
   - semester helper unit tests 通過
   - 5 個帳號的課程索引數量與 E3 dashboard 解析數量完全一致
   - `discord-bot.service` 透過 `systemctl --user` 重啟後，Gateway、slash commands 與 reminder worker 均正常
+
+### 29. E3 同步可靠度與可觀測性
+- 全帳號同步改為最多 2 個 spawn process 的受控並行：
+  - 隔離舊爬蟲的 module-level runtime config
+  - 使用跨 process 的 per-user file lock，防止同一帳號重複同步
+  - 並行數可用 `E3_SYNC_MAX_WORKERS` 調整，上限 4、預設 2
+- 背景同步改為依「距最後同步時間」判斷，不再依賴剛好命中整點的單一分鐘
+- 增量更新分層：
+  - 公告、討論區、作業與成績預設每 60 分鐘更新
+  - 課綱、課表與教材索引預設每 1440 分鐘更新
+  - 使用者 relogin 仍會執行完整刷新
+- HTTP GET 新增 timeout、429/5xx retry 與 exponential backoff
+- scraper JSON 改為原子寫入，每次同步後執行 schema validation：
+  - 異常 section 會移至 runtime `quarantine/`
+  - 當期課程索引異常會使整次同步失敗
+  - 部分 endpoint 失敗會保留上次有效資料，並標記為 partial
+- 修正已退選課程因殘留 runtime 資料夾而重新出現的問題；`courses_current.json` 現為當期唯一課程索引
+- 修正 dashboard 失敗時讀取舊 cache 卻回報成功的假陽性
+- 新增 ephemeral `/e3 status`：
+  - 顯示課程數、同步模式與耗時
+  - 顯示 endpoint 更新/略過/失敗數
+  - 顯示 validation 與 reminder worker heartbeat
+  - `/chksys` 維持只顯示主機與作業系統狀態
+- 新增 `scripts/check_e3_sync.py` 作為不發送使用者通知的全帳號維運檢查
+- 驗證：
+  - 5/5 真實帳號並行同步成功，無 SQLite lock 或 workspace 交叉
+  - 連續第二輪增量同步降至每帳號約 0.4–1.1 秒，新鮮 endpoint 全數略過
+  - 管理者帳號完整刷新：11 門課、25 個事件、88 個 endpoint、0 失敗、0 validation 警告
+  - unit tests、`py_compile`、Discord command tree 與 status payload smoke tests 通過
+  - `discord-bot.service` 重啟後 Gateway、slash command sync 與 reminder heartbeat 正常

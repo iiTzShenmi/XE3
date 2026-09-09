@@ -577,7 +577,8 @@ def list_sync_targets():
               users.id AS user_id,
               users.line_user_id AS line_user_id,
               e3_accounts.login_status AS login_status,
-              e3_accounts.last_error AS last_error
+              e3_accounts.last_error AS last_error,
+              e3_accounts.updated_at AS account_updated_at
             FROM users
             JOIN e3_accounts ON e3_accounts.user_id = users.id
             WHERE e3_accounts.encrypted_password IS NOT NULL

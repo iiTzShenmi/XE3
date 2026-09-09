@@ -6,6 +6,20 @@ from pathlib import Path
 
 from agent.features.e3.utils.common import current_semester_tag
 
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
 # Base directory for data storage
 BASE_DIR = os.path.join(os.path.dirname(__file__), "test_DB")
 
@@ -35,6 +49,10 @@ SELENIUM_PAGE_LOAD_TIMEOUT = 30
 
 # Requests configuration
 REQUEST_TIMEOUT = 15.0
+REQUEST_RETRIES = max(0, _env_int("E3_REQUEST_RETRIES", 2))
+REQUEST_BACKOFF_SECONDS = max(0.0, _env_float("E3_REQUEST_BACKOFF_SECONDS", 0.5))
+DYNAMIC_SYNC_INTERVAL_MINUTES = max(15, _env_int("E3_DYNAMIC_SYNC_INTERVAL_MINUTES", 60))
+STATIC_SYNC_INTERVAL_MINUTES = max(60, _env_int("E3_STATIC_SYNC_INTERVAL_MINUTES", 1440))
 
 # Optional override for diagnostics. Normal operation always follows Taipei time.
 SEMESTER_FILTER = os.getenv("E3_SEMESTER_FILTER", "").strip() or None
