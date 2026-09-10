@@ -2,6 +2,7 @@ import asyncio
 from io import BytesIO
 import logging
 from typing import Any
+from uuid import uuid4
 
 import discord
 from discord import app_commands
@@ -14,7 +15,9 @@ from agent.features.e3.reminder.api import build_test_reminder_payloads, refresh
 from agent.features.e3.services.upload import (
     E3UploadError,
     format_upload_queue_status,
+    preflight_assignment_upload,
     queue_assignment_upload,
+    sanitize_upload_filename,
     upload_assignment_submission,
 )
 from agent.features.plot.service import (
@@ -42,6 +45,35 @@ MAX_PLOT_UPLOAD_BYTES = 8 * 1024 * 1024
 
 def _platform_user_key(user_id: int) -> str:
     return f"discord:{user_id}"
+
+
+def _human_file_size(value: int | None) -> str:
+    if value is None:
+        return "E3 頁面未提供明確上限"
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{int(value)} B"
+
+
+def _format_upload_preflight(result) -> str:
+    status = "已繳交" if result.submitted else "尚未繳交"
+    lines = [
+        "🔎 **E3 上傳預檢**",
+        "━━━━━━━━━━━━",
+        f"📚 **{result.course_name}**｜`{result.course_id}`",
+        f"📝 **{result.assignment_title}**",
+        f"📌 狀態｜{status}｜頁面可見 `{result.submitted_file_count}` 個提交檔案",
+        f"📦 E3 檔案上限｜{_human_file_size(result.max_bytes)}",
+    ]
+    if result.filename:
+        lines.append(f"📎 附件｜`{result.filename}`｜{_human_file_size(result.file_size)}")
+    lines.extend(["", "✅ 作業頁與提交表單皆可正常讀取；本次沒有上傳或修改任何內容。"])
+    if result.warnings:
+        lines.extend(["", "⚠️ **注意事項**", *(f"• {warning}" for warning in result.warnings)])
+    return "\n".join(lines)
 
 
 def _remember_delivery_target(discord_user_id: int, channel_id: int | None, guild_id: int | None = None) -> None:
@@ -532,12 +564,58 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True)
         await _execute_e3_payload(interaction, f"files {keyword}", interaction.user.id, bot=bot)
 
+    @e3_group.command(name="uploadcheck", description="唯讀檢查指定 E3 作業是否可上傳")
+    @app_commands.describe(
+        course="作業所屬課程，請從選單挑課號",
+        homework="要檢查的作業，請先選 course 再從選單挑作業",
+        file="可選：只檢查附件檔名與大小，不會讀取或上傳內容",
+    )
+    @app_commands.autocomplete(course=_autocomplete_course_files, homework=_autocomplete_course_homework)
+    async def e3_uploadcheck(
+        interaction: discord.Interaction,
+        course: str,
+        homework: str,
+        file: discord.Attachment | None = None,
+    ):
+        if not await _is_e3_upload_user(interaction):
+            await interaction.response.send_message("⚠️ 這個 E3 上傳功能目前只開放給管理者測試。", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        filename = str(getattr(file, "filename", "") or "").strip()
+        file_size = int(getattr(file, "size", 0) or 0) if file else None
+        try:
+            result = await asyncio.to_thread(
+                preflight_assignment_upload,
+                _platform_user_key(interaction.user.id),
+                course,
+                homework,
+                filename=filename,
+                file_size=file_size,
+            )
+        except E3UploadError as exc:
+            logger.warning(
+                "discord_e3_upload_preflight_failed user=%s status=%s course=%s homework=%s error=%s",
+                interaction.user.id,
+                exc.status,
+                course,
+                homework,
+                exc,
+            )
+            await interaction.followup.send(f"⚠️ 預檢失敗｜`{exc.status}`\n{exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("discord_e3_upload_preflight_crashed user=%s course=%s homework=%s", interaction.user.id, course, homework)
+            await interaction.followup.send("⚠️ 預檢發生非預期錯誤，請查看 XE3 journal。", ephemeral=True)
+            return
+        await interaction.followup.send(_format_upload_preflight(result), ephemeral=True)
+
     @e3_group.command(name="upload", description="上傳檔案到指定 E3 作業")
     @app_commands.describe(
         course="作業所屬課程，請從選單挑課號",
         homework="要繳交的作業，請先選 course 再從選單挑作業",
         file="要上傳到 E3 的檔案",
-        replace_existing="已有繳交檔案時，是否先刪除舊提交再上傳",
+        replace_existing="安全覆蓋仍在測試；目前選 True 也不會刪除舊提交",
         queue_if_unavailable="作業尚未開放時，先保存檔案並由背景排程稍後嘗試",
     )
     @app_commands.autocomplete(course=_autocomplete_course_files, homework=_autocomplete_course_homework)
@@ -555,11 +633,13 @@ def _create_bot() -> commands.Bot:
 
         await _remember_interaction_target(interaction)
         await interaction.response.defer(thinking=True, ephemeral=True)
+        operation_id = uuid4().hex[:12]
 
-        filename = str(file.filename or "").strip()
-        if not filename:
+        raw_filename = str(file.filename or "").strip()
+        if not raw_filename:
             await interaction.followup.send("⚠️ Discord 附件沒有檔名，已取消上傳。", ephemeral=True)
             return
+        filename = sanitize_upload_filename(raw_filename)
 
         max_bytes = discord_attachment_max_bytes()
         if int(getattr(file, "size", 0) or 0) > max_bytes:
@@ -581,10 +661,12 @@ def _create_bot() -> commands.Bot:
                 blob,
                 content_type=getattr(file, "content_type", None),
                 replace_existing=replace_existing,
+                operation_id=operation_id,
             )
         except E3UploadError as exc:
             logger.warning(
-                "discord_e3_upload_user_error user=%s status=%s course=%s homework=%s file=%s error=%s",
+                "discord_e3_upload_user_error operation_id=%s user=%s status=%s course=%s homework=%s file=%s error=%s",
+                operation_id,
                 interaction.user.id,
                 exc.status,
                 course,
@@ -611,7 +693,14 @@ def _create_bot() -> commands.Bot:
                     )
                     return
                 except Exception:
-                    logger.exception("discord_e3_upload_queue_failed user=%s course=%s homework=%s file=%s", interaction.user.id, course, homework, filename)
+                    logger.exception(
+                        "discord_e3_upload_queue_failed operation_id=%s user=%s course=%s homework=%s file=%s",
+                        operation_id,
+                        interaction.user.id,
+                        course,
+                        homework,
+                        filename,
+                    )
                     await interaction.followup.send(
                         f"⚠️ E3 狀態：`{exc.status}`\n{exc}\n\n排程建立失敗，請稍後再試。",
                         ephemeral=True,
@@ -631,15 +720,25 @@ def _create_bot() -> commands.Bot:
                     ephemeral=True,
                 )
                 return
-            await interaction.followup.send(f"⚠️ E3 狀態：`{exc.status}`\n{exc}", ephemeral=True)
+            await interaction.followup.send(f"⚠️ E3 狀態：`{exc.status}`\n追蹤碼：`{operation_id}`\n{exc}", ephemeral=True)
             return
         except discord.DiscordException:
-            logger.exception("discord_e3_upload_attachment_read_failed user=%s file=%s", interaction.user.id, filename)
+            logger.exception("discord_e3_upload_attachment_read_failed operation_id=%s user=%s file=%s", operation_id, interaction.user.id, filename)
             await interaction.followup.send("⚠️ Discord 附件讀取失敗，請重新上傳一次。", ephemeral=True)
             return
         except Exception:
-            logger.exception("discord_e3_upload_failed user=%s course=%s homework=%s file=%s", interaction.user.id, course, homework, filename)
-            await interaction.followup.send("⚠️ E3 上傳流程失敗，請先回 E3 網頁確認目前作業狀態。", ephemeral=True)
+            logger.exception(
+                "discord_e3_upload_failed operation_id=%s user=%s course=%s homework=%s file=%s",
+                operation_id,
+                interaction.user.id,
+                course,
+                homework,
+                filename,
+            )
+            await interaction.followup.send(
+                f"⚠️ E3 上傳流程失敗，請先回 E3 網頁確認目前作業狀態。\n追蹤碼：`{operation_id}`",
+                ephemeral=True,
+            )
             return
 
         replaced_text = "（已先刪除舊提交）" if result.replaced_existing else ""
@@ -647,6 +746,7 @@ def _create_bot() -> commands.Bot:
             "\n".join(
                 [
                     "✅ E3 作業檔案已上傳並送出。",
+                    f"追蹤碼：`{operation_id}`",
                     f"課程：`{result.course_id}` {result.course_name}",
                     f"作業：{result.assignment_title}",
                     f"檔案：`{result.filename}` {replaced_text}".strip(),

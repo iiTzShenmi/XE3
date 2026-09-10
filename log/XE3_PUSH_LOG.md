@@ -398,3 +398,22 @@
   - 真實 `/e3 timeline`、`course`、`grades`、`remind show` payload 均通過序列化與上限檢查
   - `py_compile` 與 `git diff --check` 通過
   - `discord-bot.service` 重啟後 Gateway、4 個 Slash command 與 reminder worker 均正常
+
+### 31. E3 作業上傳預檢與安全加固
+- 新增管理者限定 `/e3 uploadcheck`：
+  - 唯讀驗證作業頁、提交表單、既有提交與附件名稱／大小
+  - 不讀取 Discord 附件內容，不向 E3 發送任何 POST
+- 每次正式上傳新增 operation ID 與分階段 journal 紀錄，失敗後可用追蹤碼定位階段
+- 所有 E3 上傳請求加入 connect/read timeout 與階段化 HTTP／網路錯誤狀態
+- repository upload 回應改為解析 JSON，不再因檔名含 `error` 等文字而誤判失敗
+- 檔名加入 Unicode 正規化、控制字元／路徑清理與 UTF-8 長度限制
+- 延後上傳暫存目錄與檔案權限收緊為 `0700` / `0600`
+- 暫停危險的自動覆蓋：不再先刪除舊提交，待取得完整覆蓋流程 HAR 後再開放
+- 若 Moodle 只儲存草稿、仍要求「正式提交」或聲明確認，不再誤報成成功
+- 舊 upload HAR 權限由 `0770` 收緊為 `0600`，避免 session 資料被其他帳號讀取
+- 新增 `requirements-dev.txt`，把 pytest 工具與正式 runtime 依賴分離
+- 驗證：
+  - 新增 7 個 upload regression tests，全專案 `23 passed`
+  - 新學期 `Lab01` 真實唯讀預檢成功：作業頁與提交表單可讀、0 個既有檔案、未偵測到額外 final-submit 步驟
+  - `py_compile` 與 `git diff --check` 通過
+  - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker 均正常

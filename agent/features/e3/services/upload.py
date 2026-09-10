@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
+import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +43,8 @@ E3_REPOSITORY_AJAX_URL = f"{config.E3_BASE_URL}/repository/repository_ajax.php?a
 DEFAULT_UPLOAD_REPO_ID = "5"
 DEFAULT_MAX_BYTES = "1073741824"
 DEFAULT_AREA_MAX_BYTES = "-1"
+E3_REQUEST_TIMEOUT = (10, 30)
+MAX_UPLOAD_FILENAME_BYTES = 180
 TAIPEI_TZ = timezone(timedelta(hours=8))
 MAX_QUEUED_UPLOAD_ATTEMPTS = 48
 SUBMITTED_STATUS_MARKERS = (
@@ -60,6 +65,7 @@ NOT_SUBMITTED_STATUS_MARKERS = (
     "尚未提交",
 )
 SUBMISSION_STATUS_LABEL_MARKERS = ("submission status", "提交狀態", "繳交狀態")
+LOGGER = logging.getLogger(__name__)
 
 
 class E3UploadError(Exception):
@@ -108,6 +114,80 @@ class QueuedUploadResult:
     cmid: str
     filename: str
     next_attempt_at: str
+
+
+@dataclass(frozen=True)
+class UploadPreflightResult:
+    course_id: str
+    course_name: str
+    assignment_title: str
+    cmid: str
+    start_at: str
+    due_at: str
+    submitted_file_count: int
+    submitted: bool
+    max_bytes: int | None
+    filename: str
+    file_size: int | None
+    final_submit_hint: bool
+    warnings: tuple[str, ...]
+
+
+def sanitize_upload_filename(filename: str | None) -> str:
+    normalized = unicodedata.normalize("NFKC", str(filename or ""))
+    normalized = normalized.replace("/", "_").replace("\\", "_")
+    normalized = "".join(char for char in normalized if ord(char) >= 32 and ord(char) != 127)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .")
+    if not normalized or normalized in {".", ".."}:
+        normalized = "upload"
+
+    if len(normalized.encode("utf-8")) <= MAX_UPLOAD_FILENAME_BYTES:
+        return normalized
+
+    suffix = Path(normalized).suffix
+    suffix_bytes = suffix.encode("utf-8")
+    if len(suffix_bytes) >= MAX_UPLOAD_FILENAME_BYTES // 2:
+        suffix = ""
+        suffix_bytes = b""
+    stem = normalized[: -len(suffix)] if suffix else normalized
+    budget = MAX_UPLOAD_FILENAME_BYTES - len(suffix_bytes)
+    while stem and len(stem.encode("utf-8")) > budget:
+        stem = stem[:-1]
+    return f"{stem.rstrip(' .')}{suffix}" or "upload"
+
+
+def _request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    stage: str,
+    status_prefix: str = "request",
+    **kwargs,
+) -> requests.Response:
+    kwargs.setdefault("timeout", E3_REQUEST_TIMEOUT)
+    try:
+        return getattr(session, method)(url, **kwargs)
+    except requests.Timeout as exc:
+        raise E3UploadError(
+            f"E3 在「{stage}」階段逾時，尚未確認提交成功，請稍後再試。",
+            status=f"{status_prefix}_timeout",
+        ) from exc
+    except requests.RequestException as exc:
+        raise E3UploadError(
+            f"E3 在「{stage}」階段連線失敗，尚未確認提交成功，請稍後再試。",
+            status=f"{status_prefix}_network_error",
+        ) from exc
+
+
+def _raise_for_status(response: requests.Response, *, stage: str, status_prefix: str) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise E3UploadError(
+            f"E3 在「{stage}」階段回覆 HTTP {response.status_code}，尚未確認提交成功。",
+            status=f"{status_prefix}_http_error",
+        ) from exc
 
 
 def _runtime_cookie_file(line_user_id: str) -> Path:
@@ -448,6 +528,27 @@ def _has_submitted_status(html: str) -> bool:
     return any(marker in text for marker in SUBMITTED_STATUS_MARKERS)
 
 
+def _has_final_submit_step(html: str) -> bool:
+    lowered = str(html or "").casefold()
+    markers = (
+        "submitforgrading",
+        "submit assignment",
+        "submissionstatement",
+        "提交作業",
+        "送出作業",
+        "正式提交",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _positive_limit(value: str | int | None) -> int | None:
+    try:
+        parsed = int(str(value or "0"))
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _page_contains_filename(html: str, filename: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
@@ -461,8 +562,16 @@ def _page_contains_filename(html: str, filename: str) -> bool:
 
 def _remove_existing_submission(session: requests.Session, target: AssignmentTarget) -> None:
     confirm_url = f"{E3_ASSIGN_VIEW_URL}?id={target.cmid}&action=removesubmissionconfirm"
-    response = session.get(confirm_url, headers={"Referer": target.detail_url}, allow_redirects=True)
-    response.raise_for_status()
+    response = _request(
+        session,
+        "get",
+        confirm_url,
+        stage="讀取舊提交",
+        status_prefix="read_existing",
+        headers={"Referer": target.detail_url},
+        allow_redirects=True,
+    )
+    _raise_for_status(response, stage="讀取舊提交", status_prefix="read_existing")
     if _needs_login(response):
         raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
 
@@ -477,20 +586,31 @@ def _remove_existing_submission(session: requests.Session, target: AssignmentTar
     if not payload["userid"] or not payload["sesskey"]:
         raise E3UploadError("無法取得刪除舊作業所需欄位，已取消。", status="missing_remove_fields")
 
-    post_response = session.post(
+    post_response = _request(
+        session,
+        "post",
         E3_ASSIGN_VIEW_URL,
+        stage="刪除舊提交",
+        status_prefix="remove_existing",
         data=payload,
         headers={"Origin": config.E3_BASE_URL, "Referer": confirm_url},
         allow_redirects=True,
     )
-    post_response.raise_for_status()
+    _raise_for_status(post_response, stage="刪除舊提交", status_prefix="remove_existing")
     if _needs_login(post_response):
         raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
 
 
 def _fetch_assignment_view(session: requests.Session, target: AssignmentTarget) -> str:
-    response = session.get(target.detail_url, allow_redirects=True)
-    response.raise_for_status()
+    response = _request(
+        session,
+        "get",
+        target.detail_url,
+        stage="讀取作業狀態",
+        status_prefix="fetch_assignment",
+        allow_redirects=True,
+    )
+    _raise_for_status(response, stage="讀取作業狀態", status_prefix="fetch_assignment")
     if _needs_login(response):
         raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     return response.text or ""
@@ -498,10 +618,18 @@ def _fetch_assignment_view(session: requests.Session, target: AssignmentTarget) 
 
 def _fetch_edit_context(session: requests.Session, target: AssignmentTarget) -> tuple[str, dict[str, str]]:
     edit_url = f"{E3_ASSIGN_VIEW_URL}?id={target.cmid}&action=editsubmission"
-    response = session.get(edit_url, headers={"Referer": target.detail_url}, allow_redirects=True)
+    response = _request(
+        session,
+        "get",
+        edit_url,
+        stage="讀取提交表單",
+        status_prefix="fetch_edit_form",
+        headers={"Referer": target.detail_url},
+        allow_redirects=True,
+    )
     if response.status_code in {403, 404}:
         _raise_edit_permission_error(response, target)
-    response.raise_for_status()
+    _raise_for_status(response, stage="讀取提交表單", status_prefix="fetch_edit_form")
     if _needs_login(response):
         raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     html = response.text or ""
@@ -541,7 +669,7 @@ def _upload_to_draft(
     filename: str,
     content: bytes,
     content_type: str,
-) -> None:
+) -> str:
     data = [
         ("title", ""),
         ("author", ""),
@@ -560,18 +688,32 @@ def _upload_to_draft(
         ("savepath", "/"),
     ]
     files = {"repo_upload_file": (filename, content, content_type)}
-    response = session.post(
+    response = _request(
+        session,
+        "post",
         E3_REPOSITORY_AJAX_URL,
+        stage="上傳草稿檔案",
+        status_prefix="upload_draft",
         data=data,
         files=files,
         headers={"Origin": config.E3_BASE_URL, "Referer": edit_url},
         allow_redirects=True,
     )
-    response.raise_for_status()
+    _raise_for_status(response, stage="上傳草稿檔案", status_prefix="upload_draft")
     if _needs_login(response):
         raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
-    if "error" in (response.text or "").casefold():
-        raise E3UploadError("E3 回報檔案上傳失敗，請確認檔案大小、格式或是否已存在同名檔案。", status="upload_rejected")
+    try:
+        payload = response.json()
+    except (requests.JSONDecodeError, ValueError) as exc:
+        raise E3UploadError("E3 回傳了無法辨識的上傳結果，請勿重複提交並回網頁確認。", status="invalid_upload_response") from exc
+    if not isinstance(payload, dict):
+        raise E3UploadError("E3 回傳了非預期的上傳結果，請勿重複提交並回網頁確認。", status="invalid_upload_response")
+    error = payload.get("error") or payload.get("errorcode")
+    if error:
+        raise E3UploadError(f"E3 拒絕檔案上傳：{str(error)[:180]}", status="upload_rejected")
+    if not (payload.get("url") or payload.get("id") or payload.get("file") or payload.get("filename")):
+        raise E3UploadError("E3 沒有回傳可確認的檔案資訊，請勿重複提交並回網頁確認。", status="invalid_upload_response")
+    return sanitize_upload_filename(payload.get("file") or payload.get("filename") or filename)
 
 
 def _save_assignment_submission(session: requests.Session, edit_url: str, context: dict[str, str]) -> str:
@@ -587,13 +729,17 @@ def _save_assignment_submission(session: requests.Session, edit_url: str, contex
     for transient in ("ctx_id", "client_id", "repo_id", "maxbytes", "areamaxbytes"):
         payload.pop(transient, None)
 
-    response = session.post(
+    response = _request(
+        session,
+        "post",
         E3_ASSIGN_VIEW_URL,
+        stage="儲存作業提交",
+        status_prefix="save_submission",
         data=payload,
         headers={"Origin": config.E3_BASE_URL, "Referer": edit_url},
         allow_redirects=True,
     )
-    response.raise_for_status()
+    _raise_for_status(response, stage="儲存作業提交", status_prefix="save_submission")
     if _needs_login(response):
         raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
     return response.text or ""
@@ -616,12 +762,15 @@ def queue_assignment_upload(
     if _target_overdue(target):
         raise E3UploadError("這份作業已截止或標記為逾期，XE3 不會建立延後上傳排程。", status="closed")
 
-    safe_filename = Path(filename or "upload").name or "upload"
+    safe_filename = sanitize_upload_filename(filename)
     token = uuid4().hex
     queue_dir = get_runtime_root() / make_user_key(line_user_id) / "queued_uploads" / token
-    queue_dir.mkdir(parents=True, exist_ok=True)
+    queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    queue_dir.chmod(0o700)
     file_path = queue_dir / safe_filename
-    file_path.write_bytes(content)
+    descriptor = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(content)
 
     next_attempt_at = _next_attempt_for_target(target)
     queue_id = create_e3_upload_queue_entry(
@@ -656,11 +805,23 @@ def upload_assignment_submission(
     *,
     content_type: str | None = None,
     replace_existing: bool = False,
+    operation_id: str | None = None,
 ) -> UploadResult:
     if not content:
         raise E3UploadError("Discord 附件是空的，已取消上傳。", status="invalid_file")
 
+    operation_id = operation_id or uuid4().hex[:12]
+    safe_filename = sanitize_upload_filename(filename)
     target = resolve_assignment_target(line_user_id, course, assignment_ref)
+    LOGGER.info(
+        "e3_upload_started operation_id=%s course=%s cmid=%s filename=%s size=%s replace=%s",
+        operation_id,
+        target.course_id,
+        target.cmid,
+        safe_filename,
+        len(content),
+        replace_existing,
+    )
     session = _authenticated_session(line_user_id)
     current_html = _fetch_assignment_view(session, target)
     existing_count = _submitted_file_count(current_html)
@@ -670,28 +831,95 @@ def upload_assignment_submission(
             status="existing_submission",
         )
     if existing_count and replace_existing:
-        _remove_existing_submission(session, target)
+        raise E3UploadError(
+            "安全覆蓋仍在測試中；XE3 不會先刪除既有提交。請先到 E3 網頁確認後手動更換。",
+            status="replace_unsupported",
+        )
 
+    LOGGER.info("e3_upload_stage operation_id=%s stage=fetch_edit_context", operation_id)
     edit_url, context = _fetch_edit_context(session, target)
-    guessed_type = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    safe_filename = Path(filename or "upload").name or "upload"
-    _upload_to_draft(session, edit_url, context, safe_filename, content, guessed_type)
+    max_bytes = _positive_limit(context.get("maxbytes"))
+    if max_bytes and len(content) > max_bytes:
+        raise E3UploadError(
+            f"檔案大小 `{len(content)}` bytes 超過 E3 此作業限制 `{max_bytes}` bytes，已取消。",
+            status="file_too_large",
+        )
+    guessed_type = content_type or mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+    LOGGER.info("e3_upload_stage operation_id=%s stage=upload_draft", operation_id)
+    uploaded_filename = _upload_to_draft(session, edit_url, context, safe_filename, content, guessed_type)
+    LOGGER.info("e3_upload_stage operation_id=%s stage=save_submission", operation_id)
     _save_assignment_submission(session, edit_url, context)
+    LOGGER.info("e3_upload_stage operation_id=%s stage=verify", operation_id)
     final_html = _fetch_assignment_view(session, target)
 
     if not _has_submitted_status(final_html):
+        if _page_contains_filename(final_html, uploaded_filename) and _has_final_submit_step(final_html):
+            raise E3UploadError(
+                "檔案已存入 E3 草稿，但這份作業還要求按「正式提交」。XE3 尚未代按，請立刻回 E3 完成確認。",
+                status="final_submit_required",
+            )
         raise E3UploadError("E3 沒有顯示已繳交狀態，請回 E3 網頁確認是否成功。", status="verification_failed")
-    if not _page_contains_filename(final_html, safe_filename):
+    if not _page_contains_filename(final_html, uploaded_filename):
         raise E3UploadError("E3 已回到作業頁，但頁面上找不到剛上傳的檔名，請回 E3 網頁確認。", status="verification_failed")
+
+    LOGGER.info(
+        "e3_upload_completed operation_id=%s course=%s cmid=%s filename=%s",
+        operation_id,
+        target.course_id,
+        target.cmid,
+        uploaded_filename,
+    )
 
     return UploadResult(
         course_id=target.course_id,
         course_name=target.course_name,
         assignment_title=target.title,
         cmid=target.cmid,
-        filename=safe_filename,
+        filename=uploaded_filename,
         submitted_file_count=_submitted_file_count(final_html),
         replaced_existing=bool(existing_count and replace_existing),
+    )
+
+
+def preflight_assignment_upload(
+    line_user_id: str,
+    course: str,
+    assignment_ref: str,
+    *,
+    filename: str = "",
+    file_size: int | None = None,
+) -> UploadPreflightResult:
+    target = resolve_assignment_target(line_user_id, course, assignment_ref)
+    session = _authenticated_session(line_user_id)
+    current_html = _fetch_assignment_view(session, target)
+    existing_count = _submitted_file_count(current_html)
+    _, context = _fetch_edit_context(session, target)
+    max_bytes = _positive_limit(context.get("maxbytes"))
+    safe_filename = sanitize_upload_filename(filename) if filename else ""
+    warnings: list[str] = []
+    if existing_count:
+        warnings.append("這份作業已有提交檔案；安全覆蓋目前停用。")
+    if max_bytes and file_size is not None and file_size > max_bytes:
+        warnings.append("附件超過 E3 此作業允許的大小。")
+    if _target_overdue(target):
+        warnings.append("這份作業已截止或標記為逾期。")
+    final_submit_hint = _has_final_submit_step(current_html)
+    if final_submit_hint:
+        warnings.append("頁面顯示可能還需要正式提交／聲明確認；目前不會自動代按。")
+    return UploadPreflightResult(
+        course_id=target.course_id,
+        course_name=target.course_name,
+        assignment_title=target.title,
+        cmid=target.cmid,
+        start_at=target.start_at,
+        due_at=target.due_at,
+        submitted_file_count=existing_count,
+        submitted=_has_submitted_status(current_html),
+        max_bytes=max_bytes,
+        filename=safe_filename,
+        file_size=file_size,
+        final_submit_hint=final_submit_hint,
+        warnings=tuple(warnings),
     )
 
 

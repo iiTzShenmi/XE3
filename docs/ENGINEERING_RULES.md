@@ -62,6 +62,17 @@ It exists so we can re-review against the same baseline later instead of relying
 - Quarantine malformed section files; fail the whole sync when the current course index is invalid.
 - A partial endpoint failure may retain the last valid section, but `/e3 status` must report the sync as partial.
 
+## 5.2 E3 Upload Safety
+- Keep upload commands owner-only until multiple real assignments have passed preflight, upload, save, and verification tests.
+- Run `/e3 uploadcheck` before the first upload to a new assignment configuration. Preflight must remain read-only.
+- Never delete an existing submission before a replacement file has been safely staged and verified. Keep automatic replacement disabled until its exact Moodle flow has a reviewed HAR and regression tests.
+- Treat `savesubmission` and "submit for grading" as separate states. Never report success while Moodle still shows a draft or requires a submission statement.
+- Every upload attempt must have an operation ID and stage logs without cookies, `sesskey`, file content, or repository response bodies.
+- All E3 upload HTTP calls must use bounded connect/read timeouts and return an actionable stage-specific error.
+- Parse repository upload responses as JSON. Do not infer failure by searching arbitrary response text for words such as `error`.
+- Normalize filenames before logging, queuing, or uploading. Queued directories and files must use owner-only permissions and be removed after terminal success.
+- HAR files are sensitive credentials captures. Keep them under ignored runtime data with mode `0600`, never commit them, and remove them when the flow has been documented.
+
 ## 6. Refactors Must Be Incremental
 - Split large files in stages.
 - Do not combine architectural refactors with unrelated product behavior changes in one commit unless necessary.
