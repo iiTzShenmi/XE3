@@ -3,12 +3,13 @@ import hashlib
 import hmac
 import json
 import mimetypes
+import re
 import secrets
 import threading
 import time
+import unicodedata
 from pathlib import Path
-from urllib.parse import urlsplit
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
@@ -237,6 +238,17 @@ def sanitize_download_filename(filename: str | None, fallback_name: str = "downl
     sanitized = f"{stem}{suffix}" if suffix else stem
     sanitized = sanitized.strip().strip(". ")
     return sanitized or fallback_name
+
+
+def attachment_content_disposition(filename: str | None) -> str:
+    safe_name = sanitize_download_filename(filename, "download")
+    suffix = Path(safe_name).suffix
+    ascii_stem = unicodedata.normalize("NFKD", Path(safe_name).stem).encode("ascii", "ignore").decode("ascii")
+    ascii_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_stem).strip("._-")
+    ascii_stem = ascii_stem or "download"
+    ascii_name = sanitize_download_filename(f"{ascii_stem}{suffix}", "download")
+    encoded_name = quote(safe_name, safe="")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
 
 
 def _filename_from_response(source_url, response, fallback_name="download"):

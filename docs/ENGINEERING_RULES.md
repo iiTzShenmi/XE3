@@ -14,6 +14,9 @@ It exists so we can re-review against the same baseline later instead of relying
 
 ## 1. Git and Runtime Must Stay Aligned
 - Keep the running bot and Git history as close as possible.
+- After rebuilding or replacing the virtual environment, restart every XE3 user service. A still-running process can retain deleted packages and hide missing runtime dependencies until the next reboot.
+- Runtime imports such as WSGI servers must be declared in `requirements.txt`; test-only packages belong in `requirements-dev.txt`.
+- After dependency or proxy changes, test both local `/healthz` and one short-lived public file-proxy download through Cloudflare.
 - After each stable chunk of work:
   1. run syntax/runtime validation
   2. commit the change

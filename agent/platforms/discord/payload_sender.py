@@ -112,10 +112,14 @@ def selector_back_command(entries: list[tuple[str, str, dict[str, str]]]) -> str
 
 
 def with_back_entry(entries: list[tuple[str, str, dict[str, str]]]) -> list[tuple[str, str, dict[str, str]]]:
-    trimmed = list(entries[: MAX_SELECT_OPTIONS - 1])
+    trimmed = list(entries[:MAX_SELECT_OPTIONS])
     back_command = selector_back_command(trimmed)
     if not back_command:
-        return trimmed[:MAX_SELECT_OPTIONS]
+        return trimmed
+    # Never discard a real option just to add navigation. Full selectors keep all
+    # 25 entries; smaller selectors can still include the requested back item.
+    if len(trimmed) >= MAX_SELECT_OPTIONS:
+        return trimmed
     trimmed.append(
         (
             "↩️ 上一頁",
@@ -133,7 +137,7 @@ def with_back_entry(entries: list[tuple[str, str, dict[str, str]]]) -> list[tupl
             },
         )
     )
-    return trimmed
+    return trimmed[:MAX_SELECT_OPTIONS]
 
 
 def _selector_summary(

@@ -417,3 +417,19 @@
   - 新學期 `Lab01` 真實唯讀預檢成功：作業頁與提交表單可讀、0 個既有檔案、未偵測到額外 final-submit 步驟
   - `py_compile` 與 `git diff --check` 通過
   - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker 均正常
+
+### 32. 課程列表完整性與檔案代理修復
+- 移除 `/e3 course` 寫死的前 10 門課限制，所有當期課程都會進入 Discord payload
+- 修正 25-option selector 加入「上一頁」時會犧牲一筆真實資料的問題；選項已滿時優先保留全部 25 筆
+- 找出搬機後檔案代理 500 根因：
+  - `xe3-web.service` 仍使用重建前的 Python 3.11 process
+  - 舊 process 指向已刪除的 `certifi` CA bundle
+  - 新 Python 3.12 venv 又缺少未列入 requirements 的 `waitress`
+- 將 `waitress` 補入正式 requirements，重啟 web service 後恢復正常
+- file proxy 現在會把 CA bundle 等 `OSError` 轉成可讀的 HTTP 502，不再裸回 500
+- 中文下載檔名改用 ASCII fallback + RFC 5987 `filename*`，避免 WSGI／代理 header 編碼錯誤
+- 驗證：
+  - 你的 `/e3 course` 真實 payload 完整包含 11 / 11 門課
+  - 全專案 `27 passed`，`py_compile` 與 `git diff --check` 通過
+  - 本機 file proxy 與公開 Cloudflare HTTPS 均實際下載成功：HTTP 200、`application/pdf`
+  - `discord-bot.service` 與 `xe3-web.service` 均重啟成功

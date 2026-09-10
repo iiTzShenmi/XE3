@@ -17,7 +17,7 @@ from agent.core.config import (
 )
 from agent.features.weather.service import handle_city_weather, handle_location_weather
 from agent.features.e3.service import handle_e3_command
-from agent.features.e3.data.file_proxy import FileProxyError, FileProxySessionExpired, prepare_proxy_download
+from agent.features.e3.data.file_proxy import FileProxyError, FileProxySessionExpired, attachment_content_disposition, prepare_proxy_download
 from agent.platforms.line.background import (
     build_processing_ack,
     is_background_e3_command,
@@ -437,7 +437,7 @@ def e3_file_proxy(token):
             exc.status_code,
             {"Content-Type": "text/html; charset=utf-8"},
         )
-    except requests.RequestException:
+    except (requests.RequestException, OSError):
         logger.exception("e3_file_proxy_request_failed")
         return (
             _render_proxy_error_page("E3 下載失敗", "伺服器目前無法從 E3 取得檔案，請稍後再試。"),
@@ -456,7 +456,7 @@ def e3_file_proxy(token):
             upstream.close()
 
     response = Response(generate(), content_type=download["content_type"])
-    response.headers["Content-Disposition"] = f'attachment; filename="{download["filename"]}"'
+    response.headers["Content-Disposition"] = attachment_content_disposition(download["filename"])
     content_length = upstream.headers.get("Content-Length")
     if content_length:
         response.headers["Content-Length"] = content_length

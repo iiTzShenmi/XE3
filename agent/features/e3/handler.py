@@ -445,7 +445,7 @@ def _list_courses(logger, line_user_id):
     else:
         text_lines = [f"📚 你的 {semester_tag} 學期 E3 課程：", _format_cache_status_text(cache_status)]
     bubbles = []
-    for idx, (display_name, payload) in enumerate(current_courses[:10], start=1):
+    for idx, (display_name, payload) in enumerate(current_courses, start=1):
         summary = course_runtime.build_course_summary(
             idx,
             display_name,
