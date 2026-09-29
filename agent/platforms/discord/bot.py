@@ -13,12 +13,13 @@ from agent.features.e3.service import handle_e3_command, run_e3_async_command
 from agent.features.e3.data.db import get_discord_delivery_target, get_user_id, init_db, upsert_discord_delivery_target
 from agent.features.e3.reminder.api import build_test_reminder_payloads, refresh_all_saved_accounts, start_reminder_worker
 from agent.features.e3.services.upload import (
+    AssignmentUploadFile,
     E3UploadError,
     format_upload_queue_status,
     preflight_assignment_upload,
-    queue_assignment_upload,
+    queue_assignment_upload_files,
     sanitize_upload_filename,
-    upload_assignment_submission,
+    upload_assignment_files,
 )
 from agent.features.plot.service import (
     PlotPreviewError,
@@ -614,7 +615,11 @@ def _create_bot() -> commands.Bot:
     @app_commands.describe(
         course="作業所屬課程，請從選單挑課號",
         homework="要繳交的作業，請先選 course 再從選單挑作業",
-        file="要上傳到 E3 的檔案",
+        file="第一個要上傳到 E3 的檔案",
+        file2="第二個檔案（可選）",
+        file3="第三個檔案（可選）",
+        file4="第四個檔案（可選）",
+        file5="第五個檔案（可選）",
         replace_existing="安全覆蓋仍在測試；目前選 True 也不會刪除舊提交",
         queue_if_unavailable="作業尚未開放時，先保存檔案並由背景排程稍後嘗試",
     )
@@ -624,6 +629,10 @@ def _create_bot() -> commands.Bot:
         course: str,
         homework: str,
         file: discord.Attachment,
+        file2: discord.Attachment | None = None,
+        file3: discord.Attachment | None = None,
+        file4: discord.Attachment | None = None,
+        file5: discord.Attachment | None = None,
         replace_existing: bool = False,
         queue_if_unavailable: bool = True,
     ):
@@ -635,55 +644,66 @@ def _create_bot() -> commands.Bot:
         await interaction.response.defer(thinking=True, ephemeral=True)
         operation_id = uuid4().hex[:12]
 
-        raw_filename = str(file.filename or "").strip()
-        if not raw_filename:
-            await interaction.followup.send("⚠️ Discord 附件沒有檔名，已取消上傳。", ephemeral=True)
-            return
-        filename = sanitize_upload_filename(raw_filename)
-
+        attachments = [item for item in (file, file2, file3, file4, file5) if item is not None]
         max_bytes = discord_attachment_max_bytes()
-        if int(getattr(file, "size", 0) or 0) > max_bytes:
-            await interaction.followup.send(
-                f"⚠️ 這個檔案超過目前 Discord 上傳代理限制 `{max_bytes // (1024 * 1024)} MB`，已取消。",
-                ephemeral=True,
-            )
-            return
+        filenames: list[str] = []
+        seen_filenames: set[str] = set()
+        for attachment in attachments:
+            raw_filename = str(attachment.filename or "").strip()
+            if not raw_filename:
+                await interaction.followup.send("⚠️ Discord 附件沒有檔名，已取消整批上傳。", ephemeral=True)
+                return
+            filename = sanitize_upload_filename(raw_filename)
+            if filename.casefold() in seen_filenames:
+                await interaction.followup.send(f"⚠️ 檔名 `{filename}` 重複，請重新命名後再上傳。", ephemeral=True)
+                return
+            if int(getattr(attachment, "size", 0) or 0) > max_bytes:
+                await interaction.followup.send(
+                    f"⚠️ 檔案 `{filename}` 超過目前 Discord 上傳代理限制 `{max_bytes // (1024 * 1024)} MB`，已取消整批上傳。",
+                    ephemeral=True,
+                )
+                return
+            filenames.append(filename)
+            seen_filenames.add(filename.casefold())
 
-        blob = b""
+        upload_files: list[AssignmentUploadFile] = []
         try:
-            blob = await file.read()
+            for attachment, filename in zip(attachments, filenames):
+                upload_files.append(
+                    AssignmentUploadFile(
+                        filename=filename,
+                        content=await attachment.read(),
+                        content_type=getattr(attachment, "content_type", None),
+                    )
+                )
             result = await asyncio.to_thread(
-                upload_assignment_submission,
+                upload_assignment_files,
                 _platform_user_key(interaction.user.id),
                 course,
                 homework,
-                filename,
-                blob,
-                content_type=getattr(file, "content_type", None),
+                upload_files,
                 replace_existing=replace_existing,
                 operation_id=operation_id,
             )
         except E3UploadError as exc:
             logger.warning(
-                "discord_e3_upload_user_error operation_id=%s user=%s status=%s course=%s homework=%s file=%s error=%s",
+                "discord_e3_upload_user_error operation_id=%s user=%s status=%s course=%s homework=%s files=%s error=%s",
                 operation_id,
                 interaction.user.id,
                 exc.status,
                 course,
                 homework,
-                filename,
+                filenames,
                 exc,
             )
-            if exc.status == "not_available" and queue_if_unavailable and blob:
+            if exc.status == "not_available" and queue_if_unavailable and upload_files:
                 try:
                     queued = await asyncio.to_thread(
-                        queue_assignment_upload,
+                        queue_assignment_upload_files,
                         _platform_user_key(interaction.user.id),
                         course,
                         homework,
-                        filename,
-                        blob,
-                        content_type=getattr(file, "content_type", None),
+                        upload_files,
                         replace_existing=replace_existing,
                     )
                 except E3UploadError as queue_exc:
@@ -694,12 +714,12 @@ def _create_bot() -> commands.Bot:
                     return
                 except Exception:
                     logger.exception(
-                        "discord_e3_upload_queue_failed operation_id=%s user=%s course=%s homework=%s file=%s",
+                        "discord_e3_upload_queue_failed operation_id=%s user=%s course=%s homework=%s files=%s",
                         operation_id,
                         interaction.user.id,
                         course,
                         homework,
-                        filename,
+                        filenames,
                     )
                     await interaction.followup.send(
                         f"⚠️ E3 狀態：`{exc.status}`\n{exc}\n\n排程建立失敗，請稍後再試。",
@@ -713,7 +733,8 @@ def _create_bot() -> commands.Bot:
                             f"排程：`#{queued.queue_id}`",
                             f"課程：`{queued.course_id}` {queued.course_name}",
                             f"作業：{queued.assignment_title}",
-                            f"檔案：`{queued.filename}`",
+                            f"檔案（{len(queued.filenames)}）：",
+                            *(f"• `{name}`" for name in queued.filenames),
                             f"下次嘗試時間：`{queued.next_attempt_at}`",
                         ]
                     ),
@@ -723,17 +744,17 @@ def _create_bot() -> commands.Bot:
             await interaction.followup.send(f"⚠️ E3 狀態：`{exc.status}`\n追蹤碼：`{operation_id}`\n{exc}", ephemeral=True)
             return
         except discord.DiscordException:
-            logger.exception("discord_e3_upload_attachment_read_failed operation_id=%s user=%s file=%s", operation_id, interaction.user.id, filename)
-            await interaction.followup.send("⚠️ Discord 附件讀取失敗，請重新上傳一次。", ephemeral=True)
+            logger.exception("discord_e3_upload_attachment_read_failed operation_id=%s user=%s files=%s", operation_id, interaction.user.id, filenames)
+            await interaction.followup.send("⚠️ Discord 附件讀取失敗，已取消整批上傳，請重新操作。", ephemeral=True)
             return
         except Exception:
             logger.exception(
-                "discord_e3_upload_failed operation_id=%s user=%s course=%s homework=%s file=%s",
+                "discord_e3_upload_failed operation_id=%s user=%s course=%s homework=%s files=%s",
                 operation_id,
                 interaction.user.id,
                 course,
                 homework,
-                filename,
+                filenames,
             )
             await interaction.followup.send(
                 f"⚠️ E3 上傳流程失敗，請先回 E3 網頁確認目前作業狀態。\n追蹤碼：`{operation_id}`",
@@ -749,7 +770,8 @@ def _create_bot() -> commands.Bot:
                     f"追蹤碼：`{operation_id}`",
                     f"課程：`{result.course_id}` {result.course_name}",
                     f"作業：{result.assignment_title}",
-                    f"檔案：`{result.filename}` {replaced_text}".strip(),
+                    f"檔案（{len(result.filenames)}）{replaced_text}：".strip(),
+                    *(f"• `{name}`" for name in result.filenames),
                     f"目前頁面上可見已繳檔案：`{result.submitted_file_count}`",
                 ]
             ),

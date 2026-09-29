@@ -45,6 +45,7 @@ DEFAULT_MAX_BYTES = "1073741824"
 DEFAULT_AREA_MAX_BYTES = "-1"
 E3_REQUEST_TIMEOUT = (10, 30)
 MAX_UPLOAD_FILENAME_BYTES = 180
+MAX_ASSIGNMENT_UPLOAD_FILES = 5
 TAIPEI_TZ = timezone(timedelta(hours=8))
 MAX_QUEUED_UPLOAD_ATTEMPTS = 48
 SUBMITTED_STATUS_MARKERS = (
@@ -100,9 +101,13 @@ class UploadResult:
     course_name: str
     assignment_title: str
     cmid: str
-    filename: str
+    filenames: tuple[str, ...]
     submitted_file_count: int
     replaced_existing: bool
+
+    @property
+    def filename(self) -> str:
+        return self.filenames[0] if self.filenames else ""
 
 
 @dataclass(frozen=True)
@@ -112,8 +117,19 @@ class QueuedUploadResult:
     course_name: str
     assignment_title: str
     cmid: str
-    filename: str
+    filenames: tuple[str, ...]
     next_attempt_at: str
+
+    @property
+    def filename(self) -> str:
+        return self.filenames[0] if self.filenames else ""
+
+
+@dataclass(frozen=True)
+class AssignmentUploadFile:
+    filename: str
+    content: bytes
+    content_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -745,6 +761,100 @@ def _save_assignment_submission(session: requests.Session, edit_url: str, contex
     return response.text or ""
 
 
+def _normalize_upload_files(files: list[AssignmentUploadFile] | tuple[AssignmentUploadFile, ...]) -> tuple[AssignmentUploadFile, ...]:
+    if not files:
+        raise E3UploadError("至少需要一個 Discord 附件。", status="invalid_file")
+    if len(files) > MAX_ASSIGNMENT_UPLOAD_FILES:
+        raise E3UploadError(f"一次最多只能上傳 `{MAX_ASSIGNMENT_UPLOAD_FILES}` 個附件。", status="too_many_files")
+
+    normalized: list[AssignmentUploadFile] = []
+    seen_names: set[str] = set()
+    for item in files:
+        if not item.content:
+            raise E3UploadError(f"附件 `{sanitize_upload_filename(item.filename)}` 是空的，已取消上傳。", status="invalid_file")
+        safe_filename = sanitize_upload_filename(item.filename)
+        name_key = safe_filename.casefold()
+        if name_key in seen_names:
+            raise E3UploadError(f"附件檔名 `{safe_filename}` 重複，請重新命名後再試。", status="duplicate_filename")
+        seen_names.add(name_key)
+        normalized.append(
+            AssignmentUploadFile(
+                filename=safe_filename,
+                content=item.content,
+                content_type=item.content_type or mimetypes.guess_type(safe_filename)[0] or "application/octet-stream",
+            )
+        )
+    return tuple(normalized)
+
+
+def queue_assignment_upload_files(
+    line_user_id: str,
+    course: str,
+    assignment_ref: str,
+    files: list[AssignmentUploadFile] | tuple[AssignmentUploadFile, ...],
+    *,
+    replace_existing: bool = False,
+) -> QueuedUploadResult:
+    normalized_files = _normalize_upload_files(files)
+
+    target = resolve_assignment_target(line_user_id, course, assignment_ref)
+    if _target_overdue(target):
+        raise E3UploadError("這份作業已截止或標記為逾期，XE3 不會建立延後上傳排程。", status="closed")
+
+    token = uuid4().hex
+    queue_dir = get_runtime_root() / make_user_key(line_user_id) / "queued_uploads" / token
+    queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    queue_dir.chmod(0o700)
+    manifest: list[dict[str, str]] = []
+    try:
+        for item in normalized_files:
+            file_path = queue_dir / item.filename
+            descriptor = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(item.content)
+            manifest.append(
+                {
+                    "filename": item.filename,
+                    "content_type": item.content_type or "application/octet-stream",
+                    "file_path": str(file_path),
+                }
+            )
+
+        first = manifest[0]
+        next_attempt_at = _next_attempt_for_target(target)
+        queue_id = create_e3_upload_queue_entry(
+            line_user_id=line_user_id,
+            course_id=target.course_id,
+            course_name=target.course_name,
+            cmid=target.cmid,
+            assignment_title=target.title,
+            filename=first["filename"],
+            content_type=first["content_type"],
+            file_path=first["file_path"],
+            replace_existing=replace_existing,
+            next_attempt_at=next_attempt_at,
+            files_json=json.dumps(manifest, ensure_ascii=False),
+        )
+    except Exception:
+        for item in manifest:
+            Path(item["file_path"]).unlink(missing_ok=True)
+        try:
+            queue_dir.rmdir()
+        except OSError:
+            pass
+        raise
+
+    return QueuedUploadResult(
+        queue_id=queue_id,
+        course_id=target.course_id,
+        course_name=target.course_name,
+        assignment_title=target.title,
+        cmid=target.cmid,
+        filenames=tuple(item.filename for item in normalized_files),
+        next_attempt_at=next_attempt_at,
+    )
+
+
 def queue_assignment_upload(
     line_user_id: str,
     course: str,
@@ -755,71 +865,34 @@ def queue_assignment_upload(
     content_type: str | None = None,
     replace_existing: bool = False,
 ) -> QueuedUploadResult:
-    if not content:
-        raise E3UploadError("Discord 附件是空的，無法建立排程。", status="invalid_file")
-
-    target = resolve_assignment_target(line_user_id, course, assignment_ref)
-    if _target_overdue(target):
-        raise E3UploadError("這份作業已截止或標記為逾期，XE3 不會建立延後上傳排程。", status="closed")
-
-    safe_filename = sanitize_upload_filename(filename)
-    token = uuid4().hex
-    queue_dir = get_runtime_root() / make_user_key(line_user_id) / "queued_uploads" / token
-    queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    queue_dir.chmod(0o700)
-    file_path = queue_dir / safe_filename
-    descriptor = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(content)
-
-    next_attempt_at = _next_attempt_for_target(target)
-    queue_id = create_e3_upload_queue_entry(
-        line_user_id=line_user_id,
-        course_id=target.course_id,
-        course_name=target.course_name,
-        cmid=target.cmid,
-        assignment_title=target.title,
-        filename=safe_filename,
-        content_type=content_type or mimetypes.guess_type(safe_filename)[0] or "application/octet-stream",
-        file_path=str(file_path),
+    return queue_assignment_upload_files(
+        line_user_id,
+        course,
+        assignment_ref,
+        [AssignmentUploadFile(filename, content, content_type)],
         replace_existing=replace_existing,
-        next_attempt_at=next_attempt_at,
-    )
-    return QueuedUploadResult(
-        queue_id=queue_id,
-        course_id=target.course_id,
-        course_name=target.course_name,
-        assignment_title=target.title,
-        cmid=target.cmid,
-        filename=safe_filename,
-        next_attempt_at=next_attempt_at,
     )
 
 
-def upload_assignment_submission(
+def upload_assignment_files(
     line_user_id: str,
     course: str,
     assignment_ref: str,
-    filename: str,
-    content: bytes,
+    files: list[AssignmentUploadFile] | tuple[AssignmentUploadFile, ...],
     *,
-    content_type: str | None = None,
     replace_existing: bool = False,
     operation_id: str | None = None,
 ) -> UploadResult:
-    if not content:
-        raise E3UploadError("Discord 附件是空的，已取消上傳。", status="invalid_file")
-
+    normalized_files = _normalize_upload_files(files)
     operation_id = operation_id or uuid4().hex[:12]
-    safe_filename = sanitize_upload_filename(filename)
     target = resolve_assignment_target(line_user_id, course, assignment_ref)
     LOGGER.info(
-        "e3_upload_started operation_id=%s course=%s cmid=%s filename=%s size=%s replace=%s",
+        "e3_upload_started operation_id=%s course=%s cmid=%s files=%s total_size=%s replace=%s",
         operation_id,
         target.course_id,
         target.cmid,
-        safe_filename,
-        len(content),
+        [item.filename for item in normalized_files],
+        sum(len(item.content) for item in normalized_files),
         replace_existing,
     )
     session = _authenticated_session(line_user_id)
@@ -839,35 +912,71 @@ def upload_assignment_submission(
     LOGGER.info("e3_upload_stage operation_id=%s stage=fetch_edit_context", operation_id)
     edit_url, context = _fetch_edit_context(session, target)
     max_bytes = _positive_limit(context.get("maxbytes"))
-    if max_bytes and len(content) > max_bytes:
+    for item in normalized_files:
+        if max_bytes and len(item.content) > max_bytes:
+            raise E3UploadError(
+                f"檔案 `{item.filename}` 大小 `{len(item.content)}` bytes 超過 E3 此作業限制 `{max_bytes}` bytes，已取消。",
+                status="file_too_large",
+            )
+    area_max_bytes = _positive_limit(context.get("areamaxbytes"))
+    total_size = sum(len(item.content) for item in normalized_files)
+    if area_max_bytes and total_size > area_max_bytes:
         raise E3UploadError(
-            f"檔案大小 `{len(content)}` bytes 超過 E3 此作業限制 `{max_bytes}` bytes，已取消。",
-            status="file_too_large",
+            f"全部附件共 `{total_size}` bytes，超過 E3 此作業總容量限制 `{area_max_bytes}` bytes，已取消。",
+            status="files_too_large",
         )
-    guessed_type = content_type or mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
-    LOGGER.info("e3_upload_stage operation_id=%s stage=upload_draft", operation_id)
-    uploaded_filename = _upload_to_draft(session, edit_url, context, safe_filename, content, guessed_type)
+
+    uploaded_filenames: list[str] = []
+    for index, item in enumerate(normalized_files, start=1):
+        LOGGER.info(
+            "e3_upload_stage operation_id=%s stage=upload_draft file_index=%s file_total=%s filename=%s",
+            operation_id,
+            index,
+            len(normalized_files),
+            item.filename,
+        )
+        try:
+            uploaded_filenames.append(
+                _upload_to_draft(
+                    session,
+                    edit_url,
+                    context,
+                    item.filename,
+                    item.content,
+                    item.content_type or "application/octet-stream",
+                )
+            )
+        except E3UploadError as exc:
+            if uploaded_filenames:
+                staged = "、".join(f"`{name}`" for name in uploaded_filenames)
+                raise E3UploadError(
+                    f"{exc} 此批次尚未儲存提交，但先前檔案可能仍留在 E3 草稿區：{staged}。請回 E3 確認。",
+                    status=exc.status,
+                ) from exc
+            raise
     LOGGER.info("e3_upload_stage operation_id=%s stage=save_submission", operation_id)
     _save_assignment_submission(session, edit_url, context)
     LOGGER.info("e3_upload_stage operation_id=%s stage=verify", operation_id)
     final_html = _fetch_assignment_view(session, target)
 
     if not _has_submitted_status(final_html):
-        if _page_contains_filename(final_html, uploaded_filename) and _has_final_submit_step(final_html):
+        if all(_page_contains_filename(final_html, name) for name in uploaded_filenames) and _has_final_submit_step(final_html):
             raise E3UploadError(
                 "檔案已存入 E3 草稿，但這份作業還要求按「正式提交」。XE3 尚未代按，請立刻回 E3 完成確認。",
                 status="final_submit_required",
             )
         raise E3UploadError("E3 沒有顯示已繳交狀態，請回 E3 網頁確認是否成功。", status="verification_failed")
-    if not _page_contains_filename(final_html, uploaded_filename):
-        raise E3UploadError("E3 已回到作業頁，但頁面上找不到剛上傳的檔名，請回 E3 網頁確認。", status="verification_failed")
+    missing_filenames = [name for name in uploaded_filenames if not _page_contains_filename(final_html, name)]
+    if missing_filenames:
+        missing = "、".join(f"`{name}`" for name in missing_filenames)
+        raise E3UploadError(f"E3 已回到作業頁，但找不到剛上傳的檔案：{missing}。請回 E3 網頁確認。", status="verification_failed")
 
     LOGGER.info(
-        "e3_upload_completed operation_id=%s course=%s cmid=%s filename=%s",
+        "e3_upload_completed operation_id=%s course=%s cmid=%s filenames=%s",
         operation_id,
         target.course_id,
         target.cmid,
-        uploaded_filename,
+        uploaded_filenames,
     )
 
     return UploadResult(
@@ -875,9 +984,30 @@ def upload_assignment_submission(
         course_name=target.course_name,
         assignment_title=target.title,
         cmid=target.cmid,
-        filename=uploaded_filename,
+        filenames=tuple(uploaded_filenames),
         submitted_file_count=_submitted_file_count(final_html),
         replaced_existing=bool(existing_count and replace_existing),
+    )
+
+
+def upload_assignment_submission(
+    line_user_id: str,
+    course: str,
+    assignment_ref: str,
+    filename: str,
+    content: bytes,
+    *,
+    content_type: str | None = None,
+    replace_existing: bool = False,
+    operation_id: str | None = None,
+) -> UploadResult:
+    return upload_assignment_files(
+        line_user_id,
+        course,
+        assignment_ref,
+        [AssignmentUploadFile(filename, content, content_type)],
+        replace_existing=replace_existing,
+        operation_id=operation_id,
     )
 
 
@@ -937,16 +1067,59 @@ def _next_retry_iso() -> str:
     return _to_utc_iso(datetime.now(timezone.utc) + timedelta(hours=1))
 
 
-def _remove_queued_file(file_path: str) -> None:
-    path = Path(str(file_path or ""))
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        return
-    try:
-        path.parent.rmdir()
-    except OSError:
-        return
+def _queued_file_metadata(row: Any) -> tuple[dict[str, str], ...]:
+    raw_manifest = str(_row_value(row, "files_json") or "").strip()
+    if raw_manifest:
+        try:
+            decoded = json.loads(raw_manifest)
+        except json.JSONDecodeError as exc:
+            raise E3UploadError("延後上傳的附件清單損壞，已停止排程。", status="queue_manifest_invalid") from exc
+        if not isinstance(decoded, list) or not decoded:
+            raise E3UploadError("延後上傳的附件清單格式錯誤，已停止排程。", status="queue_manifest_invalid")
+        metadata: list[dict[str, str]] = []
+        for item in decoded:
+            if not isinstance(item, dict):
+                raise E3UploadError("延後上傳的附件清單格式錯誤，已停止排程。", status="queue_manifest_invalid")
+            filename = sanitize_upload_filename(item.get("filename"))
+            file_path = str(item.get("file_path") or "").strip()
+            if not file_path:
+                raise E3UploadError("延後上傳的附件路徑遺失，已停止排程。", status="queue_manifest_invalid")
+            metadata.append(
+                {
+                    "filename": filename,
+                    "content_type": str(item.get("content_type") or "application/octet-stream"),
+                    "file_path": file_path,
+                }
+            )
+        return tuple(metadata)
+
+    return (
+        {
+            "filename": sanitize_upload_filename(_row_value(row, "filename") or "upload"),
+            "content_type": str(_row_value(row, "content_type") or "application/octet-stream"),
+            "file_path": str(_row_value(row, "file_path") or ""),
+        },
+    )
+
+
+def _remove_queued_files(files: tuple[dict[str, str], ...]) -> None:
+    parent_dirs: set[Path] = set()
+    for item in files:
+        path = Path(item["file_path"])
+        parent_dirs.add(path.parent)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
+    for parent in parent_dirs:
+        try:
+            parent.rmdir()
+        except OSError:
+            continue
+
+
+def _format_filenames(filenames: tuple[str, ...]) -> str:
+    return "\n".join(f"• `{filename}`" for filename in filenames)
 
 
 def _queued_upload_success_payload(result: UploadResult, queue_id: int) -> str:
@@ -956,20 +1129,24 @@ def _queued_upload_success_payload(result: UploadResult, queue_id: int) -> str:
             f"排程：`#{queue_id}`",
             f"課程：`{result.course_id}` {result.course_name}",
             f"作業：{result.assignment_title}",
-            f"檔案：`{result.filename}`",
+            f"檔案（{len(result.filenames)}）：\n{_format_filenames(result.filenames)}",
             f"目前頁面上可見已繳檔案：`{result.submitted_file_count}`",
         ]
     )
 
 
 def _queued_upload_failed_payload(row: Any, reason: str) -> str:
+    try:
+        filenames = tuple(item["filename"] for item in _queued_file_metadata(row))
+    except E3UploadError:
+        filenames = (str(_row_value(row, "filename") or "upload"),)
     return "\n".join(
         [
             "⚠️ 排程 E3 上傳已停止。",
             f"排程：`#{_row_value(row, 'id')}`",
             f"課程：`{_row_value(row, 'course_id')}` {_row_value(row, 'course_name', '')}",
             f"作業：{_row_value(row, 'assignment_title')}",
-            f"檔案：`{_row_value(row, 'filename')}`",
+            f"檔案（{len(filenames)}）：\n{_format_filenames(filenames)}",
             f"原因：{reason}",
         ]
     )
@@ -986,23 +1163,30 @@ def process_due_upload_queue(push_fn, logger, target_predicate=None, *, limit: i
         attempts = int(_row_value(row, "attempts", 0) or 0) + 1
         mark_e3_upload_attempt(queue_id)
 
-        file_path = str(_row_value(row, "file_path") or "")
         try:
-            content = Path(file_path).read_bytes()
-        except OSError:
+            queued_files = _queued_file_metadata(row)
+            files = [
+                AssignmentUploadFile(
+                    item["filename"],
+                    Path(item["file_path"]).read_bytes(),
+                    item["content_type"],
+                )
+                for item in queued_files
+            ]
+        except (OSError, E3UploadError) as exc:
             reason = "找不到先前暫存的檔案，可能已被手動刪除。"
+            if isinstance(exc, E3UploadError):
+                reason = str(exc)
             mark_e3_upload_failed(queue_id, reason)
             push_fn(user_key, _queued_upload_failed_payload(row, reason))
             continue
 
         try:
-            result = upload_assignment_submission(
+            result = upload_assignment_files(
                 user_key,
                 str(_row_value(row, "course_id") or ""),
                 f"{_row_value(row, 'course_id')}:{_row_value(row, 'cmid')}",
-                str(_row_value(row, "filename") or "upload"),
-                content,
-                content_type=str(_row_value(row, "content_type") or "") or None,
+                files,
                 replace_existing=bool(_row_value(row, "replace_existing", 0)),
             )
         except E3UploadError as exc:
@@ -1023,7 +1207,7 @@ def process_due_upload_queue(push_fn, logger, target_predicate=None, *, limit: i
             continue
 
         mark_e3_upload_sent(queue_id)
-        _remove_queued_file(file_path)
+        _remove_queued_files(queued_files)
         push_fn(user_key, _queued_upload_success_payload(result, queue_id))
 
 
@@ -1038,10 +1222,14 @@ def format_upload_queue_status(line_user_id: str) -> str:
         attempts = int(_row_value(row, "attempts", 0) or 0)
         next_attempt = str(_row_value(row, "next_attempt_at") or "")
         error = str(_row_value(row, "last_error") or "").strip()
+        try:
+            file_count = len(_queued_file_metadata(row))
+        except E3UploadError:
+            file_count = 1
         line = (
             f"• `#{_row_value(row, 'id')}` {status}｜"
             f"`{_row_value(row, 'course_id')}` {_row_value(row, 'assignment_title')}｜"
-            f"`{_row_value(row, 'filename')}`｜attempts `{attempts}`"
+            f"附件 `{file_count}` 個｜attempts `{attempts}`"
         )
         if status == "queued" and next_attempt:
             line += f"｜next `{next_attempt}`"

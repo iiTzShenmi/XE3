@@ -74,6 +74,7 @@ It exists so we can re-review against the same baseline later instead of relying
 - All E3 upload HTTP calls must use bounded connect/read timeouts and return an actionable stage-specific error.
 - Parse repository upload responses as JSON. Do not infer failure by searching arbitrary response text for words such as `error`.
 - Normalize filenames before logging, queuing, or uploading. Queued directories and files must use owner-only permissions and be removed after terminal success.
+- Multi-file homework uploads must reuse one Moodle draft item, upload every file first, and save the assignment exactly once. Never submit one queued file at a time because later files could overwrite or be rejected as an existing submission.
 - HAR files are sensitive credentials captures. Keep them under ignored runtime data with mode `0600`, never commit them, and remove them when the flow has been documented.
 
 ## 6. Refactors Must Be Incremental

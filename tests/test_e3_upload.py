@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+from pathlib import Path
+
 import requests
 import pytest
 
@@ -154,3 +158,166 @@ def test_preflight_never_uploads_or_saves(monkeypatch):
 
     assert result.filename == "_lab.xlsx"
     assert result.submitted is False
+
+
+def test_multiple_files_share_one_draft_and_save_once(monkeypatch):
+    pages = iter(
+        [
+            "<html><body>尚未提交</body></html>",
+            """
+            <html><body>
+              <table><tr><td>繳交狀態</td><td>已提交</td></tr></table>
+              <a href="assignsubmission_file/report.pdf">report.pdf</a>
+              <a href="assignsubmission_file/data.csv">data.csv</a>
+            </body></html>
+            """,
+        ]
+    )
+    uploaded: list[tuple[str, str]] = []
+    saved: list[str] = []
+    monkeypatch.setattr(upload, "resolve_assignment_target", lambda *_args, **_kwargs: _target())
+    monkeypatch.setattr(upload, "_authenticated_session", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: next(pages))
+    monkeypatch.setattr(upload, "_fetch_edit_context", lambda *_args, **_kwargs: ("https://example.invalid/edit", _context()))
+
+    def fake_upload(_session, _edit_url, context, filename, _content, _content_type):
+        uploaded.append((context["files_filemanager"], filename))
+        return filename
+
+    monkeypatch.setattr(upload, "_upload_to_draft", fake_upload)
+    monkeypatch.setattr(upload, "_save_assignment_submission", lambda *_args, **_kwargs: saved.append("saved") or "")
+
+    result = upload.upload_assignment_files(
+        "discord:1",
+        "27444",
+        "27444:230655",
+        [
+            upload.AssignmentUploadFile("report.pdf", b"pdf", "application/pdf"),
+            upload.AssignmentUploadFile("data.csv", b"csv", "text/csv"),
+        ],
+    )
+
+    assert uploaded == [("123", "report.pdf"), ("123", "data.csv")]
+    assert saved == ["saved"]
+    assert result.filenames == ("report.pdf", "data.csv")
+    assert result.submitted_file_count == 2
+
+
+def test_multiple_files_do_not_save_after_partial_draft_failure(monkeypatch):
+    monkeypatch.setattr(upload, "resolve_assignment_target", lambda *_args, **_kwargs: _target())
+    monkeypatch.setattr(upload, "_authenticated_session", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: "<html><body>尚未提交</body></html>")
+    monkeypatch.setattr(upload, "_fetch_edit_context", lambda *_args, **_kwargs: ("https://example.invalid/edit", _context()))
+    calls = 0
+
+    def fake_upload(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise upload.E3UploadError("second failed", status="upload_rejected")
+        return "first.pdf"
+
+    monkeypatch.setattr(upload, "_upload_to_draft", fake_upload)
+    monkeypatch.setattr(upload, "_save_assignment_submission", lambda *_args, **_kwargs: pytest.fail("partial batch must not be saved"))
+
+    with pytest.raises(upload.E3UploadError) as caught:
+        upload.upload_assignment_files(
+            "discord:1",
+            "27444",
+            "27444:230655",
+            [
+                upload.AssignmentUploadFile("first.pdf", b"first"),
+                upload.AssignmentUploadFile("second.pdf", b"second"),
+            ],
+        )
+
+    assert caught.value.status == "upload_rejected"
+
+
+def test_multiple_files_reject_duplicate_sanitized_names():
+    with pytest.raises(upload.E3UploadError) as caught:
+        upload._normalize_upload_files(
+            [
+                upload.AssignmentUploadFile("same.pdf", b"first"),
+                upload.AssignmentUploadFile("SAME.pdf", b"second"),
+            ]
+        )
+
+    assert caught.value.status == "duplicate_filename"
+
+
+def test_queue_stores_multi_file_manifest(monkeypatch, tmp_path):
+    target = replace(_target(), due_at="2026/12/31 23:59")
+    captured: dict = {}
+    monkeypatch.setattr(upload, "resolve_assignment_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(upload, "_target_overdue", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(upload, "get_runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(upload, "make_user_key", lambda value: value.replace(":", "_"))
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return 17
+
+    monkeypatch.setattr(upload, "create_e3_upload_queue_entry", fake_create)
+
+    result = upload.queue_assignment_upload_files(
+        "discord:1",
+        "27444",
+        "27444:230655",
+        [
+            upload.AssignmentUploadFile("report.pdf", b"pdf", "application/pdf"),
+            upload.AssignmentUploadFile("data.csv", b"csv", "text/csv"),
+        ],
+    )
+
+    manifest = json.loads(captured["files_json"])
+    assert result.queue_id == 17
+    assert result.filenames == ("report.pdf", "data.csv")
+    assert [item["filename"] for item in manifest] == ["report.pdf", "data.csv"]
+    assert [Path(item["file_path"]).read_bytes() for item in manifest] == [b"pdf", b"csv"]
+
+
+def test_queue_worker_submits_bundle_once_and_removes_all_files(monkeypatch, tmp_path):
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    first = queue_dir / "report.pdf"
+    second = queue_dir / "data.csv"
+    first.write_bytes(b"pdf")
+    second.write_bytes(b"csv")
+    manifest = [
+        {"filename": first.name, "content_type": "application/pdf", "file_path": str(first)},
+        {"filename": second.name, "content_type": "text/csv", "file_path": str(second)},
+    ]
+    row = {
+        "id": 17,
+        "line_user_id": "discord:1",
+        "course_id": "27444",
+        "course_name": "測試課程",
+        "cmid": "230655",
+        "assignment_title": "Lab01",
+        "filename": first.name,
+        "file_path": str(first),
+        "files_json": json.dumps(manifest),
+        "attempts": 0,
+        "replace_existing": 0,
+    }
+    received: list[upload.AssignmentUploadFile] = []
+    sent: list[int] = []
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(upload, "list_due_e3_uploads", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(upload, "mark_e3_upload_attempt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(upload, "mark_e3_upload_sent", lambda queue_id: sent.append(queue_id))
+
+    def fake_upload(_user, _course, _assignment, files, **_kwargs):
+        received.extend(files)
+        return upload.UploadResult("27444", "測試課程", "Lab01", "230655", ("report.pdf", "data.csv"), 2, False)
+
+    monkeypatch.setattr(upload, "upload_assignment_files", fake_upload)
+
+    upload.process_due_upload_queue(lambda user, text: pushed.append((user, text)), logger=upload.LOGGER)
+
+    assert [(item.filename, item.content) for item in received] == [("report.pdf", b"pdf"), ("data.csv", b"csv")]
+    assert sent == [17]
+    assert not first.exists()
+    assert not second.exists()
+    assert pushed and "檔案（2）" in pushed[0][1]

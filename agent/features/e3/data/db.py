@@ -187,6 +187,8 @@ def init_db() -> None:
             )
             """
         )
+        if not _has_column(conn, "e3_upload_queue", "files_json"):
+            conn.execute("ALTER TABLE e3_upload_queue ADD COLUMN files_json TEXT")
 
 
 def upsert_user(line_user_id: str) -> int:
@@ -642,6 +644,7 @@ def create_e3_upload_queue_entry(
     file_path: str,
     replace_existing: bool,
     next_attempt_at: str,
+    files_json: str | None = None,
 ) -> int:
     user_id = upsert_user(line_user_id)
     now = _utc_now_iso()
@@ -650,9 +653,10 @@ def create_e3_upload_queue_entry(
             """
             INSERT INTO e3_upload_queue (
               user_id, course_id, course_name, cmid, assignment_title, filename, content_type,
-              file_path, replace_existing, status, attempts, next_attempt_at, created_at, updated_at
+              file_path, replace_existing, status, attempts, next_attempt_at, created_at, updated_at,
+              files_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -667,6 +671,7 @@ def create_e3_upload_queue_entry(
                 next_attempt_at,
                 now,
                 now,
+                files_json,
             ),
         )
         return int(cursor.lastrowid)

@@ -466,3 +466,17 @@
   - 使用該帳號現有 E3 session 實際下載 `literacy_rates.csv` 成功，檔名正確
   - 5 / 5 帳號以不發通知模式刷新成功；目前 16 個 active homework 中 4 個帶老師附件，0 個 exact duplicate
   - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker heartbeat 正常
+
+### 35. E3 作業多檔案上傳
+- `/e3 upload` 新增 `file2` 至 `file5`，單次可選擇最多 5 個附件
+- 所有附件共用同一個 Moodle draft item，全部上傳完成後才儲存一次 submission，避免逐檔提交造成覆蓋或既有提交衝突
+- 上傳前會拒絕空檔、超過 Discord/E3 限制的檔案，以及清理後重複的檔名
+- 驗證完成後會逐一確認所有檔名都出現在 E3 作業頁；任一草稿上傳失敗時不會儲存 submission
+- 延後上傳排程加入多檔 manifest，同一排程會整批重試、送出並清除所有暫存檔；舊版單檔排程仍可相容處理
+- SQLite 啟動 migration 新增 nullable `files_json` 欄位，不重建或刪除既有 queue 資料
+- 將「多檔必須共用 draft 並只儲存一次」加入工程規範
+- 驗證：
+  - upload regression tests `12 passed`
+  - 全專案 `39 passed`
+  - `py_compile` 與 `git diff --check` 通過
+  - `discord-bot.service` 重啟後 Gateway、4 個 Slash command 與 reminder worker 均正常
