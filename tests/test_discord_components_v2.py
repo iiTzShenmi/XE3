@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
 import pytest
 
+from agent.features.e3.reminder.payloads import format_countdown_payload
 from agent.platforms.discord.components_v2 import build_select_layout, validate_layout
 from agent.platforms.discord.payload_sender import edit_message_from_payload, send_payload
 from agent.platforms.discord.views import DiscordViewCallbacks
@@ -137,3 +139,36 @@ async def test_reminder_notification_sends_only_layout_view(callbacks):
     assert list(kwargs) == ["view"]
     assert isinstance(kwargs["view"], discord.ui.LayoutView)
     validate_layout(kwargs["view"])
+
+
+@pytest.mark.asyncio
+async def test_homework_reminder_attachment_uses_direct_download_button(callbacks):
+    target = SimpleNamespace(send=AsyncMock())
+    due_at = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+    row = {
+        "event_uid": "homework-1",
+        "event_type": "homework",
+        "course_id": "course-1",
+        "course_name": "測試課程",
+        "title": "Homework 1",
+        "due_at": due_at,
+        "payload_json": '{"attachments":[{"name":"question.pdf","url":"https://e3p.nycu.edu.tw/pluginfile.php/1/question.pdf"}]}',
+    }
+    payload = format_countdown_payload(row, 12, "discord:123")
+
+    await send_payload(
+        target,
+        payload,
+        user_id=123,
+        callbacks=callbacks,
+        send_text_chunks=_noop,
+    )
+
+    kwargs = target.send.await_args.kwargs
+    assert list(kwargs) == ["view"]
+    view = kwargs["view"]
+    assert view.timeout == 86400
+    serialized = str(view.to_components())
+    assert "question.pdf" in serialized
+    assert "custom_id" in serialized
+    assert "https://e3p.nycu.edu.tw" not in serialized

@@ -537,7 +537,7 @@ def get_events_due_between(user_id: int, start_iso: str, end_iso: str, limit: in
     with get_conn() as conn:
         return conn.execute(
             """
-            SELECT event_uid, event_type, course_id, course_name, title, due_at
+            SELECT event_uid, event_type, course_id, course_name, title, due_at, payload_json
             FROM events_cache
             WHERE user_id=? AND status='active' AND due_at IS NOT NULL
               AND due_at >= ? AND due_at <= ?

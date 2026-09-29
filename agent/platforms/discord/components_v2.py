@@ -13,6 +13,7 @@ from agent.platforms.discord.views import (
     ReminderScheduleSelect,
     ReminderTestButton,
     ReminderToggleButton,
+    UriActionButton,
 )
 
 
@@ -149,6 +150,15 @@ def _button_for_action(
     kind = str(action.get("kind") or "")
     label = str(action.get("label") or "開啟")[:80]
     if kind == "uri":
+        meta = action.get("xe3_meta") if isinstance(action.get("xe3_meta"), dict) else {}
+        if meta.get("direct_download"):
+            return UriActionButton(
+                callbacks,
+                user_id,
+                action,
+                str(meta.get("option_description") or "老師附件"),
+                label,
+            )
         url = str(action.get("value") or "")
         if not url or len(url) > 512:
             return None

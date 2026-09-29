@@ -303,12 +303,16 @@ async def send_payload(
         else:
             remaining = list(pending_embeds)
             first_layout = True
+            action_timeout = 86400 if any(
+                bool(action_meta(action).get("reminder_attachment")) for action in pending_actions
+            ) else 600
             while remaining:
                 layout = build_embed_layout(
                     remaining,
                     callbacks=callbacks,
                     user_id=user_id,
                     actions=pending_actions if first_layout else None,
+                    timeout=action_timeout,
                 )
                 consumed = max(1, len(layout.children))
                 await _send_layout(target, layout)

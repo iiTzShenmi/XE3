@@ -103,6 +103,8 @@ It exists so we can re-review against the same baseline later instead of relying
 - Deduplicate delivery only after a successful push. A failed attempt must remain retryable with the original event payload.
 - Refresh stale account data before sending any due digest or countdown. Never send an empty digest solely because a stale cache contains no events.
 - Keep reminder tests side-effect free: inject a fake push function and never send live DMs during automated verification.
+- Homework reminders may expose teacher-provided assignment attachments, but must never include the user's submitted files.
+- Keep authenticated E3 attachment URLs server-side. Discord reminder controls must call the guarded download callback instead of serializing raw E3 URLs into message components.
 
 ## 8. Review Checklist For Future Changes
 Before considering a refactor complete, verify:

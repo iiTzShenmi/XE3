@@ -334,6 +334,7 @@ def extract_events_from_fetch_all(data, calendar_events=None):
 
     events = []
     seen = set()
+    homework_event_keys = set()
     assignment_completion_by_course = {}
     for course_name, payload in data.items():
         if not isinstance(payload, dict):
@@ -353,41 +354,46 @@ def extract_events_from_fetch_all(data, calendar_events=None):
         assignments = payload.get("assignments") or {}
         if isinstance(assignments, dict):
             items = assignments.get("assignments")
-            if isinstance(items, list):
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    category = str(item.get("category") or "").strip().lower()
-                    if category and category not in {"in_progress", "upcoming"}:
-                        continue
-                    if _assignment_is_completed(item):
-                        continue
-                    title = str(item.get("title") or item.get("name") or "未命名作業").strip()
-                    due_raw = (
-                        item.get("due")
-                        or item.get("due_time")
-                        or item.get("due_date")
-                        or item.get("deadline")
-                        or item.get("截止")
-                    )
-                    due_dt = _normalize_due_dt(_parse_dt(due_raw))
-                    if not due_dt:
-                        continue
-                    event_uid = _make_event_uid("assignment", course_id, title, due_dt.isoformat())
-                    if event_uid in seen:
-                        continue
-                    seen.add(event_uid)
-                    events.append(
-                        {
-                            "event_uid": event_uid,
-                            "event_type": _infer_event_type(title, fallback="homework"),
-                            "course_id": course_id,
-                            "course_name": course_name,
-                            "title": title,
-                            "due_at": due_dt.isoformat(),
-                            "payload_json": json.dumps(item, ensure_ascii=False),
-                        }
-                    )
+        elif isinstance(assignments, list):
+            items = assignments
+        else:
+            items = None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                category = str(item.get("category") or "").strip().lower()
+                if category and category not in {"in_progress", "upcoming"}:
+                    continue
+                if _assignment_is_completed(item):
+                    continue
+                title = str(item.get("title") or item.get("name") or "未命名作業").strip()
+                due_raw = (
+                    item.get("due")
+                    or item.get("due_time")
+                    or item.get("due_date")
+                    or item.get("deadline")
+                    or item.get("截止")
+                )
+                due_dt = _normalize_due_dt(_parse_dt(due_raw))
+                if not due_dt:
+                    continue
+                event_uid = _make_event_uid("assignment", course_id, title, due_dt.isoformat())
+                if event_uid in seen:
+                    continue
+                seen.add(event_uid)
+                homework_event_keys.add((str(course_id or "").strip(), normalize_title_token(title), due_dt.isoformat()))
+                events.append(
+                    {
+                        "event_uid": event_uid,
+                        "event_type": _infer_event_type(title, fallback="homework"),
+                        "course_id": course_id,
+                        "course_name": course_name,
+                        "title": title,
+                        "due_at": due_dt.isoformat(),
+                        "payload_json": json.dumps(item, ensure_ascii=False),
+                    }
+                )
 
     if isinstance(calendar_events, list):
         for item in calendar_events:
@@ -406,6 +412,9 @@ def extract_events_from_fetch_all(data, calendar_events=None):
             if event_type == "homework":
                 completion_map = assignment_completion_by_course.get(course_id or "", {})
                 if _title_matches_completed_assignment(normalize_title_token(title), completion_map):
+                    continue
+                homework_key = (course_id or "", normalize_title_token(title), due_dt.isoformat())
+                if homework_key in homework_event_keys:
                     continue
             event_uid = _make_event_uid("calendar", item.get("event_id"), course_id, title, due_dt.isoformat())
             if event_uid in seen:

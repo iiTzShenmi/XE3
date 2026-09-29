@@ -450,3 +450,19 @@
   - 5 / 5 個已儲存帳號以不發通知模式刷新成功，0 endpoint failure、0 validation warning
   - 資料庫 112 / 112 個 active event 均已改為 timezone-aware timestamp
   - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker heartbeat 正常
+
+### 34. 未繳作業提醒附加老師檔案
+- 未完成作業的每日摘要與 12／2 小時倒數提醒會顯示老師附件名稱
+- 提醒卡最多提供 5 個附件按鈕；點擊後沿用既有 authenticated Discord delivery，直接把檔案傳到 Discord
+- 僅加入老師提供的 `attachments`，明確排除使用者的 `submitted_files`
+- 原始 E3 檔案 URL 保留在 server-side callback，不會序列化到 Discord Components v2 訊息
+- 修正 scraper event extraction 未處理 list-shaped `assignments` 的問題：
+  - list-shaped 作業現在會保留完整附件 metadata
+  - 同課程、同標題、同截止時間的 calendar homework 會由資訊較完整的 assignment event 取代，避免重複提醒
+- 附件按鈕 interaction timeout 延長為 24 小時；非附件互動維持原本 10 分鐘
+- 驗證：
+  - 全專案 `34 passed`，`py_compile` 與 `git diff --check` 通過
+  - 真實 Biostatistics Homework 1 payload 正確辨識 2 個老師附件
+  - 使用該帳號現有 E3 session 實際下載 `literacy_rates.csv` 成功，檔名正確
+  - 5 / 5 帳號以不發通知模式刷新成功；目前 16 個 active homework 中 4 個帶老師附件，0 個 exact duplicate
+  - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker heartbeat 正常

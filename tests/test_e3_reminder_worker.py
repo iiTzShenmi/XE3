@@ -1,6 +1,8 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from agent.features.e3.reminder import worker
+from agent.features.e3.reminder.payloads import format_countdown_payload
 from agent.features.e3.services.events import extract_events_from_fetch_all
 
 
@@ -149,3 +151,57 @@ def test_timezone_less_e3_deadline_is_stored_as_utc():
 
     assert len(events) == 1
     assert events[0]["due_at"] == "2026-10-01T15:59:00+00:00"
+
+
+def test_list_shaped_assignments_keep_attachments_and_replace_calendar_duplicate():
+    assignment = {
+        "title": "Homework 1",
+        "category": "in_progress",
+        "due_time": "2026/10/06 23:59",
+        "attachments": [
+            {
+                "name": "question.pdf",
+                "url": "https://e3p.nycu.edu.tw/pluginfile.php/1/question.pdf",
+            }
+        ],
+    }
+    courses = {"測試課程": {"_course_id": "course-1", "assignments": [assignment]}}
+    calendar = [
+        {
+            "event_id": "calendar-1",
+            "course_id": "course-1",
+            "course_name": "測試課程",
+            "title": "Homework 1",
+            "due_at": "2026-10-06T15:59:00+00:00",
+        }
+    ]
+
+    events = extract_events_from_fetch_all(courses, calendar_events=calendar)
+
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload_json"])
+    assert payload["attachments"][0]["name"] == "question.pdf"
+
+
+def test_unfinished_homework_reminder_includes_only_teacher_attachments():
+    now = datetime(2026, 9, 29, 9, 0, tzinfo=TAIPEI_TZ)
+    row = {
+        "event_uid": "homework-1",
+        "event_type": "homework",
+        "course_id": "course-1",
+        "course_name": "測試課程",
+        "title": "Homework 1",
+        "due_at": (now + timedelta(hours=12)).astimezone(timezone.utc).isoformat(),
+        "payload_json": '{"attachments":[{"name":"question.pdf","url":"https://e3p.nycu.edu.tw/pluginfile.php/1/question.pdf"}],"submitted_files":[{"name":"answer.pdf","url":"https://e3p.nycu.edu.tw/pluginfile.php/1/answer.pdf"}]}',
+    }
+
+    payload = format_countdown_payload(row, 12, "discord:123")
+
+    assert isinstance(payload, dict)
+    assert "question.pdf" in payload["text"]
+    assert "answer.pdf" not in payload["text"]
+    footer = payload["messages"][0]["contents"]["footer"]
+    assert len(footer["contents"]) == 1
+    action = footer["contents"][0]["action"]
+    assert action["uri"].endswith("question.pdf")
+    assert action["xe3_meta"]["direct_download"] is True

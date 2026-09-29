@@ -118,6 +118,35 @@ class MessageCommandButton(discord.ui.Button):
         await self.callbacks.run_command(interaction, self.user_id, self.command_text)
 
 
+class UriActionButton(discord.ui.Button):
+    def __init__(
+        self,
+        callbacks: DiscordViewCallbacks,
+        user_id: int,
+        action: dict[str, str],
+        description: str,
+        label: str,
+    ):
+        super().__init__(label=label[:80], style=discord.ButtonStyle.secondary)
+        self.callbacks = callbacks
+        self.user_id = user_id
+        self.action = action
+        self.description = description
+        self.selected_label = label
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這個檔案按鈕不是你的操作介面。", ephemeral=True)
+            return
+        await self.callbacks.run_uri_action(
+            interaction,
+            self.user_id,
+            self.action,
+            self.description,
+            self.selected_label,
+        )
+
+
 class CommandButtonView(discord.ui.View):
     def __init__(self, callbacks: DiscordViewCallbacks, user_id: int, actions: list[dict[str, str]], timeout: float = 600):
         super().__init__(timeout=timeout)

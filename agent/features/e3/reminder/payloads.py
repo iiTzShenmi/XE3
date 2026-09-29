@@ -7,6 +7,7 @@ from typing import Any
 
 from agent.features.weather.data.city_data import CITY_COORDINATES
 from agent.features.weather.services.weather_api import get_weather
+from agent.features.e3.views.payloads import attach_message_meta, line_response
 
 DEFAULT_LOOKAHEAD_HOURS = 36
 DEFAULT_SCHEDULE = ["09:00", "21:00"]
@@ -104,6 +105,120 @@ def count_event_types(rows: list[Any]) -> dict[str, int]:
     return counts
 
 
+def _event_payload(row: Any) -> dict[str, Any]:
+    raw = row_value(row, "payload_json", "")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw or ""))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _teacher_attachments(rows: list[Any]) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for row in rows:
+        if str(row_value(row, "event_type", "")).strip() != "homework":
+            continue
+        payload = _event_payload(row)
+        course_name = course_name_for_display(row_value(row, "course_name") or row_value(row, "course_id") or "-")
+        homework_title = str(row_value(row, "title", "作業") or "作業").strip()
+        for item in payload.get("attachments") or []:
+            if not isinstance(item, dict):
+                continue
+            source_url = str(item.get("url") or "").strip()
+            if not source_url or source_url in seen_urls:
+                continue
+            seen_urls.add(source_url)
+            entries.append(
+                {
+                    "name": str(item.get("name") or "作業附件").strip(),
+                    "url": source_url,
+                    "course_name": course_name,
+                    "homework_title": homework_title,
+                }
+            )
+    return entries
+
+
+def _attachment_names_line(row: Any) -> str | None:
+    names = [entry["name"] for entry in _teacher_attachments([row])]
+    if not names:
+        return None
+    preview = "、".join(names[:3])
+    if len(names) > 3:
+        preview += f"，另有 {len(names) - 3} 個"
+    return f"📎 老師附件：{preview}"
+
+
+def _with_attachment_buttons(text: str, rows: list[Any], user_key: str | None) -> Any:
+    if not is_discord_target(user_key):
+        return text
+    attachments = _teacher_attachments(rows)
+    if not attachments:
+        return text
+
+    lines = str(text or "").splitlines()
+    title = (lines[0] if lines else "⏰ XE3 提醒").replace("**", "").strip()
+    body = "\n".join(lines[1:]).strip() or "有一項作業需要留意。"
+    buttons = []
+    for attachment in attachments[:5]:
+        filename = attachment["name"]
+        buttons.append(
+            {
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {
+                    "type": "uri",
+                    "label": f"📎 {filename}"[:80],
+                    "uri": attachment["url"],
+                    "xe3_meta": {
+                        "selector_kind": "file",
+                        "entry_kind": "file",
+                        "file_role_label": "老師附件",
+                        "item_title": filename,
+                        "course_name": attachment["course_name"],
+                        "option_label": f"📎 老師附件｜{filename}",
+                        "option_description": f"{attachment['homework_title']}｜老師附件",
+                        "direct_download": True,
+                        "reminder_attachment": True,
+                    },
+                },
+            }
+        )
+
+    bubble = {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#D97706",
+            "paddingAll": "12px",
+            "contents": [{"type": "text", "text": title, "color": "#FFFFFF", "weight": "bold", "wrap": True}],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [{"type": "text", "text": body, "wrap": True, "size": "sm"}],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": buttons,
+        },
+    }
+    message = attach_message_meta(
+        {"type": "flex", "altText": title, "contents": bubble},
+        reminder_attachment=True,
+    )
+    return line_response(text, messages=[message], meta={"reminder_attachment": True})
+
+
 def briefing_weather_line() -> str | None:
     coordinates = CITY_COORDINATES.get(DEFAULT_BRIEFING_COORD_KEY)
     if not coordinates:
@@ -176,6 +291,9 @@ def format_digest(rows: list[Any], slot_text: str, user_key: str | None = None) 
             lines.append(f"{label} **{course_name}**")
             lines.append(f"• {row_value(row, 'title', '-')}")
             lines.append(f"• 截止：{due_label}")
+            attachment_line = _attachment_names_line(row)
+            if attachment_line:
+                lines.append(f"• {attachment_line}")
         else:
             lines.append(f"{idx}. {due_label} {label} {course_name}")
             lines.append(f"   {row_value(row, 'title', '-')}")
@@ -185,10 +303,11 @@ def format_digest(rows: list[Any], slot_text: str, user_key: str | None = None) 
     return "\n".join(lines)
 
 
-def build_digest_payload(rows: list[Any], slot_text: str, user_key: str | None = None) -> str | None:
+def build_digest_payload(rows: list[Any], slot_text: str, user_key: str | None = None) -> Any:
     if not rows:
         return None
-    return format_digest(rows, slot_text, user_key=user_key)
+    text = format_digest(rows, slot_text, user_key=user_key)
+    return _with_attachment_buttons(text, rows, user_key)
 
 
 def build_empty_digest_payload(slot_text: str, user_key: str | None = None) -> str:
@@ -209,17 +328,21 @@ def build_empty_digest_payload(slot_text: str, user_key: str | None = None) -> s
     return "⏰ E3 提醒 21:00\n未來 36 小時內沒有新的截止事件，今晚可以安心休息。"
 
 
-def format_countdown_payload(row: Any, hours_left: int, user_key: str | None = None) -> str:
+def format_countdown_payload(row: Any, hours_left: int, user_key: str | None = None) -> Any:
     course_name = course_name_for_display(row_value(row, "course_name") or row_value(row, "course_id") or "-")
     label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(row_value(row, "event_type"), "📌")
     due_label = discord_due_label(row_value(row, "due_at"), user_key)
     if is_discord_target(user_key):
-        return (
+        attachment_line = _attachment_names_line(row)
+        text = (
             f"⚠️ **截止倒數：還剩 {hours_left} 小時**\n"
             f"{label} **{course_name}**\n"
             f"• {row_value(row, 'title', '-')}\n"
             f"• 截止：{due_label}"
         )
+        if attachment_line:
+            text += f"\n• {attachment_line}"
+        return _with_attachment_buttons(text, [row], user_key)
     return f"⏰ E3 倒數提醒（{hours_left} 小時）\n{due_label} {label} {course_name}\n{row_value(row, 'title', '-')}"
 
 
