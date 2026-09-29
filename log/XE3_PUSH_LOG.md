@@ -433,3 +433,20 @@
   - 全專案 `27 passed`，`py_compile` 與 `git diff --check` 通過
   - 本機 file proxy 與公開 Cloudflare HTTPS 均實際下載成功：HTTP 200、`application/pdf`
   - `discord-bot.service` 與 `xe3-web.service` 均重啟成功
+
+### 33. 提醒排程可靠性修復
+- 確認 reminder worker 持續運作，09:00／21:00 摘要與既有 12／2 小時倒數紀錄皆有成功送達
+- 修正 E3 無時區日期的核心問題：
+  - 無時區截止時間一律先視為 Asia/Taipei，再轉成 UTC 儲存
+  - 避免課綱考試的倒數查詢因 8 小時偏移而錯過
+- 排程摘要與倒數加入 30 分鐘 catch-up window：
+  - bot 重啟、Discord 暫時斷線或同步較慢時，不再因錯過單一分鐘而永久漏發
+  - 原有成功通知 dedupe 仍會避免重複私訊
+- 摘要與倒數送出前會檢查資料新鮮度；即使 cache 原本為空，也會先同步再決定是否發送空摘要
+- 修正真實事件 DM 首次失敗後，重試錯誤改送「沒有事件」的問題；現在只以成功送達作為 dedupe 依據
+- 新增 reminder regression tests，涵蓋延遲補送、空 cache 更新、失敗重試及 Taipei→UTC 時區正規化
+- 驗證：
+  - 全專案 `31 passed`，`py_compile` 與 `git diff --check` 通過
+  - 5 / 5 個已儲存帳號以不發通知模式刷新成功，0 endpoint failure、0 validation warning
+  - 資料庫 112 / 112 個 active event 均已改為 timezone-aware timestamp
+  - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker heartbeat 正常

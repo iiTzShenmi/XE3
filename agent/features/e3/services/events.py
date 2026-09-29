@@ -2,7 +2,7 @@ import hashlib
 import html
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from ..utils.common import normalize_title_token
 
@@ -26,6 +26,15 @@ ENGLISH_EXAM_PATTERNS = [
     r"\bmidterm exam\b",
     r"\bmid-term exam\b",
 ]
+TAIPEI_TZ = timezone(timedelta(hours=8))
+
+
+def _normalize_due_dt(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=TAIPEI_TZ)
+    return value.astimezone(timezone.utc)
 
 
 def _event_payload_source(event):
@@ -230,7 +239,7 @@ def _syllabus_exam_events(course_id, course_name, timetable_payload):
         class_date = row.get("class_date") or row.get("date")
         if not _contains_exam_keyword(topic):
             continue
-        due_dt = _infer_exam_date_from_topic(topic, class_date)
+        due_dt = _normalize_due_dt(_infer_exam_date_from_topic(topic, class_date))
         if not due_dt:
             continue
         title = f"課綱考試｜{topic}"
@@ -361,7 +370,7 @@ def extract_events_from_fetch_all(data, calendar_events=None):
                         or item.get("deadline")
                         or item.get("截止")
                     )
-                    due_dt = _parse_dt(due_raw)
+                    due_dt = _normalize_due_dt(_parse_dt(due_raw))
                     if not due_dt:
                         continue
                     event_uid = _make_event_uid("assignment", course_id, title, due_dt.isoformat())
@@ -387,7 +396,7 @@ def extract_events_from_fetch_all(data, calendar_events=None):
 
             title = str(item.get("title") or "").strip()
             due_raw = item.get("due_at")
-            due_dt = _parse_dt(due_raw)
+            due_dt = _normalize_due_dt(_parse_dt(due_raw))
             if not title or not due_dt:
                 continue
 

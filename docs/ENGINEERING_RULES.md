@@ -97,6 +97,13 @@ It exists so we can re-review against the same baseline later instead of relying
 - Use bounded spawn processes for cross-account concurrency and a cross-process per-user file lock to prevent duplicate syncs for the same account.
 - Keep the default worker count conservative (`2`) to avoid overloading E3 even when the host has more CPU capacity.
 
+## 7.2 Reminder Reliability
+- Store event deadlines as timezone-aware UTC timestamps. Treat timezone-less E3 dates as `Asia/Taipei` before converting them to UTC.
+- Scheduled and countdown reminders must use a bounded catch-up window rather than requiring one exact worker tick.
+- Deduplicate delivery only after a successful push. A failed attempt must remain retryable with the original event payload.
+- Refresh stale account data before sending any due digest or countdown. Never send an empty digest solely because a stale cache contains no events.
+- Keep reminder tests side-effect free: inject a fake push function and never send live DMs during automated verification.
+
 ## 8. Review Checklist For Future Changes
 Before considering a refactor complete, verify:
 - metadata-driven selectors still work

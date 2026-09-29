@@ -51,6 +51,7 @@ _STARTED = False
 _LOCK = threading.Lock()
 _WORKER_LOCK_HANDLE: Optional[Any] = None
 PRE_REMINDER_SYNC_MINUTES = 10
+REMINDER_CATCHUP_MINUTES = 30
 TRANSIENT_SYNC_ERROR_MARKERS = (
     "temporary failure in name resolution",
     "nameresolutionerror",
@@ -207,6 +208,44 @@ def _recently_synced(row: Any, now, minutes: int = PRE_REMINDER_SYNC_MINUTES) ->
         synced_at = synced_at.astimezone(timezone.utc)
     current = now.astimezone(timezone.utc)
     return (current - synced_at) <= timedelta(minutes=minutes)
+
+
+def _due_schedule_slot(now: datetime, schedule: list[str]) -> tuple[datetime, str] | None:
+    catchup = timedelta(minutes=REMINDER_CATCHUP_MINUTES)
+    candidates: list[tuple[datetime, str]] = []
+    for raw_slot in schedule:
+        try:
+            hour_text, minute_text = str(raw_slot).strip().split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate > now:
+            candidate -= timedelta(days=1)
+        if timedelta(0) <= now - candidate <= catchup:
+            candidates.append((candidate, f"{hour:02d}:{minute:02d}"))
+    return max(candidates, key=lambda item: item[0]) if candidates else None
+
+
+def _load_countdown_windows(user_id: int, now: datetime, tolerance_seconds: int) -> dict[int, list[Any]]:
+    catchup = timedelta(minutes=REMINDER_CATCHUP_MINUTES)
+    windows: dict[int, list[Any]] = {}
+    for hours_left in COUNTDOWN_HOURS:
+        window_start = (now + timedelta(hours=hours_left) - catchup).astimezone(timezone.utc)
+        window_end = (now + timedelta(hours=hours_left, seconds=tolerance_seconds)).astimezone(timezone.utc)
+        windows[hours_left] = list(
+            get_events_due_between(
+                user_id,
+                window_start.isoformat(),
+                window_end.isoformat(),
+                limit=10,
+            )
+        )
+    return windows
 
 
 def sync_grade_items(user_id: int, courses: dict[str, Any]) -> list[dict[str, Any]]:
@@ -413,7 +452,6 @@ def refresh_all_saved_accounts(logger) -> dict[str, Any]:
 
 def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
     now = taipei_now()
-    current_slot = now.strftime("%H:%M")
     start_iso = now.astimezone(timezone.utc).isoformat()
     end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
     interval_seconds = e3_reminder_poll_seconds()
@@ -428,29 +466,18 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         if not _login_status_allows_cached_reminders(row):
             continue
 
-        countdown_windows: dict[int, list[Any]] = {}
-        for hours_left in COUNTDOWN_HOURS:
-            window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)
-            window_end = (now + timedelta(hours=hours_left, seconds=tolerance)).astimezone(timezone.utc)
-            countdown_windows[hours_left] = list(
-                get_events_due_between(
-                    row["user_id"],
-                    window_start.isoformat(),
-                    window_end.isoformat(),
-                    limit=10,
-                )
-            )
-
         schedule = load_schedule(row)
-        digest_key = f"{now.date().isoformat()} {current_slot}"
-        digest_enabled = current_slot in schedule and not notification_sent(row["user_id"], "scheduled_digest", digest_key)
+        due_slot = _due_schedule_slot(now, schedule)
+        slot_time, slot_text = due_slot if due_slot else (None, "")
+        digest_key = f"{slot_time.date().isoformat()} {slot_text}" if slot_time else ""
+        digest_enabled = bool(due_slot) and not _scheduled_digest_succeeded(row["user_id"], digest_key)
+        countdown_windows = _load_countdown_windows(row["user_id"], now, tolerance)
         digest_events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8)) if digest_enabled else []
 
-        needs_homework_guard = _has_homework_events(digest_events) or any(
-            _has_homework_events(rows) for rows in countdown_windows.values()
-        )
+        has_countdown_candidates = any(countdown_windows.values())
+        needs_fresh_snapshot = digest_enabled or has_countdown_candidates
         completion_lookup: dict[tuple[str, str], bool] = {}
-        if needs_homework_guard:
+        if needs_fresh_snapshot:
             if not _recently_synced(row, now):
                 _, sync_ok = sync_user_snapshot(row, logger, persist_failure=False)
                 log_notification(
@@ -460,26 +487,19 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
                     details=now.strftime("%Y-%m-%d %H:%M"),
                 )
                 if sync_ok:
-                    countdown_windows = {}
-                    for hours_left in COUNTDOWN_HOURS:
-                        window_start = (now + timedelta(hours=hours_left)).astimezone(timezone.utc)
-                        window_end = (now + timedelta(hours=hours_left, seconds=tolerance)).astimezone(timezone.utc)
-                        countdown_windows[hours_left] = list(
-                            get_events_due_between(
-                                row["user_id"],
-                                window_start.isoformat(),
-                                window_end.isoformat(),
-                                limit=10,
-                            )
-                        )
+                    countdown_windows = _load_countdown_windows(row["user_id"], now, tolerance)
                     if digest_enabled:
                         digest_events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8))
-            completion_lookup = _build_assignment_completion_lookup(str(row["line_user_id"]), logger)
-            countdown_windows = {
-                hours_left: _filter_actionable_events(rows, completion_lookup)
-                for hours_left, rows in countdown_windows.items()
-            }
-            digest_events = _filter_actionable_events(digest_events, completion_lookup)
+            needs_homework_guard = _has_homework_events(digest_events) or any(
+                _has_homework_events(rows) for rows in countdown_windows.values()
+            )
+            if needs_homework_guard:
+                completion_lookup = _build_assignment_completion_lookup(str(row["line_user_id"]), logger)
+                countdown_windows = {
+                    hours_left: _filter_actionable_events(rows, completion_lookup)
+                    for hours_left, rows in countdown_windows.items()
+                }
+                digest_events = _filter_actionable_events(digest_events, completion_lookup)
 
         for hours_left in COUNTDOWN_HOURS:
             countdown_rows = countdown_windows.get(hours_left) or []
@@ -496,16 +516,16 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
                     event_uid=event_row["event_uid"],
                 )
 
-        if current_slot not in schedule:
+        if not due_slot:
             continue
 
-        dedupe_key = f"{now.date().isoformat()} {current_slot}"
+        dedupe_key = digest_key
         if _scheduled_digest_succeeded(row["user_id"], dedupe_key):
             continue
 
         events = digest_events
         if not events:
-            payload = build_empty_digest_payload(current_slot, row["line_user_id"])
+            payload = build_empty_digest_payload(slot_text, row["line_user_id"])
             ok = push_fn(row["line_user_id"], payload)
             log_notification(
                 row["user_id"],
@@ -514,10 +534,10 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
                 details=f"{dedupe_key}|empty",
             )
             if not ok:
-                logger.error("e3_reminder_push_failed user=%s slot=%s empty_digest=1", row["line_user_id"], current_slot)
+                logger.error("e3_reminder_push_failed user=%s slot=%s empty_digest=1", row["line_user_id"], slot_text)
             continue
 
-        payload = build_digest_payload(events, current_slot, row["line_user_id"])
+        payload = build_digest_payload(events, slot_text, row["line_user_id"])
         ok = push_fn(row["line_user_id"], payload)
         log_notification(
             row["user_id"],
@@ -526,7 +546,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
             details=dedupe_key,
         )
         if not ok:
-            logger.error("e3_reminder_push_failed user=%s slot=%s", row["line_user_id"], current_slot)
+            logger.error("e3_reminder_push_failed user=%s slot=%s", row["line_user_id"], slot_text)
 
 
 def worker_loop(push_fn: Callable[[str, Any], bool], logger, interval_seconds: int, target_predicate=None) -> None:
