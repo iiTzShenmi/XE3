@@ -11,11 +11,20 @@ from agent.features.e3.services import upload
 
 
 class FakeResponse:
-    def __init__(self, payload=None, *, text="", url="https://e3p.nycu.edu.tw/repository/repository_ajax.php"):
+    def __init__(
+        self,
+        payload=None,
+        *,
+        text="",
+        url="https://e3p.nycu.edu.tw/repository/repository_ajax.php",
+        status_code=200,
+        headers=None,
+    ):
         self._payload = payload
         self.text = text
         self.url = url
-        self.status_code = 200
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def json(self):
         if isinstance(self._payload, Exception):
@@ -63,6 +72,30 @@ def _context():
     }
 
 
+def _edit_form_html():
+    return """
+    <html><body>
+      <form method="post" action="https://e3p.nycu.edu.tw/mod/assign/view.php">
+        <input type="hidden" name="lastmodified" value="1777255350">
+        <input type="hidden" name="id" value="230655">
+        <input type="hidden" name="userid" value="48616">
+        <input type="hidden" name="action" value="savesubmission">
+        <input type="hidden" name="sesskey" value="secret">
+        <input type="hidden" name="_qf__mod_assign_submission_form" value="1">
+        <input type="hidden" name="mform_isexpanded_id_submissionheader" value="1">
+        <input type="hidden" name="files_filemanager" value="123">
+        <input type="submit" name="submitbutton" value="儲存更改">
+        <input type="submit" name="cancel" value="取消">
+      </form>
+      <script>
+        M.cfg = {"courseId":"27444","contextInstanceId":"230655","sesskey":"secret","userId":"48616","contextid":"456"};
+        var options = {"client_id":"client","ctx_id":456,"maxbytes":1073741824,"areamaxbytes":-1,
+          "repositories":[{"type":"upload","id":5}]};
+      </script>
+    </body></html>
+    """
+
+
 def test_sanitize_upload_filename_removes_path_controls_and_preserves_suffix():
     name = upload.sanitize_upload_filename("../bad\\name\x00\n" + "測" * 100 + ".xlsx")
 
@@ -104,6 +137,86 @@ def test_request_maps_timeout_to_user_facing_error():
     assert caught.value.status == "request_timeout"
 
 
+def test_edit_form_parser_uses_filemanager_parent_and_excludes_cancel():
+    context = upload._parse_edit_context(_edit_form_html(), "27444", "230655")
+
+    assert context["files_filemanager"] == "123"
+    assert context["lastmodified"] == "1777255350"
+    assert context["client_id"] == "client"
+    assert context["ctx_id"] == "456"
+    assert context["repo_id"] == "5"
+    assert "cancel" not in context
+    assert "submitbutton" not in context
+
+
+def test_edit_form_parser_rejects_missing_submission_form():
+    with pytest.raises(upload.E3UploadError) as caught:
+        upload._parse_edit_context("<html><body>not an edit page</body></html>", "27444", "230655")
+
+    assert caught.value.status == "missing_submission_form"
+
+
+def test_assignment_response_rejects_enrol_redirect():
+    response = FakeResponse(url="https://e3p.nycu.edu.tw/enrol/index.php?id=27444")
+
+    with pytest.raises(upload.E3UploadError) as caught:
+        upload._validate_assignment_response(response, _target(), stage="讀取提交表單")
+
+    assert caught.value.status == "enrol_redirect"
+
+
+def test_draft_list_returns_uploaded_filenames_and_sets_expected_fields():
+    session = FakeSession(FakeResponse({"itemid": 123, "list": [{"filename": "report%20file.pdf"}], "filecount": 1}))
+
+    filenames = upload._list_draft_filenames(session, "https://example.invalid/edit", _context())
+
+    assert filenames == ("report file.pdf",)
+    assert session.kwargs["data"] == {
+        "sesskey": "secret",
+        "client_id": "client",
+        "filepath": "/",
+        "itemid": "123",
+    }
+
+
+def test_save_submission_excludes_cancel_and_follows_expected_redirect():
+    class SaveSession:
+        def __init__(self):
+            self.saved_data = None
+
+        def post(self, _url, **kwargs):
+            self.saved_data = kwargs["data"]
+            assert kwargs["allow_redirects"] is False
+            return FakeResponse(
+                status_code=303,
+                url=upload.E3_ASSIGN_VIEW_URL,
+                headers={"Location": "/mod/assign/view.php?id=230655&action=view"},
+            )
+
+        def get(self, url, **_kwargs):
+            return FakeResponse(
+                text="<html><body>已提交 report.pdf</body></html>",
+                url=url,
+            )
+
+    session = SaveSession()
+    context = {**_context(), "id": "230655", "userid": "48616", "lastmodified": "1", "cancel": "取消"}
+
+    html = upload._save_assignment_submission(
+        session,
+        "https://e3p.nycu.edu.tw/mod/assign/view.php?id=230655&action=editsubmission",
+        context,
+        _target(),
+        operation_id="test-operation",
+    )
+
+    assert "已提交" in html
+    assert session.saved_data["action"] == "savesubmission"
+    assert session.saved_data["submitbutton"] == "儲存更改"
+    assert "cancel" not in session.saved_data
+    assert session.saved_data["files_filemanager"] == "123"
+
+
 def test_replace_existing_never_deletes_submission(monkeypatch):
     monkeypatch.setattr(upload, "resolve_assignment_target", lambda *_args, **_kwargs: _target(submitted_count=1))
     monkeypatch.setattr(upload, "_authenticated_session", lambda *_args, **_kwargs: object())
@@ -121,18 +234,18 @@ def test_replace_existing_never_deletes_submission(monkeypatch):
 
 
 def test_saved_draft_is_not_reported_as_submitted(monkeypatch):
-    pages = iter(
-        [
-            "<html><body>尚未提交</body></html>",
-            '<html><body>draft.pdf<form><input name="action" value="submitforgrading"></form></body></html>',
-        ]
-    )
     monkeypatch.setattr(upload, "resolve_assignment_target", lambda *_args, **_kwargs: _target())
     monkeypatch.setattr(upload, "_authenticated_session", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: next(pages))
+    monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: "<html><body>尚未提交</body></html>")
     monkeypatch.setattr(upload, "_fetch_edit_context", lambda *_args, **_kwargs: ("https://example.invalid/edit", _context()))
+    draft_lists = iter([(), ("draft.pdf",)])
+    monkeypatch.setattr(upload, "_list_draft_filenames", lambda *_args, **_kwargs: next(draft_lists))
     monkeypatch.setattr(upload, "_upload_to_draft", lambda *_args, **_kwargs: "draft.pdf")
-    monkeypatch.setattr(upload, "_save_assignment_submission", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        upload,
+        "_save_assignment_submission",
+        lambda *_args, **_kwargs: '<html><body>draft.pdf<form><input name="action" value="submitforgrading"></form></body></html>',
+    )
 
     with pytest.raises(upload.E3UploadError) as caught:
         upload.upload_assignment_submission("discord:1", "27444", "27444:230655", "draft.pdf", b"draft")
@@ -161,31 +274,28 @@ def test_preflight_never_uploads_or_saves(monkeypatch):
 
 
 def test_multiple_files_share_one_draft_and_save_once(monkeypatch):
-    pages = iter(
-        [
-            "<html><body>尚未提交</body></html>",
-            """
-            <html><body>
-              <table><tr><td>繳交狀態</td><td>已提交</td></tr></table>
-              <a href="assignsubmission_file/report.pdf">report.pdf</a>
-              <a href="assignsubmission_file/data.csv">data.csv</a>
-            </body></html>
-            """,
-        ]
-    )
+    final_html = """
+        <html><body>
+          <table><tr><td>繳交狀態</td><td>已提交</td></tr></table>
+          <a href="assignsubmission_file/report.pdf">report.pdf</a>
+          <a href="assignsubmission_file/data.csv">data.csv</a>
+        </body></html>
+    """
     uploaded: list[tuple[str, str]] = []
     saved: list[str] = []
     monkeypatch.setattr(upload, "resolve_assignment_target", lambda *_args, **_kwargs: _target())
     monkeypatch.setattr(upload, "_authenticated_session", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: next(pages))
+    monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: "<html><body>尚未提交</body></html>")
     monkeypatch.setattr(upload, "_fetch_edit_context", lambda *_args, **_kwargs: ("https://example.invalid/edit", _context()))
+    draft_lists = iter([(), ("report.pdf", "data.csv")])
+    monkeypatch.setattr(upload, "_list_draft_filenames", lambda *_args, **_kwargs: next(draft_lists))
 
     def fake_upload(_session, _edit_url, context, filename, _content, _content_type):
         uploaded.append((context["files_filemanager"], filename))
         return filename
 
     monkeypatch.setattr(upload, "_upload_to_draft", fake_upload)
-    monkeypatch.setattr(upload, "_save_assignment_submission", lambda *_args, **_kwargs: saved.append("saved") or "")
+    monkeypatch.setattr(upload, "_save_assignment_submission", lambda *_args, **_kwargs: saved.append("saved") or final_html)
 
     result = upload.upload_assignment_files(
         "discord:1",
@@ -208,6 +318,7 @@ def test_multiple_files_do_not_save_after_partial_draft_failure(monkeypatch):
     monkeypatch.setattr(upload, "_authenticated_session", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(upload, "_fetch_assignment_view", lambda *_args, **_kwargs: "<html><body>尚未提交</body></html>")
     monkeypatch.setattr(upload, "_fetch_edit_context", lambda *_args, **_kwargs: ("https://example.invalid/edit", _context()))
+    monkeypatch.setattr(upload, "_list_draft_filenames", lambda *_args, **_kwargs: ())
     calls = 0
 
     def fake_upload(*_args, **_kwargs):

@@ -480,3 +480,19 @@
   - 全專案 `39 passed`
   - `py_compile` 與 `git diff --check` 通過
   - `discord-bot.service` 重啟後 Gateway、4 個 Slash command 與 reminder worker 均正常
+
+### 36. 修正 Moodle 作業提交取消問題
+- 找到真實失敗根因：舊表單 parser 同時送出 `submitbutton=儲存更改` 與 `cancel=取消`，Moodle 因此取消提交
+- submission form 改由 `files_filemanager` 定位 parent form，不再找不到時退回解析整張頁面
+- 表單序列化改為瀏覽器 successful-controls 規則：排除 cancel、未點擊 submit、file、disabled 與未勾選欄位
+- 移除自製 `client_id` fallback；所有 itemid、client_id、context、sesskey 與表單欄位都必須由當次 edit page 動態取得
+- 上傳前後呼叫 `draftfiles_ajax.php?action=list`，提交前逐一確認所有檔名已存在同一 draft item
+- `savesubmission` 改為明確驗證 302/303、Location、同站 assignment destination，再以同一 session 讀取結果
+- login、enrol、外站與錯誤 assignment redirect 現在會回傳明確錯誤，不再被 HTTP 200 掩蓋
+- 驗證：
+  - upload regression tests `17 passed`
+  - 全專案 `44 passed`
+  - 真實 `25028:238715` (`Week3_HW`) 以 2 個文字檔測試成功
+  - E3 最終頁顯示已提交、2 個檔案，兩個預期檔名均可見
+  - `py_compile` 與 `git diff --check` 通過
+  - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker 均正常

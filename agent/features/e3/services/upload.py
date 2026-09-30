@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from uuid import uuid4
 
 import requests
@@ -40,6 +40,7 @@ from .client import fetch_courses, get_runtime_root, make_user_key
 
 E3_ASSIGN_VIEW_URL = f"{config.E3_BASE_URL}/mod/assign/view.php"
 E3_REPOSITORY_AJAX_URL = f"{config.E3_BASE_URL}/repository/repository_ajax.php?action=upload"
+E3_DRAFTFILES_LIST_URL = f"{config.E3_BASE_URL}/repository/draftfiles_ajax.php?action=list"
 DEFAULT_UPLOAD_REPO_ID = "5"
 DEFAULT_MAX_BYTES = "1073741824"
 DEFAULT_AREA_MAX_BYTES = "-1"
@@ -241,6 +242,38 @@ def _needs_login(response: requests.Response) -> bool:
     return "login" in url or "登入本網站" in text or 'id="loginbtn"' in text
 
 
+def _validate_assignment_response(
+    response: requests.Response,
+    target: AssignmentTarget,
+    *,
+    stage: str,
+    expected_action: str | None = None,
+) -> None:
+    if _needs_login(response):
+        raise E3UploadError(f"E3 在「{stage}」階段要求重新登入，請先 `/e3 relogin`。", status="session_expired")
+
+    parsed = urlparse(str(response.url or ""))
+    if parsed.path.endswith("/enrol/index.php"):
+        raise E3UploadError(
+            f"E3 在「{stage}」階段轉到選課頁，這份作業目前無法存取。",
+            status="enrol_redirect",
+        )
+    if not parsed.path.endswith("/mod/assign/view.php"):
+        raise E3UploadError(f"E3 在「{stage}」階段轉到非預期頁面，已取消。", status="unexpected_redirect")
+
+    query = parse_qs(parsed.query)
+    response_cmid = str((query.get("id") or [""])[0]).strip()
+    if response_cmid and response_cmid != target.cmid:
+        raise E3UploadError(f"E3 在「{stage}」階段轉到其他作業，已取消。", status="page_mismatch")
+    if expected_action:
+        action = str((query.get("action") or [""])[0]).strip()
+        if action != expected_action:
+            raise E3UploadError(
+                f"E3 在「{stage}」階段沒有進入 `{expected_action}` 頁面，已取消。",
+                status="unexpected_redirect",
+            )
+
+
 def _assignment_cmid(url: str | None) -> str:
     parsed = urlparse(str(url or ""))
     values = parse_qs(parsed.query).get("id") or []
@@ -406,24 +439,36 @@ def _input_value(soup: BeautifulSoup, name: str, default: str = "") -> str:
     return str(node.get("value") or default)
 
 
-def _submit_form_fields(soup: BeautifulSoup) -> dict[str, str]:
-    form = None
-    for candidate in soup.find_all("form"):
-        action_input = candidate.find("input", attrs={"name": "action"})
-        if action_input and str(action_input.get("value") or "") == "savesubmission":
-            form = candidate
-            break
+def _submission_form(soup: BeautifulSoup):
+    filemanager = soup.find("input", attrs={"name": "files_filemanager"})
+    form = filemanager.find_parent("form") if filemanager else None
     if form is None:
-        form = soup
+        raise E3UploadError("E3 編輯頁找不到作業提交表單，已取消上傳。", status="missing_submission_form")
+    action_input = form.find("input", attrs={"name": "action"})
+    if not action_input or str(action_input.get("value") or "") != "savesubmission":
+        raise E3UploadError("E3 編輯頁的提交動作不是 savesubmission，已取消上傳。", status="invalid_submission_form")
+    return form
+
+
+def _submit_form_fields(soup: BeautifulSoup) -> dict[str, str]:
+    form = _submission_form(soup)
 
     fields: dict[str, str] = {}
     for node in form.find_all(["input", "textarea", "select"]):
         name = str(node.get("name") or "").strip()
-        if not name:
+        if not name or node.has_attr("disabled"):
             continue
         if node.name == "select":
             selected = node.find("option", selected=True) or node.find("option")
             fields[name] = str(selected.get("value") or "") if selected else ""
+            continue
+        if node.name == "textarea":
+            fields[name] = node.get_text()
+            continue
+        input_type = str(node.get("type") or "text").casefold()
+        if input_type in {"submit", "button", "reset", "file", "image"}:
+            continue
+        if input_type in {"checkbox", "radio"} and not node.has_attr("checked"):
             continue
         fields[name] = str(node.get("value") or "")
     return fields
@@ -477,13 +522,11 @@ def _parse_edit_context(html: str, expected_course_id: str, expected_cmid: str) 
     if page_cmid and page_cmid != str(expected_cmid):
         raise E3UploadError("E3 編輯頁作業和你選的作業不一致，已取消上傳。", status="page_mismatch")
 
-    itemid = fields.get("files_filemanager") or _extract_number_value(html, "itemid")
+    itemid = fields.get("files_filemanager") or ""
     sesskey = fields.get("sesskey") or str(m_cfg.get("sesskey") or "")
     userid = fields.get("userid") or str(m_cfg.get("userId") or "")
     ctx_id = _extract_number_value(html, "ctx_id") or str(m_cfg.get("contextid") or "")
     client_id = _extract_quoted_value(html, "client_id")
-    if not client_id:
-        client_id = f"xe3{itemid}"
 
     required = {
         "itemid": itemid,
@@ -492,6 +535,8 @@ def _parse_edit_context(html: str, expected_course_id: str, expected_cmid: str) 
         "ctx_id": ctx_id,
         "lastmodified": fields.get("lastmodified") or "",
         "id": fields.get("id") or expected_cmid,
+        "client_id": client_id,
+        "_qf__mod_assign_submission_form": fields.get("_qf__mod_assign_submission_form") or "",
     }
     missing = [key for key, value in required.items() if not str(value or "").strip()]
     if missing:
@@ -627,8 +672,7 @@ def _fetch_assignment_view(session: requests.Session, target: AssignmentTarget) 
         allow_redirects=True,
     )
     _raise_for_status(response, stage="讀取作業狀態", status_prefix="fetch_assignment")
-    if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
+    _validate_assignment_response(response, target, stage="讀取作業狀態")
     return response.text or ""
 
 
@@ -646,8 +690,7 @@ def _fetch_edit_context(session: requests.Session, target: AssignmentTarget) -> 
     if response.status_code in {403, 404}:
         _raise_edit_permission_error(response, target)
     _raise_for_status(response, stage="讀取提交表單", status_prefix="fetch_edit_form")
-    if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
+    _validate_assignment_response(response, target, stage="讀取提交表單", expected_action="editsubmission")
     html = response.text or ""
     return edit_url, _parse_edit_context(html, target.course_id, target.cmid)
 
@@ -732,7 +775,56 @@ def _upload_to_draft(
     return sanitize_upload_filename(payload.get("file") or payload.get("filename") or filename)
 
 
-def _save_assignment_submission(session: requests.Session, edit_url: str, context: dict[str, str]) -> str:
+def _list_draft_filenames(session: requests.Session, edit_url: str, context: dict[str, str]) -> tuple[str, ...]:
+    response = _request(
+        session,
+        "post",
+        E3_DRAFTFILES_LIST_URL,
+        stage="驗證草稿檔案",
+        status_prefix="list_draft",
+        data={
+            "sesskey": context["sesskey"],
+            "client_id": context["client_id"],
+            "filepath": "/",
+            "itemid": context["files_filemanager"],
+        },
+        headers={"Origin": config.E3_BASE_URL, "Referer": edit_url},
+        allow_redirects=True,
+    )
+    _raise_for_status(response, stage="驗證草稿檔案", status_prefix="list_draft")
+    if _needs_login(response):
+        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
+    try:
+        payload = response.json()
+    except (requests.JSONDecodeError, ValueError) as exc:
+        raise E3UploadError("E3 回傳了無法辨識的草稿清單。", status="invalid_draft_response") from exc
+    if not isinstance(payload, dict):
+        raise E3UploadError("E3 回傳了非預期的草稿清單。", status="invalid_draft_response")
+    error = payload.get("error") or payload.get("errorcode")
+    if error:
+        raise E3UploadError(f"E3 無法列出草稿檔案：{str(error)[:180]}", status="draft_list_rejected")
+    entries = payload.get("list")
+    if not isinstance(entries, list):
+        raise E3UploadError("E3 草稿清單缺少 list 欄位。", status="invalid_draft_response")
+
+    filenames: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        filename = str(entry.get("filename") or entry.get("file") or "").strip()
+        if filename:
+            filenames.append(unquote(filename))
+    return tuple(filenames)
+
+
+def _save_assignment_submission(
+    session: requests.Session,
+    edit_url: str,
+    context: dict[str, str],
+    target: AssignmentTarget,
+    *,
+    operation_id: str,
+) -> str:
     payload = dict(context)
     payload.update(
         {
@@ -742,6 +834,7 @@ def _save_assignment_submission(session: requests.Session, edit_url: str, contex
             "submitbutton": payload.get("submitbutton") or "儲存更改",
         }
     )
+    payload.pop("cancel", None)
     for transient in ("ctx_id", "client_id", "repo_id", "maxbytes", "areamaxbytes"):
         payload.pop(transient, None)
 
@@ -753,12 +846,48 @@ def _save_assignment_submission(session: requests.Session, edit_url: str, contex
         status_prefix="save_submission",
         data=payload,
         headers={"Origin": config.E3_BASE_URL, "Referer": edit_url},
+        allow_redirects=False,
+    )
+    if response.status_code not in {302, 303}:
+        _raise_for_status(response, stage="儲存作業提交", status_prefix="save_submission")
+        soup = BeautifulSoup(response.text or "", "html.parser")
+        errors = [node.get_text(" ", strip=True) for node in soup.select(".error, .alert-danger, [data-region='error-message']")]
+        detail = f"：{errors[0][:180]}" if errors else ""
+        raise E3UploadError(
+            f"E3 沒有接受儲存提交（HTTP {response.status_code}）{detail}。",
+            status="save_rejected",
+        )
+
+    location = str(response.headers.get("Location") or "").strip()
+    if not location:
+        raise E3UploadError("E3 儲存後沒有回傳跳轉位置，無法確認結果。", status="missing_save_redirect")
+    redirect_url = urljoin(E3_ASSIGN_VIEW_URL, location)
+    parsed_redirect = urlparse(redirect_url)
+    if parsed_redirect.netloc != urlparse(config.E3_BASE_URL).netloc:
+        raise E3UploadError("E3 儲存後轉到外部網站，已停止驗證。", status="unexpected_redirect")
+    if parsed_redirect.path.endswith("/login/index.php"):
+        raise E3UploadError("E3 儲存時 session 已過期，請先 `/e3 relogin`。", status="session_expired")
+    if parsed_redirect.path.endswith("/enrol/index.php"):
+        raise E3UploadError("E3 儲存後轉到選課頁，提交沒有完成。", status="enrol_redirect")
+
+    follow_response = _request(
+        session,
+        "get",
+        redirect_url,
+        stage="讀取儲存結果",
+        status_prefix="fetch_save_result",
+        headers={"Referer": edit_url},
         allow_redirects=True,
     )
-    _raise_for_status(response, stage="儲存作業提交", status_prefix="save_submission")
-    if _needs_login(response):
-        raise E3UploadError("E3 session 已過期，請先 `/e3 relogin`。", status="session_expired")
-    return response.text or ""
+    _raise_for_status(follow_response, stage="讀取儲存結果", status_prefix="fetch_save_result")
+    _validate_assignment_response(follow_response, target, stage="讀取儲存結果")
+    LOGGER.info(
+        "e3_upload_stage operation_id=%s stage=save_redirect_verified status=%s destination=%s",
+        operation_id,
+        response.status_code,
+        parsed_redirect.path,
+    )
+    return follow_response.text or ""
 
 
 def _normalize_upload_files(files: list[AssignmentUploadFile] | tuple[AssignmentUploadFile, ...]) -> tuple[AssignmentUploadFile, ...]:
@@ -911,6 +1040,14 @@ def upload_assignment_files(
 
     LOGGER.info("e3_upload_stage operation_id=%s stage=fetch_edit_context", operation_id)
     edit_url, context = _fetch_edit_context(session, target)
+    LOGGER.info("e3_upload_stage operation_id=%s stage=list_initial_draft", operation_id)
+    initial_draft_files = _list_draft_filenames(session, edit_url, context)
+    if initial_draft_files:
+        visible = "、".join(f"`{name}`" for name in initial_draft_files[:5])
+        raise E3UploadError(
+            f"E3 草稿區已有檔案：{visible}。為避免混入舊檔，請先回 E3 清理後再試。",
+            status="draft_not_empty",
+        )
     max_bytes = _positive_limit(context.get("maxbytes"))
     for item in normalized_files:
         if max_bytes and len(item.content) > max_bytes:
@@ -954,10 +1091,30 @@ def upload_assignment_files(
                     status=exc.status,
                 ) from exc
             raise
+    LOGGER.info("e3_upload_stage operation_id=%s stage=verify_draft", operation_id)
+    draft_filenames = _list_draft_filenames(session, edit_url, context)
+    draft_name_keys = {name.casefold() for name in draft_filenames}
+    missing_draft_files = [name for name in uploaded_filenames if name.casefold() not in draft_name_keys]
+    if missing_draft_files:
+        missing = "、".join(f"`{name}`" for name in missing_draft_files)
+        raise E3UploadError(
+            f"E3 repository 接受了上傳，但草稿區找不到：{missing}。尚未儲存提交。",
+            status="draft_verification_failed",
+        )
+    LOGGER.info(
+        "e3_upload_stage operation_id=%s stage=draft_verified file_count=%s",
+        operation_id,
+        len(draft_filenames),
+    )
     LOGGER.info("e3_upload_stage operation_id=%s stage=save_submission", operation_id)
-    _save_assignment_submission(session, edit_url, context)
+    final_html = _save_assignment_submission(
+        session,
+        edit_url,
+        context,
+        target,
+        operation_id=operation_id,
+    )
     LOGGER.info("e3_upload_stage operation_id=%s stage=verify", operation_id)
-    final_html = _fetch_assignment_view(session, target)
 
     if not _has_submitted_status(final_html):
         if all(_page_contains_filename(final_html, name) for name in uploaded_filenames) and _has_final_submit_step(final_html):
