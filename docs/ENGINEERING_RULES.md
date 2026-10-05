@@ -108,6 +108,9 @@ It exists so we can re-review against the same baseline later instead of relying
 - Keep reminder tests side-effect free: inject a fake push function and never send live DMs during automated verification.
 - Homework reminders may expose teacher-provided assignment attachments, but must never include the user's submitted files.
 - Keep authenticated E3 attachment URLs server-side. Discord reminder controls must call the guarded download callback instead of serializing raw E3 URLs into message components.
+- New-homework alerts must be eligible only for assignments discovered after the feature/account baseline, trigger only once when the assignment is actually open, and deduplicate by event UID after successful delivery.
+- Group multiple homework openings from one sync into one notification. Scheduled digests must keep listing every open, unsubmitted, future-due homework, while completed work is filtered after a fresh-enough account sync.
+- Clear new-homework eligibility only after successful delivery or when the assignment is already terminal (submitted, closed, or overdue). Failed delivery must remain retryable and must not block newer candidates.
 
 ## 8. Review Checklist For Future Changes
 Before considering a refactor complete, verify:

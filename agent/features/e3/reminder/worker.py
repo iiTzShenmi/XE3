@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import multiprocessing
 import os
@@ -18,12 +19,17 @@ from ..services.client import fetch_courses, get_runtime_root, login_and_sync, m
 from ..services.upload import process_due_upload_queue
 from ..data.db import (
     get_e3_account_by_user_id,
+    get_active_homework_events,
     get_events_due_between,
     get_grade_items,
+    get_new_homework_candidates,
+    has_cached_e3_events,
+    has_cached_homework_identity,
     get_line_user_id_by_user_id,
     list_reminder_targets,
     list_sync_targets,
     log_notification,
+    mark_new_homework_announced,
     mark_missing_events_inactive,
     notification_sent,
     notification_succeeded,
@@ -41,6 +47,7 @@ from .payloads import (
     extract_grade_items,
     format_countdown_payload,
     format_grade_payload,
+    format_new_homework_payload,
     load_schedule,
     taipei_now,
 )
@@ -198,6 +205,101 @@ def _has_homework_events(rows: list[Any]) -> bool:
     return any(str(_row_value(row, "event_type", "")).strip() == "homework" for row in rows or [])
 
 
+def _homework_payload(row: Any) -> dict[str, Any]:
+    raw = _row_value(row, "payload_json", "")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw or ""))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_homework_time(value: Any) -> datetime | None:
+    parsed = _parse_iso_timestamp(value)
+    if parsed is None:
+        text = str(value or "").strip()
+        for pattern in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%Y/%m/%d", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(text, pattern)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+    return parsed.astimezone(timezone(timedelta(hours=8)))
+
+
+def _is_open_homework_event(row: Any, now: datetime) -> bool:
+    if str(_row_value(row, "event_type", "")).strip() != "homework":
+        return False
+    due_at = _parse_homework_time(_row_value(row, "due_at"))
+    if due_at is None or due_at <= now:
+        return False
+
+    payload = _homework_payload(row)
+    if payload.get("is_completed") is True or payload.get("submitted_files"):
+        return False
+    category = str(payload.get("category") or "").strip().casefold()
+    if category in {"submitted", "overdue", "closed"}:
+        return False
+    if category == "in_progress":
+        return True
+
+    start_at = _parse_homework_time(
+        payload.get("start_time") or payload.get("start") or payload.get("available_from")
+    )
+    return bool(start_at and start_at <= now)
+
+
+def _filter_open_homeworks(rows: list[Any], now: datetime) -> list[Any]:
+    return [row for row in rows if _is_open_homework_event(row, now)]
+
+
+def _is_terminal_homework_event(row: Any) -> bool:
+    payload = _homework_payload(row)
+    if payload.get("is_completed") is True or payload.get("submitted_files"):
+        return True
+    category = str(payload.get("category") or "").strip().casefold()
+    return category in {"submitted", "overdue", "closed"}
+
+
+def _merge_event_rows(*groups: list[Any], limit: int = 20) -> list[Any]:
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for rows in groups:
+        for row in rows:
+            event_uid = str(_row_value(row, "event_uid", "")).strip()
+            if not event_uid or event_uid in seen:
+                continue
+            seen.add(event_uid)
+            merged.append(row)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _load_pending_new_homeworks(user_id: int, start_iso: str, now: datetime) -> list[Any]:
+    pending: list[Any] = []
+    for event_row in get_new_homework_candidates(user_id, start_iso, limit=100):
+        event_uid = str(event_row["event_uid"])
+        if _is_terminal_homework_event(event_row):
+            mark_new_homework_announced(user_id, event_uid)
+            continue
+        if not _is_open_homework_event(event_row, now):
+            continue
+        if notification_succeeded(user_id, "homework_opened", event_uid):
+            mark_new_homework_announced(user_id, event_uid)
+            continue
+        pending.append(event_row)
+        if len(pending) >= 10:
+            break
+    return pending
+
+
 def _recently_synced(row: Any, now, minutes: int = PRE_REMINDER_SYNC_MINUTES) -> bool:
     synced_at = _parse_iso_timestamp(_row_value(row, "account_updated_at"))
     if synced_at is None:
@@ -268,6 +370,7 @@ def sync_user_snapshot(row: Any, logger, persist_failure: bool = True) -> tuple[
         return [], False
 
     try:
+        new_homework_alerts_enabled = has_cached_e3_events(row["user_id"])
         password = decrypt_secret(account_row["encrypted_password"])
         result = login_and_sync(
             account_row["e3_account"],
@@ -282,6 +385,15 @@ def sync_user_snapshot(row: Any, logger, persist_failure: bool = True) -> tuple[
         active_event_uids = []
         for event in events:
             active_event_uids.append(event["event_uid"])
+            is_new_homework = (
+                new_homework_alerts_enabled
+                and event["event_type"] == "homework"
+                and not has_cached_homework_identity(
+                    row["user_id"],
+                    event.get("course_id"),
+                    event["title"],
+                )
+            )
             upsert_event(
                 user_id=row["user_id"],
                 event_uid=event["event_uid"],
@@ -291,6 +403,7 @@ def sync_user_snapshot(row: Any, logger, persist_failure: bool = True) -> tuple[
                 title=event["title"],
                 due_at=event["due_at"],
                 payload_json=event["payload_json"],
+                new_homework_eligible=is_new_homework,
             )
         mark_missing_events_inactive(row["user_id"], active_event_uids)
         grade_changes = sync_grade_items(row["user_id"], courses)
@@ -473,9 +586,15 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         digest_enabled = bool(due_slot) and not _scheduled_digest_succeeded(row["user_id"], digest_key)
         countdown_windows = _load_countdown_windows(row["user_id"], now, tolerance)
         digest_events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8)) if digest_enabled else []
+        outstanding_homeworks = (
+            _filter_open_homeworks(list(get_active_homework_events(row["user_id"], start_iso, limit=12)), now)
+            if digest_enabled
+            else []
+        )
+        new_homework_rows = _load_pending_new_homeworks(row["user_id"], start_iso, now)
 
         has_countdown_candidates = any(countdown_windows.values())
-        needs_fresh_snapshot = digest_enabled or has_countdown_candidates
+        needs_fresh_snapshot = digest_enabled or has_countdown_candidates or bool(new_homework_rows)
         completion_lookup: dict[tuple[str, str], bool] = {}
         if needs_fresh_snapshot:
             if not _recently_synced(row, now):
@@ -490,8 +609,16 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
                     countdown_windows = _load_countdown_windows(row["user_id"], now, tolerance)
                     if digest_enabled:
                         digest_events = list(get_events_due_between(row["user_id"], start_iso, end_iso, limit=8))
-            needs_homework_guard = _has_homework_events(digest_events) or any(
-                _has_homework_events(rows) for rows in countdown_windows.values()
+                        outstanding_homeworks = _filter_open_homeworks(
+                            list(get_active_homework_events(row["user_id"], start_iso, limit=12)),
+                            now,
+                        )
+                    new_homework_rows = _load_pending_new_homeworks(row["user_id"], start_iso, now)
+            needs_homework_guard = (
+                _has_homework_events(digest_events)
+                or bool(outstanding_homeworks)
+                or bool(new_homework_rows)
+                or any(_has_homework_events(rows) for rows in countdown_windows.values())
             )
             if needs_homework_guard:
                 completion_lookup = _build_assignment_completion_lookup(str(row["line_user_id"]), logger)
@@ -500,6 +627,31 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
                     for hours_left, rows in countdown_windows.items()
                 }
                 digest_events = _filter_actionable_events(digest_events, completion_lookup)
+                outstanding_homeworks = _filter_actionable_events(outstanding_homeworks, completion_lookup)
+                new_homework_rows = _filter_actionable_events(new_homework_rows, completion_lookup)
+
+        if new_homework_rows:
+            ok = push_fn(
+                row["line_user_id"],
+                format_new_homework_payload(new_homework_rows, row["line_user_id"]),
+            )
+            for event_row in new_homework_rows:
+                event_uid = str(event_row["event_uid"])
+                log_notification(
+                    row["user_id"],
+                    "homework_opened",
+                    "sent" if ok else "failed",
+                    details=event_uid,
+                    event_uid=event_uid,
+                )
+                if ok:
+                    mark_new_homework_announced(row["user_id"], event_uid)
+            if not ok:
+                logger.error(
+                    "e3_new_homework_push_failed user=%s events=%s",
+                    row["line_user_id"],
+                    [str(event_row["event_uid"]) for event_row in new_homework_rows],
+                )
 
         for hours_left in COUNTDOWN_HOURS:
             countdown_rows = countdown_windows.get(hours_left) or []
@@ -523,7 +675,7 @@ def process_due_reminders(push_fn, logger, target_predicate=None) -> None:
         if _scheduled_digest_succeeded(row["user_id"], dedupe_key):
             continue
 
-        events = digest_events
+        events = _merge_event_rows(digest_events, outstanding_homeworks, limit=16)
         if not events:
             payload = build_empty_digest_payload(slot_text, row["line_user_id"])
             ok = push_fn(row["line_user_id"], payload)
@@ -635,7 +787,7 @@ def start_reminder_worker(push_fn: Callable[[str, Any], bool], logger, target_pr
     return True
 
 
-def build_test_reminder_payloads(user_id: int) -> list[str]:
+def build_test_reminder_payloads(user_id: int) -> list[Any]:
     user_key = get_line_user_id_by_user_id(user_id) or "discord:test"
 
     class _NullLogger:
@@ -649,8 +801,18 @@ def build_test_reminder_payloads(user_id: int) -> list[str]:
     start_iso = now.astimezone(timezone.utc).isoformat()
     end_iso = (now + timedelta(hours=DEFAULT_LOOKAHEAD_HOURS)).astimezone(timezone.utc).isoformat()
     completion_lookup = _build_assignment_completion_lookup(user_key, _NullLogger())
-    events = list(get_events_due_between(user_id, start_iso, end_iso, limit=5))
-    events = _filter_actionable_events(events, completion_lookup)
+    due_events = _filter_actionable_events(
+        list(get_events_due_between(user_id, start_iso, end_iso, limit=8)),
+        completion_lookup,
+    )
+    outstanding_homeworks = _filter_actionable_events(
+        _filter_open_homeworks(
+            list(get_active_homework_events(user_id, start_iso, limit=12)),
+            now,
+        ),
+        completion_lookup,
+    )
+    events = _merge_event_rows(due_events, outstanding_homeworks, limit=16)
     if not events:
         return [
             build_empty_digest_payload("09:00", user_key=user_key),

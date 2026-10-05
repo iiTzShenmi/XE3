@@ -265,7 +265,7 @@ def morning_brief_lines(rows: list[Any]) -> list[str]:
     if counts["calendar"]:
         summary_bits.append(f"{counts['calendar']} 項行事曆事件")
     if summary_bits:
-        lines.append("未來 36 小時：" + "、".join(summary_bits) + "。")
+        lines.append("目前追蹤：" + "、".join(summary_bits) + "。")
     if today_rows:
         lines.append(f"今天共有 {len(today_rows)} 項事件截止。")
         first_row = min(today_rows, key=lambda row: str(row_value(row, "due_at", "") or ""))
@@ -281,23 +281,37 @@ def format_digest(rows: list[Any], slot_text: str, user_key: str | None = None) 
     if slot_text == "09:00":
         lines.extend(morning_brief_lines(rows))
         lines.append("")
-    lines.append("──────────" if is_discord_target(user_key) else "")
-    lines.append("🚨 **接下來 36 小時內的重點事件**" if is_discord_target(user_key) else "未來 36 小時內的重點事件：")
-    for idx, row in enumerate(rows, start=1):
-        course_name = course_name_for_display(row_value(row, "course_name") or row_value(row, "course_id") or "-")
-        label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(row_value(row, "event_type"), "📌")
-        due_label = discord_due_label(row_value(row, "due_at"), user_key)
-        if is_discord_target(user_key):
-            lines.append(f"{label} **{course_name}**")
-            lines.append(f"• {row_value(row, 'title', '-')}")
-            lines.append(f"• 截止：{due_label}")
-            attachment_line = _attachment_names_line(row)
-            if attachment_line:
-                lines.append(f"• {attachment_line}")
-        else:
-            lines.append(f"{idx}. {due_label} {label} {course_name}")
-            lines.append(f"   {row_value(row, 'title', '-')}")
+    homework_rows = [row for row in rows if str(row_value(row, "event_type", "")) == "homework"]
+    other_rows = [row for row in rows if str(row_value(row, "event_type", "")) != "homework"]
+
+    sections = []
+    if homework_rows:
+        sections.append(("🟠 **尚未繳交作業**", "尚未繳交作業：", homework_rows))
+    if other_rows:
+        sections.append(("🔴 **接下來 36 小時內的其他事件**", "未來 36 小時內的其他事件：", other_rows))
+
+    item_index = 0
+    for discord_title, plain_title, section_rows in sections:
+        lines.append("━━━━━━━━━━━━" if is_discord_target(user_key) else "")
+        lines.append(discord_title if is_discord_target(user_key) else plain_title)
+        lines.append("━━━━━━━━━━━━" if is_discord_target(user_key) else "")
         lines.append("")
+        for row in section_rows:
+            item_index += 1
+            course_name = course_name_for_display(row_value(row, "course_name") or row_value(row, "course_id") or "-")
+            label = {"exam": "🧪", "homework": "📝", "calendar": "🗓️"}.get(row_value(row, "event_type"), "📌")
+            due_label = discord_due_label(row_value(row, "due_at"), user_key)
+            if is_discord_target(user_key):
+                lines.append(f"{label} **{course_name}**")
+                lines.append(f"• {row_value(row, 'title', '-')}")
+                lines.append(f"• 截止：{due_label}")
+                attachment_line = _attachment_names_line(row)
+                if attachment_line:
+                    lines.append(f"• {attachment_line}")
+            else:
+                lines.append(f"{item_index}. {due_label} {label} {course_name}")
+                lines.append(f"   {row_value(row, 'title', '-')}")
+            lines.append("")
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
@@ -315,17 +329,46 @@ def build_empty_digest_payload(slot_text: str, user_key: str | None = None) -> s
         lines = [f"⏰ **E3 提醒 {slot_text}**"]
         if slot_text == "09:00":
             weather_line = briefing_weather_line()
-            lines.append("早安，XE3 先幫你看過了，接下來 36 小時內沒有新的截止事件。")
+            lines.append("早安，XE3 先幫你看過了，目前沒有未繳作業或 36 小時內的截止事件。")
             if weather_line:
                 lines.append(weather_line)
             lines.append("")
             lines.append("🎉 **今天暫時沒有作業或考試壓線，先安心過你的早上。**")
         else:
-            lines.append("🎉 **今晚暫時沒有新的作業或考試壓線，可以安心休息。**")
+            lines.append("🎉 **今晚沒有未繳作業或考試壓線，可以安心休息。**")
         return "\n".join(lines)
     if slot_text == "09:00":
-        return "⏰ E3 提醒 09:00\n未來 36 小時內沒有新的截止事件，今天先安心。"
-    return "⏰ E3 提醒 21:00\n未來 36 小時內沒有新的截止事件，今晚可以安心休息。"
+        return "⏰ E3 提醒 09:00\n目前沒有未繳作業或 36 小時內的截止事件，今天先安心。"
+    return "⏰ E3 提醒 21:00\n目前沒有未繳作業或 36 小時內的截止事件，今晚可以安心休息。"
+
+
+def format_new_homework_payload(row: Any, user_key: str | None = None) -> Any:
+    rows = list(row) if isinstance(row, (list, tuple)) else [row]
+    rows = [item for item in rows if item is not None]
+    if not rows:
+        return ""
+    if is_discord_target(user_key):
+        lines = ["🆕 **新作業開放**"]
+        for item in rows:
+            course_name = course_name_for_display(row_value(item, "course_name") or row_value(item, "course_id") or "-")
+            due_label = discord_due_label(row_value(item, "due_at"), user_key)
+            title = str(row_value(item, "title", "作業") or "作業").strip()
+            lines.extend(["━━━━━━━━━━━━", f"📝 **{title}**", f"📚 {course_name}", f"📅 截止：{due_label}"])
+            attachment_line = _attachment_names_line(item)
+            if attachment_line:
+                lines.append(attachment_line)
+        text = "\n".join(lines)
+        text += "\n\n目前尚未繳交，我會在每日整理與截止前繼續提醒。"
+        return _with_attachment_buttons(text, rows, user_key)
+
+    lines = ["🆕 新作業開放"]
+    for item in rows:
+        course_name = course_name_for_display(row_value(item, "course_name") or row_value(item, "course_id") or "-")
+        due_label = discord_due_label(row_value(item, "due_at"), user_key)
+        title = str(row_value(item, "title", "作業") or "作業").strip()
+        lines.extend([f"📝 {title}", f"📚 {course_name}", f"📅 截止：{due_label}", ""])
+    lines.append("目前尚未繳交，我會繼續幫你追蹤。")
+    return "\n".join(lines)
 
 
 def format_countdown_payload(row: Any, hours_left: int, user_key: str | None = None) -> Any:

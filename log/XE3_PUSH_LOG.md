@@ -496,3 +496,22 @@
   - E3 最終頁顯示已提交、2 個檔案，兩個預期檔名均可見
   - `py_compile` 與 `git diff --check` 通過
   - `discord-bot.service` 重啟後 Gateway、Slash command sync 與 reminder worker 均正常
+
+### 37. 新作業開放與未繳追蹤提醒
+- 每小時同步發現新 Moodle 作業後，會在實際開放時送出一次 `🆕 新作業開放` 通知
+- 同一次同步若出現多份新作業，合併成一則通知，避免連續私訊洗版
+- 每份作業以 event UID 記錄成功通知；失敗會保留待通知狀態供下輪重試，成功後跨重啟去重
+- 已繳交、關閉或逾期的候選會自動移出待通知佇列，避免舊資料卡住後續新作業
+- `events_cache` 新增 `new_homework_eligible`：既有資料 migration 預設不通知，新帳號第一次同步只建立靜默 baseline
+- calendar 預告不會被誤認為已開放；只有 assignment category/start time 顯示已開放才通知
+- 09:00／21:00 每日整理不再只看 36 小時，會持續列出所有已開放、未繳交、尚未截止的作業
+- 其他考試與行事曆仍維持 36 小時重點區，原有 12／2 小時倒數提醒保留
+- 新作業與每日整理沿用老師附件按鈕，使用者已提交檔案不會出現在通知
+- `/e3 remind test` 同步套用新的未繳作業整理內容
+- 驗證：
+  - reminder regression tests `13 passed`
+  - 全專案 `51 passed`
+  - 既有 event migration 後 eligible rows 為 0，不會在部署時補發舊作業
+  - 真實帳號 5 份未繳作業 digest 通過 Components v2 驗證：676 字、13 components
+  - 兩份新作業合併卡通過 Components v2 驗證：297 字、10 components
+  - `discord-bot.service` 重啟後 Gateway、4 個 slash commands 與 reminder worker 均正常

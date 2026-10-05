@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from agent.features.e3.reminder import worker
-from agent.features.e3.reminder.payloads import format_countdown_payload
+from agent.features.e3.reminder.payloads import format_countdown_payload, format_new_homework_payload
 from agent.features.e3.services.events import extract_events_from_fetch_all
 
 
@@ -42,12 +42,35 @@ def _event(now):
     }
 
 
+def _homework_event(now, *, hours=72):
+    return {
+        "event_uid": "homework-1",
+        "event_type": "homework",
+        "course_id": "course-1",
+        "course_name": "測試課程",
+        "title": "Homework 1",
+        "due_at": (now + timedelta(hours=hours)).astimezone(timezone.utc).isoformat(),
+        "payload_json": json.dumps(
+            {
+                "category": "in_progress",
+                "start_time": now.strftime("%Y/%m/%d 00:00"),
+                "attachments": [],
+                "submitted_files": [],
+            }
+        ),
+    }
+
+
 def _patch_worker_basics(monkeypatch, now, row):
     monkeypatch.setattr(worker, "taipei_now", lambda: now)
     monkeypatch.setattr(worker, "list_reminder_targets", lambda: [row])
     monkeypatch.setattr(worker, "process_periodic_syncs", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker, "process_due_upload_queue", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker, "notification_succeeded", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(worker, "get_active_homework_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "get_new_homework_candidates", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "mark_new_homework_announced", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_build_assignment_completion_lookup", lambda *_args, **_kwargs: {})
 
 
 def test_schedule_slot_remains_due_during_catchup_window():
@@ -205,3 +228,156 @@ def test_unfinished_homework_reminder_includes_only_teacher_attachments():
     action = footer["contents"][0]["action"]
     assert action["uri"].endswith("question.pdf")
     assert action["xe3_meta"]["direct_download"] is True
+
+
+def test_new_open_homework_is_announced_once(monkeypatch):
+    now = datetime(2026, 10, 6, 10, 0, tzinfo=TAIPEI_TZ)
+    row = _reminder_row(now)
+    homework = _homework_event(now)
+    sent = set()
+    pushed = []
+    _patch_worker_basics(monkeypatch, now, row)
+    monkeypatch.setattr(worker, "get_events_due_between", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "get_new_homework_candidates", lambda *_args, **_kwargs: [homework])
+
+    def succeeded(_user_id, notification_type, details=None):
+        return (notification_type, details) in sent
+
+    def log(_user_id, notification_type, result, details=None, **_kwargs):
+        if result == "sent":
+            sent.add((notification_type, details))
+
+    monkeypatch.setattr(worker, "notification_succeeded", succeeded)
+    monkeypatch.setattr(worker, "log_notification", log)
+
+    worker.process_due_reminders(lambda _user, payload: pushed.append(payload) or True, _Logger())
+    worker.process_due_reminders(lambda _user, payload: pushed.append(payload) or True, _Logger())
+
+    assert len(pushed) == 1
+    assert "新作業開放" in pushed[0]
+    assert "Homework 1" in pushed[0]
+
+
+def test_scheduled_digest_keeps_far_unsubmitted_homework(monkeypatch):
+    now = datetime(2026, 10, 6, 9, 5, tzinfo=TAIPEI_TZ)
+    row = _reminder_row(now)
+    homework = _homework_event(now, hours=120)
+    pushed = []
+    _patch_worker_basics(monkeypatch, now, row)
+    monkeypatch.setattr(worker, "get_events_due_between", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "get_active_homework_events", lambda *_args, **_kwargs: [homework])
+    monkeypatch.setattr(worker, "log_notification", lambda *_args, **_kwargs: None)
+
+    worker.process_due_reminders(lambda _user, payload: pushed.append(payload) or True, _Logger())
+
+    assert len(pushed) == 1
+    assert "尚未繳交作業" in pushed[0]
+    assert "Homework 1" in pushed[0]
+
+
+def test_multiple_new_homeworks_are_grouped_into_one_push(monkeypatch):
+    now = datetime(2026, 10, 6, 10, 0, tzinfo=TAIPEI_TZ)
+    row = _reminder_row(now)
+    first = _homework_event(now)
+    second = {**_homework_event(now, hours=96), "event_uid": "homework-2", "title": "Homework 2"}
+    pushed = []
+    logged = []
+    marked = []
+    _patch_worker_basics(monkeypatch, now, row)
+    monkeypatch.setattr(worker, "get_events_due_between", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "get_new_homework_candidates", lambda *_args, **_kwargs: [first, second])
+    monkeypatch.setattr(worker, "log_notification", lambda *args, **kwargs: logged.append((args, kwargs)))
+    monkeypatch.setattr(worker, "mark_new_homework_announced", lambda *args: marked.append(args))
+
+    worker.process_due_reminders(lambda _user, payload: pushed.append(payload) or True, _Logger())
+
+    assert len(pushed) == 1
+    assert "Homework 1" in pushed[0]
+    assert "Homework 2" in pushed[0]
+    opened_logs = [entry for entry in logged if entry[0][1] == "homework_opened"]
+    assert len(opened_logs) == 2
+    assert marked == [(row["user_id"], "homework-1"), (row["user_id"], "homework-2")]
+
+
+def test_failed_new_homework_push_is_retried(monkeypatch):
+    now = datetime(2026, 10, 6, 10, 0, tzinfo=TAIPEI_TZ)
+    row = _reminder_row(now)
+    homework = _homework_event(now)
+    push_results = iter([False, True])
+    pushed = []
+    marked = []
+    _patch_worker_basics(monkeypatch, now, row)
+    monkeypatch.setattr(worker, "get_events_due_between", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "get_new_homework_candidates", lambda *_args, **_kwargs: [homework])
+    monkeypatch.setattr(worker, "log_notification", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "mark_new_homework_announced", lambda *args: marked.append(args))
+
+    def push(_user, payload):
+        pushed.append(payload)
+        return next(push_results)
+
+    worker.process_due_reminders(push, _Logger())
+    worker.process_due_reminders(push, _Logger())
+
+    assert len(pushed) == 2
+    assert marked == [(row["user_id"], "homework-1")]
+
+
+def test_submitted_new_homework_candidate_is_retired(monkeypatch):
+    now = datetime(2026, 10, 6, 10, 0, tzinfo=TAIPEI_TZ)
+    homework = _homework_event(now)
+    payload = json.loads(homework["payload_json"])
+    payload["submitted_files"] = [{"name": "answer.pdf"}]
+    homework["payload_json"] = json.dumps(payload)
+    marked = []
+    monkeypatch.setattr(worker, "get_new_homework_candidates", lambda *_args, **_kwargs: [homework])
+    monkeypatch.setattr(worker, "mark_new_homework_announced", lambda *args: marked.append(args))
+
+    pending = worker._load_pending_new_homeworks(7, now.astimezone(timezone.utc).isoformat(), now)
+
+    assert pending == []
+    assert marked == [(7, "homework-1")]
+
+
+def test_new_homework_payload_keeps_teacher_attachment_only():
+    now = datetime(2026, 10, 6, 10, 0, tzinfo=TAIPEI_TZ)
+    row = _homework_event(now)
+    row["payload_json"] = json.dumps(
+        {
+            "category": "in_progress",
+            "attachments": [{"name": "question.pdf", "url": "https://e3p.nycu.edu.tw/pluginfile.php/1/question.pdf"}],
+            "submitted_files": [{"name": "answer.pdf", "url": "https://e3p.nycu.edu.tw/pluginfile.php/1/answer.pdf"}],
+        }
+    )
+
+    payload = format_new_homework_payload(row, "discord:123")
+
+    assert "question.pdf" in payload["text"]
+    assert "answer.pdf" not in payload["text"]
+    assert len(payload["messages"][0]["contents"]["footer"]["contents"]) == 1
+
+
+def test_first_sync_is_silent_baseline_then_new_events_become_eligible(monkeypatch):
+    now = datetime(2026, 10, 6, 10, 0, tzinfo=TAIPEI_TZ)
+    row = _reminder_row(now)
+    homework = _homework_event(now)
+    eligibility = []
+    cached_states = iter([False, True])
+    monkeypatch.setattr(worker, "get_e3_account_by_user_id", lambda *_args: {"encrypted_password": "secret", "e3_account": "student"})
+    monkeypatch.setattr(worker, "decrypt_secret", lambda *_args: "password")
+    monkeypatch.setattr(worker, "has_cached_e3_events", lambda *_args: next(cached_states))
+    monkeypatch.setattr(worker, "has_cached_homework_identity", lambda *_args: False)
+    monkeypatch.setattr(worker, "login_and_sync", lambda *_args, **_kwargs: {"courses": {}, "calendar_events": []})
+    monkeypatch.setattr(worker, "extract_events_from_fetch_all", lambda *_args, **_kwargs: [homework])
+    monkeypatch.setattr(worker, "mark_missing_events_inactive", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "sync_grade_items", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker, "update_login_state", lambda *_args, **_kwargs: None)
+
+    def capture_upsert(**kwargs):
+        eligibility.append(kwargs["new_homework_eligible"])
+
+    monkeypatch.setattr(worker, "upsert_event", capture_upsert)
+
+    assert worker.sync_user_snapshot(row, _Logger()) == ([], True)
+    assert worker.sync_user_snapshot(row, _Logger()) == ([], True)
+    assert eligibility == [False, True]

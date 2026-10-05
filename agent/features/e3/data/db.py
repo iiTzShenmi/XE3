@@ -101,6 +101,7 @@ def init_db() -> None:
               first_seen_at TEXT NOT NULL,
               last_seen_at TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'active',
+              new_homework_eligible INTEGER NOT NULL DEFAULT 0,
               UNIQUE(user_id, event_uid),
               FOREIGN KEY (user_id) REFERENCES users(id)
             )
@@ -108,6 +109,8 @@ def init_db() -> None:
         )
         if not _has_column(conn, "events_cache", "course_name"):
             conn.execute("ALTER TABLE events_cache ADD COLUMN course_name TEXT")
+        if not _has_column(conn, "events_cache", "new_homework_eligible"):
+            conn.execute("ALTER TABLE events_cache ADD COLUMN new_homework_eligible INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS reminder_prefs (
@@ -317,6 +320,7 @@ def upsert_event(
     title: str,
     due_at: str | None,
     payload_json: str,
+    new_homework_eligible: bool = False,
 ) -> None:
     now = _utc_now_iso()
     with get_conn() as conn:
@@ -324,8 +328,8 @@ def upsert_event(
             """
             INSERT INTO events_cache (
               user_id, source, event_uid, event_type, course_id, course_name, title, due_at, payload_json,
-              first_seen_at, last_seen_at, status
-            ) VALUES (?, 'e3', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+              first_seen_at, last_seen_at, status, new_homework_eligible
+            ) VALUES (?, 'e3', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
             ON CONFLICT(user_id, event_uid) DO UPDATE SET
               event_type=excluded.event_type,
               course_id=excluded.course_id,
@@ -336,8 +340,53 @@ def upsert_event(
               last_seen_at=excluded.last_seen_at,
               status='active'
             """,
-            (user_id, event_uid, event_type, course_id, course_name, title, due_at, payload_json, now, now),
+            (
+                user_id,
+                event_uid,
+                event_type,
+                course_id,
+                course_name,
+                title,
+                due_at,
+                payload_json,
+                now,
+                now,
+                1 if new_homework_eligible else 0,
+            ),
         )
+
+
+def has_cached_e3_events(user_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM events_cache WHERE user_id=? AND source='e3' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return bool(row)
+
+
+def has_cached_homework_identity(user_id: int, course_id: str | None, title: str) -> bool:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT payload_json FROM events_cache
+            WHERE user_id=? AND source='e3' AND event_type='homework'
+              AND COALESCE(course_id, '')=? AND title=?
+            """,
+            (user_id, str(course_id or ""), str(title or "")),
+        ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and (
+            payload.get("category")
+            or payload.get("start_time")
+            or payload.get("available_from")
+        ):
+            return True
+    return False
 
 
 def mark_missing_events_inactive(user_id: int, active_event_uids: list[str]) -> None:
@@ -548,6 +597,48 @@ def get_events_due_between(user_id: int, start_iso: str, end_iso: str, limit: in
             """,
             (user_id, start_iso, end_iso, limit),
         ).fetchall()
+
+
+def get_active_homework_events(user_id: int, now_iso: str, limit: int = 20):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT event_uid, event_type, course_id, course_name, title, due_at, payload_json, first_seen_at
+            FROM events_cache
+            WHERE user_id=? AND source='e3' AND status='active' AND event_type='homework'
+              AND due_at IS NOT NULL AND due_at >= ?
+            ORDER BY due_at ASC
+            LIMIT ?
+            """,
+            (user_id, now_iso, limit),
+        ).fetchall()
+
+
+def get_new_homework_candidates(user_id: int, now_iso: str, limit: int = 10):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT event_uid, event_type, course_id, course_name, title, due_at, payload_json, first_seen_at
+            FROM events_cache
+            WHERE user_id=? AND source='e3' AND status='active' AND event_type='homework'
+              AND new_homework_eligible=1 AND due_at IS NOT NULL AND due_at >= ?
+            ORDER BY first_seen_at ASC, due_at ASC
+            LIMIT ?
+            """,
+            (user_id, now_iso, limit),
+        ).fetchall()
+
+
+def mark_new_homework_announced(user_id: int, event_uid: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE events_cache
+            SET new_homework_eligible=0
+            WHERE user_id=? AND event_uid=?
+            """,
+            (user_id, event_uid),
+        )
 
 
 def list_reminder_targets():
